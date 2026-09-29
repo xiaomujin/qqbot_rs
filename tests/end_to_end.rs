@@ -247,7 +247,15 @@ fn build_stack_with(mock: &MockServer, store: Option<Arc<MessageStore>>) -> Arc<
     let services = Arc::new(services);
 
     let mut router = Router::new();
-    qqbot_plugins::register(&mut router, store, Duration::from_secs(30 * 24 * 3600));
+    qqbot_plugins::register(
+        &mut router,
+        store,
+        &qqbot_plugins::PluginsConfig {
+            wordcloud_window: Duration::from_secs(30 * 24 * 3600),
+            daily: None,
+        },
+    )
+    .expect("初始化插件失败");
 
     Arc::new(Dispatcher::new(router, services, DispatchConfig::default()))
 }
@@ -371,6 +379,50 @@ async fn dice_reply_uses_markdown_so_bold_is_rendered() {
     let md = body["markdown"]["content"].as_str().expect("缺少 markdown.content");
     assert!(md.contains("2d6"), "应回显骰子规格: {md}");
     assert!(md.contains("**"), "应保留加粗标记: {md}");
+}
+/// 全量模式回归：`GROUP_MESSAGE_CREATE` **不剥离** @机器人 前缀，
+/// content 是 `<@openid> 骰子 2d6`。
+///
+/// 修复前这条会静默失败 —— 裸关键词正常、@机器人 却毫无反应，
+/// 症状很像权限或订阅问题，实际是匹配串里多了个 `<@...>`。
+#[tokio::test]
+async fn full_mode_at_prefix_still_routes() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock);
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_AT","author":{"member_openid":"U1"},"content":"<@0F1E2D3C4B5A69788796A5B4C3D2E1F0> 骰子 2d6","group_openid":"GAT"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GAT/messages")
+        .expect("@机器人 的命令必须能触发（全量模式不剥离 @ 前缀）");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    assert_eq!(body["msg_type"], 2, "应当走骰子的 Markdown 路径");
+    assert_eq!(body["msg_id"], "IN_AT", "关键词触发必须走被动回复");
+}
+
+/// 全量模式下的裸关键词（没有 @）同样要触发，且走被动回复。
+#[tokio::test]
+async fn full_mode_bare_keyword_routes_passively() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock);
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_BARE","author":{"member_openid":"U1"},"content":"骰子 2d6","group_openid":"GBARE"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GBARE/messages")
+        .expect("裸关键词必须能触发");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    assert_eq!(body["msg_id"], "IN_BARE", "必须是被动回复而不是主动消息");
 }
 
 #[tokio::test]

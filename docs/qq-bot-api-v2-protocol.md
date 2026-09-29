@@ -240,7 +240,7 @@ curl --location 'https://api.bot.qq.com/app/getAppAccessToken' \
 |---|---|---|
 | `id` | string | 消息 ID，可用于被动回复和撤回 |
 | `author` | User | 发送者（`member_openid` 有值） |
-| `content` | string | 消息文本（**已去除 @机器人前缀**） |
+| `content` | string | 消息文本。`GROUP_AT_MESSAGE_CREATE` 下**已去除 @机器人前缀**；全量模式的 `GROUP_MESSAGE_CREATE` 下**不剥离**，见下方 ⚠️ |
 | `group_openid` | string | 群 OpenID |
 | `timestamp` | string | RFC3339 |
 | `message_type` | integer | 消息内容类型 |
@@ -249,6 +249,25 @@ curl --location 'https://api.bot.qq.com/app/getAppAccessToken' \
 | `mentions` | []User | @ 的用户（不含机器人自身） |
 | `ark_data` | ARKData | 结构化卡片数据 |
 | `msg_elements` | []MsgElement | 消息元素列表 |
+
+### 6.2.1 ⚠️ 全量模式下的 @ 前缀（实测）
+
+开启**群聊全量消息**后，事件名固定为 `GROUP_MESSAGE_CREATE`，
+**@ 消息不会再走 `GROUP_AT_MESSAGE_CREATE`**，且 content 里的 @ 机器人
+**不会被剥离**，而是内联成 `<@openid>` 文本：
+
+```text
+event="GROUP_MESSAGE_CREATE" content="<@0F1E2D3C4B5A69788796A5B4C3D2E1F0> 日报"
+```
+
+（openid 已脱敏，仅保留形状。）
+
+后果：直接用整串匹配命令的实现，**裸关键词能触发、@机器人反而触发不了**，
+很容易被误判成权限或订阅问题。匹配前必须先剥掉开头的 `<@...>`。
+实现见 `MessageEvent::trimmed()`（`crates/qqbot-api/src/event/message.rs`）。
+
+另外注意：机器人在群里的 openid 是**按群**下发的，事先无从得知，
+因此无法只剥离「机器人自己的」提及 —— 只能剥离开头的任意提及。
 
 **User**
 

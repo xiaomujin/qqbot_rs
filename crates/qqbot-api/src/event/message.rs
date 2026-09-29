@@ -102,7 +102,11 @@ pub struct MessageEvent {
     pub id: String,
     #[serde(default)]
     pub author: User,
-    /// 消息文本（群聊场景官方已去除 @机器人前缀）。
+    /// 消息文本。
+    ///
+    /// ⚠️ **全量模式下 @机器人 不会被剥离**：`GROUP_MESSAGE_CREATE` 的 content
+    /// 形如 `<@9FC25631...> 日报`（实测）。只有 `GROUP_AT_MESSAGE_CREATE` 才带
+    /// 剥离行为，而全量模式不会下发该事件。因此匹配前必须走 [`Self::trimmed`]。
     #[serde(default)]
     pub content: String,
     /// 群聊场景存在，单聊场景为空。
@@ -162,9 +166,23 @@ impl MessageEvent {
         matches!(self.sender_role(), Some("admin") | Some("owner"))
     }
 
-    /// 去除首尾空白后的命令文本。
+    /// 去除首尾空白与**开头 @提及**后的命令文本。
+    ///
+    /// 这是路由匹配的唯一依据。全量模式下官方不剥离 @机器人 前缀，
+    /// content 形如 `<@9FC25631...> 日报`；不处理的话，
+    /// 用户 **@机器人 发命令永远匹配不上**（裸关键词却正常，很容易误判成权限问题）。
+    ///
+    /// 剥掉的是**任意**开头提及而非「仅机器人」：群聊里机器人的 openid 是
+    /// **按群**下发的，事先无从得知；而「@某人 日报」这种消息本来也是在跟机器人说话。
+    /// 正文中间的提及**不动** —— 那通常是消息内容的一部分。
     pub fn trimmed(&self) -> &str {
-        self.content.trim()
+        let mut text = self.content.trim();
+        while let Some(rest) = text.strip_prefix("<@")
+            && let Some(end) = rest.find('>')
+        {
+            text = rest[end + 1..].trim_start();
+        }
+        text
     }
 
     /// 第一个附件（常用于取用户发送的图片）。
@@ -176,6 +194,53 @@ impl MessageEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// 全量模式下 @机器人 不会被服务端剥离，而是内联成 `<@openid>` 文本。
+    /// 实测：`content = "<@0F1E2D3C4B5A69788796A5B4C3D2E1F0> 日报"`（openid 已脱敏）。
+    #[test]
+    fn trimmed_strips_leading_mention() {
+        let ev: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","content":"<@0F1E2D3C4B5A69788796A5B4C3D2E1F0> 日报","group_openid":"G1"}"#,
+        )
+        .unwrap();
+        assert_eq!(ev.trimmed(), "日报");
+    }
+
+    #[test]
+    fn trimmed_strips_repeated_mentions() {
+        let ev: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","content":"<@AAA> <@BBB>   查子弹 7N39","group_openid":"G1"}"#,
+        )
+        .unwrap();
+        assert_eq!(ev.trimmed(), "查子弹 7N39");
+    }
+
+    #[test]
+    fn trimmed_keeps_inline_and_malformed_mentions() {
+        // 正文中间的提及是消息内容的一部分，不能动。
+        let inline: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","content":"喊 <@AAA> 来","group_openid":"G1"}"#,
+        )
+        .unwrap();
+        assert_eq!(inline.trimmed(), "喊 <@AAA> 来");
+
+        // 没有闭合尖括号时不能死循环，也不能把内容吃掉。
+        let broken: MessageEvent = serde_json::from_str(
+            r#"{"id":"M2","content":"<@unterminated","group_openid":"G1"}"#,
+        )
+        .unwrap();
+        assert_eq!(broken.trimmed(), "<@unterminated");
+    }
+
+    #[test]
+    fn mention_only_message_becomes_empty() {
+        let ev: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","content":"<@AAA>","group_openid":"G1"}"#,
+        )
+        .unwrap();
+        assert_eq!(ev.trimmed(), "");
+    }
 
     #[test]
     fn parses_group_at_message() {

@@ -218,6 +218,21 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/test-image") {
         return ("200 OK", "FAKE-IMAGE-BYTES".to_string());
     }
+    // 塔科夫服务器状态：形状照 status.escapefromtarkov.com 的响应。
+    if path.starts_with("/api/services") {
+        return (
+            "200 OK",
+            json!([
+                {"name": "Website", "status": 0},
+                {"name": "Matchmaking", "status": 2},
+                {"name": "Something New", "status": 9},
+            ])
+            .to_string(),
+        );
+    }
+    if path.starts_with("/api/global/status") {
+        return ("200 OK", json!({"status": 1, "message": "正在维护"}).to_string());
+    }
     // BA 图片查询：形状照 arona 的响应。
     if path.starts_with("/api/v2/image") {
         if inner.ba_fuzzy.load(Ordering::Relaxed) {
@@ -333,6 +348,7 @@ async fn build_stack_with(
             // 指向 mock，否则塔科夫的 GraphQL 会真的打出去。
             tarkov: qqbot_plugins::TarkovConfig {
                 graphql_url: format!("{}/graphql", mock.base_url()),
+                status_base: mock.base_url(),
                 ..Default::default()
             },
             ba: qqbot_plugins::BaConfig {
@@ -1314,4 +1330,29 @@ async fn dice_range_form_ignores_ordinary_sentences() {
         mock.find(|h| h.path == "/v2/groups/GD2/messages").is_none(),
         "普通句子不该触发骰子"
     );
+}
+
+/// B1 服务器状态：服务列表 + 总体状态，中文名与状态图标都要对上。
+#[tokio::test]
+async fn tarkov_server_status_lists_services_in_chinese() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"SRV_1","author":{"member_openid":"U1"},"content":"服务器","group_openid":"GS"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GS/messages")
+        .expect("应当回复服务器状态");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("服务器状态速报："), "{text}");
+    assert!(text.contains("游戏官网：🟢服务正常"), "{text}");
+    assert!(text.contains("战局匹配：🟡部分故障"), "{text}");
+    assert!(text.contains("总体状态：⚙️正在更新"), "{text}");
+    assert!(text.contains("信息：正在维护"), "{text}");
 }

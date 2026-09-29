@@ -115,6 +115,14 @@ pub async fn register(
 
     let tarkov = tarkov::TarkovPlugin::new(cfg.tarkov.clone(), http.clone());
     router.on_any(Matcher::Exact("塔科夫时间".into()), tarkov.clone());
+    // `服务器` / `服务器状态`，前缀 `塔科夫` / `tkf` 可选，共 6 种写法。
+    // 用一条正则而不是 6 条路由：帮助里 6 个几乎同名的条目反而看不清。
+    router.on_any(
+        Matcher::Regex(
+            regex::Regex::new(r"(?i)^(塔科夫|tkf)?服务器(状态)?$").expect("服务器状态正则字面量"),
+        ),
+        tarkov.clone(),
+    );
     // 源项目的正则是 `^(?i)boss(刷|概)`：前缀匹配、大小写不敏感。
     // 路由用正则，真正的判定在插件里（`is_boss_query`），两者保持一致。
     router.on_any(

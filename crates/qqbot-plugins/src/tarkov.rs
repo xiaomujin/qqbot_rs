@@ -39,6 +39,10 @@ pub struct TarkovConfig {
     ///
     /// 刷新率是**静态数据**，缓存纯粹是为了防刷 —— 源项目也是 10 分钟。
     pub boss_cache: Duration,
+    /// 服务器状态接口前缀（不含 `/api/...`）。
+    pub status_base: String,
+    /// 服务器状态缓存时长。源项目是 20 分钟。
+    pub status_cache: Duration,
 }
 
 impl Default for TarkovConfig {
@@ -46,6 +50,8 @@ impl Default for TarkovConfig {
         Self {
             graphql_url: "https://api.tarkov.dev/graphql".into(),
             boss_cache: Duration::from_secs(600),
+            status_base: "https://status.escapefromtarkov.com".into(),
+            status_cache: Duration::from_secs(1200),
         }
     }
 }
@@ -146,6 +152,84 @@ pub fn format_boss_chance(maps: &[MapEntry], now: i64) -> String {
     out
 }
 
+// ---- 服务器状态 ----
+
+#[derive(Debug, Deserialize)]
+pub struct ServiceStatus {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub status: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GlobalStatus {
+    #[serde(default)]
+    pub status: i64,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// 服务名中文化。未知服务原样显示 —— 官方随时可能加服务，
+/// 用 `_ => ""` 把它们吞掉会让状态页看起来少了几行。
+fn cn_service_name(name: &str) -> String {
+    let label = match name {
+        "Website" => "游戏官网",
+        "Forum" => "官方论坛",
+        "Authentication" => "身份认证",
+        "Launcher" => "启动器",
+        "Group lobby" => "组队功能",
+        "Trading" => "交易功能",
+        "Matchmaking" => "战局匹配",
+        "Friends and msg" => "好友消息",
+        "Inventory operations" => "库存操作",
+        other => other,
+    };
+    format!("{label}：")
+}
+
+fn cn_status(status: i64) -> &'static str {
+    match status {
+        0 => "🟢服务正常",
+        1 => "⚙️正在更新",
+        2 => "🟡部分故障",
+        3 => "🔴服务不可用",
+        _ => "⚪未知",
+    }
+}
+
+/// 整理成状态速报文本。
+pub fn format_server_status(
+    services: &[ServiceStatus],
+    global: &GlobalStatus,
+    now: i64,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", format_datetime(now, SHANGHAI_OFFSET));
+    out.push_str("服务器状态速报：\n");
+    for service in services {
+        let _ = writeln!(out, "{}{}", cn_service_name(&service.name), cn_status(service.status));
+    }
+    let _ = write!(out, "\n总体状态：{}", cn_status(global.status));
+    if !global.message.is_empty() {
+        let _ = write!(out, "\n信息：{}", global.message);
+    }
+    out
+}
+
+/// 是否是服务器状态查询。
+///
+/// 源项目正则是 `^(?i)((塔科夫|tkf)?服务器(状态)?)$` —— 前缀可选、后缀可选，
+/// 一共 6 种写法，但**必须是整串**。
+pub fn is_server_query(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    let rest = lower
+        .strip_prefix("塔科夫")
+        .or_else(|| lower.strip_prefix("tkf"))
+        .unwrap_or(lower.as_str());
+    matches!(rest, "服务器" | "服务器状态")
+}
+
 /// 是否是 BOSS 刷新率查询。
 ///
 /// 源项目的正则是 `^(?i)(boss(刷|概))`：`boss刷` / `boss概` 开头、后面随意。
@@ -168,11 +252,18 @@ pub struct TarkovPlugin {
     http: reqwest::Client,
     /// 只缓存一份：刷新率是静态数据，与用户、群都无关。
     boss_cache: Arc<Mutex<Option<(Instant, String)>>>,
+    /// 服务器状态同理，且源项目也是 20 分钟一刷。
+    status_cache: Arc<Mutex<Option<(Instant, String)>>>,
 }
 
 impl TarkovPlugin {
     pub fn new(config: TarkovConfig, http: reqwest::Client) -> Self {
-        Self { config, http, boss_cache: Arc::new(Mutex::new(None)) }
+        Self {
+            config,
+            http,
+            boss_cache: Arc::new(Mutex::new(None)),
+            status_cache: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// BOSS 刷新率文本，命中缓存则不打上游。
@@ -195,6 +286,60 @@ impl TarkovPlugin {
                 "查询失败，稍后再试".to_string()
             }
         }
+    }
+
+    /// 服务器状态文本，命中缓存则不打上游。
+    async fn server_status_text(&self) -> String {
+        let mut guard = self.status_cache.lock().await;
+        if let Some((at, text)) = guard.as_ref()
+            && at.elapsed() < self.config.status_cache
+        {
+            return text.clone();
+        }
+        match self.fetch_server_status().await {
+            Ok(text) => {
+                *guard = Some((Instant::now(), text.clone()));
+                text
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "查询塔科夫服务器状态失败");
+                "查询失败，稍后再试".to_string()
+            }
+        }
+    }
+
+    async fn fetch_server_status(&self) -> anyhow::Result<String> {
+        let base = self.config.status_base.trim_end_matches('/');
+        let services: Vec<ServiceStatus> = self
+            .get_json(&format!("{base}/api/services"))
+            .await
+            .context("获取服务列表失败")?;
+        let global: GlobalStatus = self
+            .get_json(&format!("{base}/api/global/status"))
+            .await
+            .context("获取总体状态失败")?;
+        Ok(format_server_status(&services, &global, now_unix()))
+    }
+
+    /// GET 一个 JSON 接口。
+    ///
+    /// 状态站会按 UA 拦请求，所以带一个常见的浏览器 UA —— 源项目也这么做。
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
+        let res = self
+            .http
+            .get(url)
+            .header("Accept", "application/json")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
+            .send()
+            .await
+            .with_context(|| format!("请求 {url} 失败"))?;
+        let status = res.status();
+        let body = res.text().await.with_context(|| format!("读取 {url} 响应失败"))?;
+        if !status.is_success() {
+            let snippet: String = body.chars().take(200).collect();
+            anyhow::bail!("{url} 返回 {status}：{snippet}");
+        }
+        serde_json::from_str(&body).with_context(|| format!("解析 {url} 响应失败"))
     }
 
     async fn fetch_boss_chance(&self) -> anyhow::Result<String> {
@@ -230,6 +375,11 @@ impl Handler for TarkovPlugin {
             // 与源项目一致：两行裸时刻，不带标签。
             let (left, right) = tarkov_time(now_unix());
             let _ = ctx.reply_text(format!("{left}\n{right}")).await;
+            return Handled::Consumed;
+        }
+
+        if is_server_query(content) {
+            let _ = ctx.reply_text(self.server_status_text().await).await;
             return Handled::Consumed;
         }
 
@@ -337,6 +487,62 @@ mod tests {
         }];
         let text = format_boss_chance(&maps, 0);
         assert!(!text.contains("图\n"), "没有名字的条目不该产生标题: {text}");
+    }
+
+    fn service(name: &str, status: i64) -> ServiceStatus {
+        ServiceStatus { name: name.into(), status }
+    }
+
+    #[test]
+    fn recognizes_all_six_server_forms() {
+        for text in [
+            "服务器",
+            "服务器状态",
+            "塔科夫服务器",
+            "塔科夫服务器状态",
+            "tkf服务器",
+            "TKF服务器状态",
+            "  服务器  ",
+        ] {
+            assert!(is_server_query(text), "应当识别：{text}");
+        }
+    }
+
+    #[test]
+    fn server_query_rejects_lookalikes() {
+        for text in [
+            "服务器状态怎么样",
+            "看看服务器",
+            "塔科夫服务器状态如何",
+            "tkf 服务器",
+            "塔科夫",
+            "",
+        ] {
+            assert!(!is_server_query(text), "不该识别：{text}");
+        }
+    }
+
+    #[test]
+    fn formats_server_status_with_chinese_labels() {
+        let services = vec![service("Website", 0), service("Matchmaking", 2)];
+        let global = GlobalStatus { status: 1, message: "正在维护".into() };
+        let text = format_server_status(&services, &global, 0);
+        assert!(text.starts_with("1970-01-01 08:00:00\n服务器状态速报：\n"), "{text}");
+        assert!(text.contains("游戏官网：🟢服务正常"), "{text}");
+        assert!(text.contains("战局匹配：🟡部分故障"), "{text}");
+        assert!(text.contains("\n总体状态：⚙️正在更新"), "{text}");
+        assert!(text.ends_with("信息：正在维护"), "{text}");
+    }
+
+    #[test]
+    fn unknown_services_and_statuses_are_shown_not_dropped() {
+        // 官方随时可能加服务或加状态码，静默吞掉会让状态页看起来少了几行。
+        let services = vec![service("Something New", 9)];
+        let global = GlobalStatus { status: 9, message: String::new() };
+        let text = format_server_status(&services, &global, 0);
+        assert!(text.contains("Something New：⚪未知"), "{text}");
+        assert!(text.contains("总体状态：⚪未知"), "{text}");
+        assert!(!text.contains("信息："), "没有 message 就不该出现这一行: {text}");
     }
 
     #[test]

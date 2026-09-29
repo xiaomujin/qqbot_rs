@@ -6,7 +6,9 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// 当前 schema 版本，记录在 `meta` 表里。
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 增加了资源映射（`resources` / `resource_keywords`）与系统设置（`settings`）。
+pub const SCHEMA_VERSION: i64 = 2;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -31,6 +33,48 @@ CREATE INDEX IF NOT EXISTS idx_messages_created_at
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- 资源映射。只存**路径**，素材留在磁盘上：换图直接替换文件即可，数据库不用动。
+CREATE TABLE IF NOT EXISTS resources (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- group = 某群自建，只在该群可见；system = 全局可见
+    scope       TEXT    NOT NULL CHECK (scope IN ('group','system')),
+    -- 群资源存 group_openid；系统资源存**空串**。
+    -- 不能用 NULL：SQLite 的 UNIQUE 索引把 NULL 视为互不相等，
+    -- 那样下面的三列主键就拦不住重复关键词了。详见 resource.rs。
+    owner_id    TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    -- 素材文件路径（收录时已解析成绝对路径）
+    path        TEXT    NOT NULL,
+    -- 发送时给平台判格式用
+    file_name   TEXT    NOT NULL,
+    -- 官方富媒体 FileType：1 图片 / 2 视频 / 3 语音 / 4 文件
+    file_type   INTEGER NOT NULL,
+    description TEXT,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    UNIQUE (scope, owner_id, name)
+);
+
+-- 触发词。主名也在其中，这样「同一作用域内关键词唯一」由主键保证，
+-- 而不是靠应用层自觉 —— 两个资源抢一个词必须在 INSERT 时就失败。
+CREATE TABLE IF NOT EXISTS resource_keywords (
+    keyword     TEXT    NOT NULL,
+    scope       TEXT    NOT NULL CHECK (scope IN ('group','system')),
+    owner_id    TEXT    NOT NULL,
+    resource_id INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    PRIMARY KEY (keyword, scope, owner_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_keywords_resource
+    ON resource_keywords(resource_id);
+
+-- 通用系统设置（键值）。
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 "#;
 
@@ -98,6 +142,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [SCHEMA_VERSION.to_string()],
             )?;
+            // 只在**首次到达本版本**时播种。之后控制者清空列表不会让默认值复活。
+            crate::resource::seed_defaults(conn)?;
         }
         Some(v) => {
             anyhow::bail!(
@@ -112,6 +158,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 [SCHEMA_VERSION.to_string()],
             )?;
             tracing::info!(version = SCHEMA_VERSION, "数据库 schema 已初始化");
+            crate::resource::seed_defaults(conn)?;
         }
     }
     Ok(())

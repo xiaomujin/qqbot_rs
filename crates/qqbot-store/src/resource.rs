@@ -1,0 +1,527 @@
+//! 资源映射的持久化。
+//!
+//! 数据库只存**路径**，素材本身留在磁盘上 —— 换图时直接替换文件即可，
+//! 数据库不用动，也不需要任何缓存失效逻辑。
+//!
+//! 资源分两种作用域：群自建的只在该群可见，系统级的全局可见。
+//! 触发时**群优先、系统兜底**（见 `qqbot-plugins` 的 `ResourcePlugin`）。
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{anyhow, Context, Result};
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::model::now_unix;
+
+/// 首次建库时播种的系统控制者。
+pub const DEFAULT_SYSTEM_CONTROLLER: &str = "5CF47107AFE2275EE0173D298F6FF07E";
+
+/// 系统控制者列表在 `settings` 表里的键名。
+pub const SYSTEM_CONTROLLERS_KEY: &str = "system_controllers";
+
+/// 系统资源的 `owner_id` 哨兵值。
+///
+/// **必须是空串而不是 NULL**：SQLite 的 UNIQUE 索引把 NULL 视为互不相等，
+/// 用 NULL 会让 `PRIMARY KEY (keyword, scope, owner_id)` 拦不住重复 ——
+/// 而「同一作用域内关键词唯一」正是靠它保证的。
+pub const SYSTEM_OWNER: &str = "";
+
+/// 资源作用域。
+///
+/// 与消息的 [`crate::Scope`] 名字相近但语义无关，所以刻意分开命名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceScope {
+    /// 某个群自建，只在该群可见。
+    Group,
+    /// 全局可见。
+    System,
+}
+
+impl ResourceScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Group => "group",
+            Self::System => "system",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "group" => Some(Self::Group),
+            "system" => Some(Self::System),
+            _ => None,
+        }
+    }
+}
+
+fn parse_scope(raw: &str) -> Result<ResourceScope> {
+    ResourceScope::parse(raw).with_context(|| format!("未知的资源作用域 {raw:?}"))
+}
+
+/// 一条资源的元数据（不含文件内容）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resource {
+    pub id: i64,
+    pub scope: ResourceScope,
+    pub owner_id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub file_name: String,
+    /// 官方富媒体的 FileType：1 图片 / 2 视频 / 3 语音 / 4 文件。
+    pub file_type: u8,
+    pub description: Option<String>,
+}
+
+/// 关键词索引项。启动时整表读出来建内存索引。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeywordEntry {
+    pub keyword: String,
+    pub scope: ResourceScope,
+    pub owner_id: String,
+    pub resource_id: i64,
+}
+
+/// 新增 / 覆盖资源时的输入。
+#[derive(Debug, Clone)]
+pub struct ResourceSpec {
+    pub scope: ResourceScope,
+    pub owner_id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub file_name: String,
+    pub file_type: u8,
+    pub description: Option<String>,
+}
+
+const RESOURCE_COLUMNS: &str =
+    "id, scope, owner_id, name, path, file_name, file_type, description";
+
+/// 资源库句柄。
+#[derive(Clone)]
+pub struct ResourceStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl ResourceStore {
+    /// 用一条已建好表的连接构造。
+    pub fn new(conn: Connection) -> Self {
+        Self { conn: Arc::new(Mutex::new(conn)) }
+    }
+
+    /// 在阻塞线程池上跑一次数据库操作。
+    ///
+    /// 资源操作全部由管理命令触发，频率是人手级别，所以不做连接池，
+    /// 一条连接加锁就够。消息热路径走的是 `MessageStore` 的批量写线程，
+    /// 与这里互不影响。
+    async fn with<T, F>(&self, op: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let guard = conn.lock().map_err(|_| anyhow!("资源库连接已中毒"))?;
+            op(&guard)
+        })
+        .await
+        .context("资源库操作任务 panic")?
+    }
+
+    /// 读出全部关键词，供启动时建内存索引。
+    pub async fn keywords(&self) -> Result<Vec<KeywordEntry>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT keyword, scope, owner_id, resource_id FROM resource_keywords",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (keyword, scope, owner_id, resource_id) = row?;
+                // 作用域受 CHECK 约束，正常到不了这里；真到了就跳过并告警，
+                // 不要让一行坏数据把整个索引拖垮。
+                let Some(scope) = ResourceScope::parse(&scope) else {
+                    tracing::warn!(scope, keyword, "资源作用域无法识别，已跳过该关键词");
+                    continue;
+                };
+                out.push(KeywordEntry { keyword, scope, owner_id, resource_id });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// 按 id 取资源。
+    pub async fn get(&self, id: i64) -> Result<Option<Resource>> {
+        self.with(move |conn| load(conn, id)).await
+    }
+
+    /// 列出某作用域下的全部资源（按名称排序）。
+    pub async fn list(&self, scope: ResourceScope, owner_id: &str) -> Result<Vec<Resource>> {
+        let owner = owner_id.to_string();
+        self.with(move |conn| {
+            let sql = format!(
+                "SELECT {RESOURCE_COLUMNS} FROM resources \
+                 WHERE scope = ?1 AND owner_id = ?2 ORDER BY name"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(rusqlite::params![scope.as_str(), owner], read_row)?;
+            let mut out = Vec::new();
+            for row in rows {
+                // 双层 Result：外层是 rusqlite，内层是作用域解析。
+                out.push(row??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// 新增或覆盖一条资源，并把 `name` 登记为主关键词。
+    ///
+    /// 两步在**同一个事务**里 —— 否则中途失败会留下一个没有任何触发词的孤儿资源。
+    pub async fn upsert(&self, spec: ResourceSpec) -> Result<i64> {
+        self.with(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let now = now_unix();
+            tx.execute(
+                "INSERT INTO resources(scope, owner_id, name, path, file_name, file_type, description, created_at, updated_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8) \
+                 ON CONFLICT(scope, owner_id, name) DO UPDATE SET \
+                   path = excluded.path, \
+                   file_name = excluded.file_name, \
+                   file_type = excluded.file_type, \
+                   description = excluded.description, \
+                   updated_at = excluded.updated_at",
+                rusqlite::params![
+                    spec.scope.as_str(),
+                    spec.owner_id,
+                    spec.name,
+                    spec.path.to_string_lossy(),
+                    spec.file_name,
+                    spec.file_type,
+                    spec.description,
+                    now,
+                ],
+            )?;
+
+            let id: i64 = tx.query_row(
+                "SELECT id FROM resources WHERE scope = ?1 AND owner_id = ?2 AND name = ?3",
+                rusqlite::params![spec.scope.as_str(), spec.owner_id, spec.name],
+                |r| r.get(0),
+            )?;
+
+            // 主名也登记成关键词，让「同一作用域内关键词唯一」这条约束覆盖它。
+            tx.execute(
+                "INSERT INTO resource_keywords(keyword, scope, owner_id, resource_id) \
+                 VALUES(?1, ?2, ?3, ?4) \
+                 ON CONFLICT(keyword, scope, owner_id) DO UPDATE SET resource_id = excluded.resource_id",
+                rusqlite::params![spec.name, spec.scope.as_str(), spec.owner_id, id],
+            )?;
+            tx.commit()?;
+            Ok(id)
+        })
+        .await
+    }
+
+    /// 给已有资源加一个触发词。
+    ///
+    /// 关键词在该作用域内已被占用时返回错误 —— 这正是我们要的：
+    /// 与其让两个资源抢一个词、行为取决于查询顺序，不如直接拒绝。
+    pub async fn add_keyword(
+        &self,
+        keyword: &str,
+        scope: ResourceScope,
+        owner_id: &str,
+        resource_id: i64,
+    ) -> Result<()> {
+        let (keyword, owner) = (keyword.to_string(), owner_id.to_string());
+        self.with(move |conn| {
+            conn.execute(
+                "INSERT INTO resource_keywords(keyword, scope, owner_id, resource_id) VALUES(?1, ?2, ?3, ?4)",
+                rusqlite::params![keyword, scope.as_str(), owner, resource_id],
+            )
+            .with_context(|| format!("关键词 {keyword:?} 已被占用"))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 删除一个关键词，返回是否真的删掉了。
+    pub async fn remove_keyword(
+        &self,
+        keyword: &str,
+        scope: ResourceScope,
+        owner_id: &str,
+    ) -> Result<bool> {
+        let (keyword, owner) = (keyword.to_string(), owner_id.to_string());
+        self.with(move |conn| {
+            let n = conn.execute(
+                "DELETE FROM resource_keywords WHERE keyword = ?1 AND scope = ?2 AND owner_id = ?3",
+                rusqlite::params![keyword, scope.as_str(), owner],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    /// 删除资源及其全部关键词（关键词靠外键级联）。
+    pub async fn delete(
+        &self,
+        scope: ResourceScope,
+        owner_id: &str,
+        name: &str,
+    ) -> Result<bool> {
+        let (owner, name) = (owner_id.to_string(), name.to_string());
+        self.with(move |conn| {
+            let n = conn.execute(
+                "DELETE FROM resources WHERE scope = ?1 AND owner_id = ?2 AND name = ?3",
+                rusqlite::params![scope.as_str(), owner, name],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    /// 读一条系统设置。
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let key = key.to_string();
+        self.with(move |conn| {
+            conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+                .optional()
+                .context("读取系统设置失败")
+        })
+        .await
+    }
+
+    /// 写一条系统设置。
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let (key, value) = (key.to_string(), value.to_string());
+        self.with(move |conn| {
+            conn.execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES(?1, ?2, ?3) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                rusqlite::params![key, value, now_unix()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn load(conn: &Connection, id: i64) -> Result<Option<Resource>> {
+    let sql = format!("SELECT {RESOURCE_COLUMNS} FROM resources WHERE id = ?1");
+    let row = conn
+        .query_row(&sql, [id], read_row)
+        .optional()
+        .context("读取资源失败")?;
+    row.transpose()
+}
+
+fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Resource>> {
+    let scope: String = r.get(1)?;
+    let file_type: i64 = r.get(6)?;
+    Ok((|| {
+        Ok(Resource {
+            id: r.get(0)?,
+            scope: parse_scope(&scope)?,
+            owner_id: r.get(2)?,
+            name: r.get(3)?,
+            path: PathBuf::from(r.get::<_, String>(4)?),
+            file_name: r.get(5)?,
+            file_type: u8::try_from(file_type).context("file_type 超出 u8 范围")?,
+            description: r.get(7)?,
+        })
+    })())
+}
+
+/// 首次到达 v2 时播种默认系统控制者。
+///
+/// 用 `DO NOTHING` 而不是 `DO UPDATE`：**只在设置不存在时写入**。
+/// 否则控制者把列表清空后，下次启动默认值会复活，
+/// 「删掉最后一个控制者」就成了一个无法完成的动作。
+pub fn seed_defaults(conn: &Connection) -> Result<()> {
+    let value = format!("[\"{DEFAULT_SYSTEM_CONTROLLER}\"]");
+    conn.execute(
+        "INSERT INTO settings(key, value, updated_at) VALUES(?1, ?2, ?3) ON CONFLICT(key) DO NOTHING",
+        rusqlite::params![SYSTEM_CONTROLLERS_KEY, value, now_unix()],
+    )
+    .context("播种默认系统控制者失败")?;
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> ResourceStore {
+        let conn = Connection::open_in_memory().unwrap();
+        // migrate 只管建表，PRAGMA 在 schema::open 里设；内存库要自己补上，
+        // 否则外键级联不生效，删除资源的测试会假绿。
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        ResourceStore::new(conn)
+    }
+
+    fn spec(scope: ResourceScope, owner: &str, name: &str, path: &str) -> ResourceSpec {
+        ResourceSpec {
+            scope,
+            owner_id: owner.to_string(),
+            name: name.to_string(),
+            path: PathBuf::from(path),
+            file_name: "a.png".to_string(),
+            file_type: 1,
+            description: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_then_get_roundtrip() {
+        let s = store();
+        let id = s
+            .upsert(spec(ResourceScope::Group, "G1", "地图", "/img/map.png"))
+            .await
+            .unwrap();
+        let got = s.get(id).await.unwrap().expect("应当能取回");
+        assert_eq!(got.name, "地图");
+        assert_eq!(got.scope, ResourceScope::Group);
+        assert_eq!(got.owner_id, "G1");
+        assert_eq!(got.path, PathBuf::from("/img/map.png"));
+        assert_eq!(got.file_type, 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_same_name_updates_in_place() {
+        let s = store();
+        let first = s.upsert(spec(ResourceScope::Group, "G1", "地图", "/a.png")).await.unwrap();
+        let second = s.upsert(spec(ResourceScope::Group, "G1", "地图", "/b.png")).await.unwrap();
+        assert_eq!(first, second, "同名应当覆盖而不是新增");
+        assert_eq!(s.get(second).await.unwrap().unwrap().path, PathBuf::from("/b.png"));
+        assert_eq!(s.keywords().await.unwrap().len(), 1, "关键词不应重复登记");
+    }
+
+    #[tokio::test]
+    async fn same_keyword_may_exist_in_different_groups() {
+        let s = store();
+        s.upsert(spec(ResourceScope::Group, "G1", "地图", "/g1.png")).await.unwrap();
+        s.upsert(spec(ResourceScope::Group, "G2", "地图", "/g2.png")).await.unwrap();
+        assert_eq!(s.keywords().await.unwrap().len(), 2, "两个群各自持有一份同名关键词");
+    }
+
+    #[tokio::test]
+    async fn duplicate_keyword_in_same_scope_is_rejected() {
+        let s = store();
+        s.upsert(spec(ResourceScope::Group, "G1", "地图", "/a.png")).await.unwrap();
+        let other = s.upsert(spec(ResourceScope::Group, "G1", "别的", "/b.png")).await.unwrap();
+
+        let err = s
+            .add_keyword("地图", ResourceScope::Group, "G1", other)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("已被占用"), "应拒绝同群内重复关键词: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn system_resources_share_one_owner_slot() {
+        let s = store();
+        s.upsert(spec(ResourceScope::System, SYSTEM_OWNER, "地图", "/sys.png"))
+            .await
+            .unwrap();
+        let other = s
+            .upsert(spec(ResourceScope::System, SYSTEM_OWNER, "别的", "/sys2.png"))
+            .await
+            .unwrap();
+
+        // 这条断言是 NULL 陷阱的回归：owner_id 若用 NULL，
+        // 三列主键会失效，下面这次插入就会悄悄成功。
+        let err = s
+            .add_keyword("地图", ResourceScope::System, SYSTEM_OWNER, other)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("已被占用"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn same_keyword_coexists_across_group_and_system() {
+        let s = store();
+        s.upsert(spec(ResourceScope::Group, "G1", "地图", "/g.png")).await.unwrap();
+        s.upsert(spec(ResourceScope::System, SYSTEM_OWNER, "地图", "/s.png"))
+            .await
+            .unwrap();
+        // 群与系统各持一份，触发时由插件决定优先级。
+        assert_eq!(s.keywords().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_keywords_too() {
+        let s = store();
+        let id = s.upsert(spec(ResourceScope::Group, "G1", "地图", "/a.png")).await.unwrap();
+        s.add_keyword("海关", ResourceScope::Group, "G1", id).await.unwrap();
+        assert_eq!(s.keywords().await.unwrap().len(), 2);
+
+        assert!(s.delete(ResourceScope::Group, "G1", "地图").await.unwrap());
+        assert!(s.keywords().await.unwrap().is_empty(), "关键词应当随资源级联删除");
+        assert!(s.get(id).await.unwrap().is_none());
+        assert!(!s.delete(ResourceScope::Group, "G1", "地图").await.unwrap(), "重复删除应返回 false");
+    }
+
+    #[tokio::test]
+    async fn list_is_scoped_and_sorted() {
+        let s = store();
+        // 排序用 ASCII 名验证：SQLite 默认 BINARY 排序，中文按 UTF-8 字节序，
+        // 不是拼音序 —— 对「列表稳定可复现」够用，但别指望它符合中文语感。
+        s.upsert(spec(ResourceScope::Group, "G1", "b", "/b.png")).await.unwrap();
+        s.upsert(spec(ResourceScope::Group, "G1", "a", "/a.png")).await.unwrap();
+        s.upsert(spec(ResourceScope::Group, "G2", "c", "/c.png")).await.unwrap();
+        s.upsert(spec(ResourceScope::System, SYSTEM_OWNER, "d", "/d.png")).await.unwrap();
+
+        let g1 = s.list(ResourceScope::Group, "G1").await.unwrap();
+        let names: Vec<&str> = g1.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"], "只应包含本群资源，且按名称排序");
+        assert_eq!(s.list(ResourceScope::System, SYSTEM_OWNER).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settings_roundtrip() {
+        let s = store();
+        assert!(s.get_setting("nope").await.unwrap().is_none());
+        s.set_setting("k", "v1").await.unwrap();
+        assert_eq!(s.get_setting("k").await.unwrap().as_deref(), Some("v1"));
+        s.set_setting("k", "v2").await.unwrap();
+        assert_eq!(s.get_setting("k").await.unwrap().as_deref(), Some("v2"));
+    }
+
+    #[tokio::test]
+    async fn seed_writes_default_only_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        let seeded: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [SYSTEM_CONTROLLERS_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seeded, format!("[\"{DEFAULT_SYSTEM_CONTROLLER}\"]"));
+
+        // 清空后再次 migrate 不应把默认值写回来 ——
+        // 否则「删掉最后一个控制者」会是一个无法完成的动作。
+        conn.execute("DELETE FROM settings WHERE key = ?1", [SYSTEM_CONTROLLERS_KEY])
+            .unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = ?1",
+                [SYSTEM_CONTROLLERS_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "已清空的控制者列表不该被重新播种");
+    }
+}
+

@@ -25,6 +25,7 @@
 
 mod model;
 mod reader;
+mod resource;
 mod schema;
 mod writer;
 
@@ -37,12 +38,36 @@ use anyhow::{Context, Result};
 
 pub use model::{fmt_unix, now_unix, NewMessage, Scope, MAX_CONTENT_CHARS};
 pub use reader::{MAX_TEXT_CHARS, MAX_TEXT_ROWS};
+pub use resource::{
+    KeywordEntry, Resource, ResourceScope, ResourceSpec, ResourceStore, DEFAULT_SYSTEM_CONTROLLER,
+    SYSTEM_CONTROLLERS_KEY, SYSTEM_OWNER,
+};
 
 use reader::ReadHandle;
 use writer::WriteHandle;
 
 /// 一天的秒数。
 pub const DAY_SECS: u64 = 24 * 3600;
+
+/// 打开资源库。
+///
+/// 与消息库**共用同一个数据库文件**，但用独立连接 —— 资源操作由管理命令触发，
+/// 频率是人手级别，没必要挤进消息的批量写线程。
+///
+/// 异步入口：`Connection::open` 与 `PRAGMA journal_mode = WAL` 都是同步阻塞 IO，
+/// 不该直接跑在 runtime 的 worker 线程上。
+pub async fn open_resource_store(path: std::path::PathBuf) -> Result<ResourceStore> {
+    tokio::task::spawn_blocking(move || {
+        let conn = schema::open(&path)?;
+        // 自己保证表存在，**不能**依赖「消息库先打开」这个调用顺序 ——
+        // 顺序一变就会变成只有运行时才暴露的 `no such table: resources`。
+        // `migrate` 本身是幂等的（有测试守着）。
+        schema::migrate(&conn)?;
+        Ok(ResourceStore::new(conn))
+    })
+    .await
+    .context("资源库初始化任务 panic")?
+}
 
 #[derive(Debug, Clone)]
 pub struct StoreConfig {

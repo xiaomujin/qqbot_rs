@@ -332,6 +332,43 @@ mod tests {
         assert_eq!(g.wiki_link, "https://x/1");
     }
 
+    /// 实跑验证：打**真实**接口（任务 + 商人两份）。
+    ///
+    /// ```text
+    /// cargo test -p qqbot-plugins --lib -- --ignored live_tasks
+    /// ```
+    #[tokio::test]
+    #[ignore = "需要网络"]
+    async fn live_tasks_endpoint_parses() {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let mut bodies = Vec::new();
+        for url in [
+            "https://json.tarkov.dev/regular/tasks",
+            "https://json.tarkov.dev/regular/traders",
+        ] {
+            bodies.push(
+                http.get(url)
+                    .header("User-Agent", "Mozilla/5.0 qqbot-rs")
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("{url} 请求失败：{e}"))
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| panic!("{url} 读取失败：{e}")),
+            );
+        }
+        let items = parse_tasks(&bodies[0], &bodies[1]).expect("解析失败");
+        assert!(items.len() > 400, "应当解析出四百个以上任务，实际 {}", items.len());
+        // 商人解析必须真的生效 —— 否则界面上只会是一串十六进制 id。
+        let resolved = items.iter().filter(|t| !t.trader.is_empty()).count();
+        assert!(resolved > 400, "应当有四百个以上任务解析出商人，实际 {resolved}");
+        let kappa = items.iter().filter(|t| t.is_kappa).count();
+        assert!(kappa > 0, "应当有卡帕任务");
+    }
+
     #[test]
     fn broken_input_is_an_error_not_a_panic() {
         assert!(parse_tasks("不是 JSON", TRADERS).is_err());

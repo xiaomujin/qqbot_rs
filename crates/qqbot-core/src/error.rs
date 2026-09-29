@@ -25,9 +25,6 @@ pub enum CoreError {
     #[error("主动消息配额已用尽（单关系 20/min、1000/天）")]
     QuotaExceeded,
 
-    #[error("被动回复窗口已过期或次数用尽，已拒绝发送")]
-    PassiveExpired,
-
     #[error("会话 actor 已关闭")]
     Closed,
 

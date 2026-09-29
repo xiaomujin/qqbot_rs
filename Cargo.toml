@@ -8,7 +8,12 @@ edition = "2021"
 license = "MIT"
 rust-version = "1.85"
 
+# 内部 crate 与**全部**外部依赖的版本都只在这里声明一次。
+# 成员一律用 `{ workspace = true }` 继承，需要额外 feature 时在成员里追加
+# （Cargo 的 feature 是叠加的）。这样升版本只有一处要改，也不会出现
+# 「A crate 用 serde 1.0.229、B crate 用 1.0.200」这类漂移。
 [workspace.dependencies]
+# ---- 内部 crate ----
 qqbot-api = { path = "crates/qqbot-api" }
 qqbot-gateway = { path = "crates/qqbot-gateway" }
 qqbot-core = { path = "crates/qqbot-core" }
@@ -17,28 +22,32 @@ qqbot-render = { path = "crates/qqbot-render" }
 qqbot-plugins = { path = "crates/qqbot-plugins" }
 qqbot-store = { path = "crates/qqbot-store" }
 
-[package]
-name = "qqbot"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
+# ---- 外部依赖 ----
 anyhow = "1.0.104"
+async-trait = "0.1.92"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+jieba-rs = "0.11.0"
+md-5 = "0.11.0"
+metrics = "0.24.6"
 mimalloc = "0.1.52"
-qqbot-api = { version = "0.1.0", path = "crates/qqbot-api" }
-qqbot-core = { version = "0.1.0", path = "crates/qqbot-core" }
-qqbot-gateway = { version = "0.1.0", path = "crates/qqbot-gateway" }
-qqbot-media = { version = "0.1.0", path = "crates/qqbot-media" }
-qqbot-plugins = { version = "0.1.0", path = "crates/qqbot-plugins" }
-qqbot-render = { version = "0.1.0", path = "crates/qqbot-render" }
-qqbot-store = { version = "0.1.0", path = "crates/qqbot-store" }
+minijinja = "2.24.0"
+moka = { version = "0.12.16", features = ["sync"] }
+rand = "0.10.3"
+regex = "1.13.1"
+# 刻意关掉默认特性并显式选 native-tls：aws-lc-rs 需要 cmake/nasm，本机没有。
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "charset", "native-tls"] }
+resvg = "0.48.1"
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+sha1 = "0.11.0"
+thiserror = "2.0.21"
+tokio = "1.53.1"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "native-tls"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+usvg = "0.48.1"
 
 # 统一 lint 策略。项目已经做到 clippy 零警告，这里把它**固化**下来，
 # 而不是依赖每个人的本地习惯。
@@ -50,15 +59,36 @@ unsafe_code = "deny"
 # correctness 是「几乎肯定是 bug」的那一类，按错误处理。
 correctness = { level = "deny", priority = -1 }
 
+[package]
+name = "qqbot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+mimalloc = { workspace = true }
+qqbot-api = { workspace = true }
+qqbot-core = { workspace = true }
+qqbot-gateway = { workspace = true }
+qqbot-media = { workspace = true }
+qqbot-plugins = { workspace = true }
+qqbot-render = { workspace = true }
+qqbot-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
 
-[dev-dependencies]
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
-
-
 [lints]
 workspace = true
-

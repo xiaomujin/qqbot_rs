@@ -3,6 +3,9 @@
 //! 不依赖模板：布局是算法问题，直接在 Rust 里算好坐标再拼 SVG，
 //! 比「模板 + 前端 JS 布局」快一个数量级。
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
+
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,38 +82,39 @@ pub fn build_wordcloud_svg(words: &[WordItem], width: u32, height: u32, title: &
             // 基线约在 y + font 处。这里必须换算，否则文字会整体下沉一个字高，
             // 造成肉眼可见的重叠。
             let baseline = y + font;
-            body.push_str(&format!(
-                "  <text x=\"{x:.1}\" y=\"{baseline:.1}\" font-family=\"{FONT_STACK}\" font-size=\"{font:.1}\" font-weight=\"bold\" fill=\"{color}\" fill-opacity=\"{alpha:.2}\">{}</text>\n",
+            let _ = writeln!(
+                body,
+                "  <text x=\"{x:.1}\" y=\"{baseline:.1}\" font-family=\"{FONT_STACK}\" font-size=\"{font:.1}\" font-weight=\"bold\" fill=\"{color}\" fill-opacity=\"{alpha:.2}\">{}</text>",
                 escape_xml(&item.text)
-            ));
+            );
         }
     }
 
     let mut out = String::with_capacity(body.len() + 1024);
-    out.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"");
-    out.push_str(&width.to_string());
-    out.push_str("\" height=\"");
-    out.push_str(&height.to_string());
-    out.push_str("\" viewBox=\"0 0 ");
-    out.push_str(&width.to_string());
-    out.push(' ');
-    out.push_str(&height.to_string());
-    out.push_str("\">\n");
+    // 全部直接 writeln! 进 out：push_str(&format!(...)) 每次都要多分配一个
+    // 临时 String（clippy::format_push_string），而这里是渲染热路径。
+    let _ = writeln!(
+        out,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">"
+    );
     out.push_str("  <defs>\n    <radialGradient id=\"wcbg\" cx=\"50%\" cy=\"45%\" r=\"72%\">\n");
     out.push_str("      <stop offset=\"0%\" stop-color=\"#16213a\"/>\n");
     out.push_str("      <stop offset=\"100%\" stop-color=\"#0b1120\"/>\n");
     out.push_str("    </radialGradient>\n  </defs>\n");
-    out.push_str(&format!(
-        "  <rect x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\" rx=\"24\" fill=\"url(#wcbg)\"/>\n"
-    ));
-    out.push_str(&format!(
-        "  <text x=\"32\" y=\"58\" font-family=\"{FONT_STACK}\" font-size=\"30\" font-weight=\"bold\" fill=\"#7dd3fc\">{}</text>\n",
+    let _ = writeln!(
+        out,
+        "  <rect x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\" rx=\"24\" fill=\"url(#wcbg)\"/>"
+    );
+    let _ = writeln!(
+        out,
+        "  <text x=\"32\" y=\"58\" font-family=\"{FONT_STACK}\" font-size=\"30\" font-weight=\"bold\" fill=\"#7dd3fc\">{}</text>",
         escape_xml(title)
-    ));
-    out.push_str(&format!(
-        "  <line x1=\"32\" y1=\"78\" x2=\"{}\" y2=\"78\" stroke=\"#334155\" stroke-width=\"2\"/>\n",
+    );
+    let _ = writeln!(
+        out,
+        "  <line x1=\"32\" y1=\"78\" x2=\"{}\" y2=\"78\" stroke=\"#334155\" stroke-width=\"2\"/>",
         width - 32
-    ));
+    );
     out.push_str(&body);
     out.push_str("</svg>\n");
     out
@@ -191,12 +195,26 @@ fn is_wide(c: char) -> bool {
     )
 }
 
-fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+/// 单遍转义，且**只在真的需要时**才分配。
+///
+/// 原实现是 5 次链式 `replace`：每个词都要分配 5 个中间 `String`，
+/// 哪怕绝大多数词一个特殊字符都没有。
+fn escape_xml(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(|c| matches!(c, '&' | '<' | '>' | '"' | '\'')) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    Cow::Owned(out)
 }
 
 #[cfg(test)]

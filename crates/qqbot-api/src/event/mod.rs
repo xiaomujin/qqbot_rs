@@ -61,7 +61,10 @@ pub enum Event {
     GroupAddRobot(RawNotice),
     GroupDelRobot(RawNotice),
     /// 主动消息开关变更、群通知开关变更。
-    Notice { name: String, notice: RawNotice },
+    ///
+    /// `notice` 装箱：`RawNotice` 是 6 个 `Option<String>`（约 144 字节），
+    /// 不装箱会把整个 `Event` 撑大 —— 其余变体都刻意用 `Arc`/`Box` 压到 8 字节。
+    Notice { name: String, notice: Box<RawNotice> },
     /// 按钮 / 菜单互动。
     Interaction(Box<InteractionCreate>),
     /// 未识别事件（保留事件名，便于排查）。
@@ -139,7 +142,7 @@ impl Event {
             "C2C_MSG_REJECT" | "C2C_MSG_RECEIVE" | "GROUP_MSG_REJECT" | "GROUP_MSG_RECEIVE"
             | "MESSAGE_AUDIT_PASS" | "MESSAGE_AUDIT_REJECT" => Event::Notice {
                 name: name.to_string(),
-                notice: with_id(serde_json::from_str(raw).unwrap_or_default()),
+                notice: Box::new(with_id(serde_json::from_str(raw).unwrap_or_default())),
             },
 
             "INTERACTION_CREATE" => {

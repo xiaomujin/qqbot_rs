@@ -67,7 +67,7 @@ impl Handler for HelpPlugin {
         Handled::Consumed
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "帮助"
     }
 }

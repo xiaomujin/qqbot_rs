@@ -4,7 +4,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -149,6 +149,15 @@ pub async fn spawn_gateway(
 
     tracing::info!(url = %url, shards, max_concurrency, "网关信息已确定");
 
+    // 服务端下发的 `max_concurrency` 是「同时 Identify 的上限」。之前它只进日志，
+    // 超出的分片会被服务端拒绝 → InvalidSession → 退避重连，形成启动期抖动。
+    // 这里用信号量把它真正变成背压。0 表示未下发，退化为不限制。
+    let identify_gate = Arc::new(Semaphore::new(if max_concurrency > 0 {
+        max_concurrency as usize
+    } else {
+        shards as usize
+    }));
+
     let (events_tx, events_rx) = mpsc::channel::<Arc<Event>>(cfg.event_buffer);
     let mut tasks = JoinSet::new();
     let mut cmds = Vec::with_capacity(shards as usize);
@@ -167,6 +176,8 @@ pub async fn spawn_gateway(
             session_id: None,
             last_seq: 0,
             backoff: Backoff::default(),
+            identify_gate: Arc::clone(&identify_gate),
+            identify_permit: None,
         };
 
         tasks.spawn(actor.run());
@@ -192,6 +203,11 @@ struct GatewayActor {
     intents: Intents,
     events: mpsc::Sender<Arc<Event>>,
     inbox: mpsc::Receiver<GatewayCmd>,
+
+    /// 限制「同时 Identify」的分片数，对应服务端 `session_start_limit.max_concurrency`。
+    identify_gate: Arc<Semaphore>,
+    /// 本次 Identify 占用的许可，收到 READY 后归还给其他分片。
+    identify_permit: Option<OwnedSemaphorePermit>,
 
     // ---- 独占状态：只有本 actor 触碰 ----
     session_id: Option<String>,
@@ -283,9 +299,22 @@ impl GatewayActor {
                 send_op(&mut ws, OpCode::Resume, d).await?;
             }
             None => {
+                // 上一次 Identify 没等到 READY 就断线：先归还许可，
+                // 否则 max_concurrency = 1 时这个 actor 会把自己锁死。
+                self.identify_permit = None;
+
+                let permit = Arc::clone(&self.identify_gate)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| GatewayError::IdentifyGateClosed)?;
+
                 tracing::info!(shard = ?self.shard, intents = self.intents.bits(), "发送 Identify");
                 let d = self.api.identify(self.intents, self.shard).await?;
                 send_op(&mut ws, OpCode::Identify, d).await?;
+
+                // 许可保持到收到 READY 为止（在 `on_frame` 里归还）。
+                // 上面任何一步失败，permit 都会在这里被丢弃、立即归还。
+                self.identify_permit = Some(permit);
             }
         }
 
@@ -384,6 +413,8 @@ impl GatewayActor {
                         self.session_id = Some(ready.session_id.clone());
                         self.last_seq = raw.s.unwrap_or(1);
                         self.backoff.reset();
+                        // Identify 握手完成，把并发许可让给其他分片。
+                        self.identify_permit = None;
                         tracing::info!(
                             shard = ?ready.shard,
                             session_id = %ready.session_id,

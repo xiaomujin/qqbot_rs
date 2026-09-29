@@ -68,7 +68,7 @@ impl qqbot_core::Handler for PingPlugin {
         qqbot_core::Handled::Consumed
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ping"
     }
 }

@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qqbot_api::{ApiClient, SendResult, Target};
@@ -226,8 +225,6 @@ pub enum SessionMsg {
         request: SendRequest,
         ack: oneshot::Sender<Result<SendResult, CoreError>>,
     },
-    /// 淘汰会话状态。
-    Evict { key: String },
 }
 
 /// 会话 actor 注册表：按 key 哈希路由到固定数量的 shard。
@@ -356,9 +353,6 @@ impl SessionShard {
                                 .or_insert_with(|| SessionState::new(is_group, now))
                                 .observe(&msg_id, now);
                         }
-                        SessionMsg::Evict { key } => {
-                            states.remove(&key);
-                        }
                         SessionMsg::Send { key, request, ack } => {
                             let result = handle_send(&api, &mut states, &key, request).await;
                             let _ = ack.send(result);
@@ -481,9 +475,6 @@ async fn handle_send(
 pub fn recommended_shards() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) * 2
 }
-
-/// 共享的注册表句柄。
-pub type SharedRegistry = Arc<SessionRegistry>;
 
 #[cfg(test)]
 mod tests {

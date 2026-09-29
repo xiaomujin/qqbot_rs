@@ -30,17 +30,26 @@ impl History {
     }
 
     fn record(&mut self, key: &str, text: &str, limit: usize) {
-        if !self.sessions.contains_key(key) {
-            while self.sessions.len() >= self.max_sessions {
-                match self.order.pop_front() {
-                    Some(oldest) => {
-                        self.sessions.remove(&oldest);
-                    }
-                    None => break,
-                }
+        // 快路径：会话已存在。原来走 contains_key + entry 两次哈希，
+        // 并且无条件多分配一次 key.to_string() —— 而这条路才是常态。
+        if let Some(queue) = self.sessions.get_mut(key) {
+            if queue.len() >= limit {
+                queue.pop_front();
             }
-            self.order.push_back(key.to_string());
+            queue.push_back(text.to_string());
+            return;
         }
+
+        // 慢路径：新会话，先按 FIFO 淘汰。
+        while self.sessions.len() >= self.max_sessions {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.sessions.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        self.order.push_back(key.to_string());
 
         let queue = self.sessions.entry(key.to_string()).or_default();
         if queue.len() >= limit {
@@ -110,20 +119,27 @@ impl WordCloudPlugin {
         }
     }
 
-    /// 该消息是否是命令调用（首词命中任一命令）。
-    fn is_command(&self, text: &str) -> bool {
+    /// 该消息是否是命令调用（首词命中任一命令）。不取锁的纯判断，便于批量复用。
+    fn is_command_in(commands: &[String], text: &str) -> bool {
         let first = text.split_whitespace().next().unwrap_or("");
         if first.is_empty() {
             return false;
         }
-        self.commands
-            .read()
-            .map(|c| c.iter().any(|cmd| cmd == first))
-            .unwrap_or(false)
+        commands.iter().any(|cmd| cmd == first)
     }
 
+    /// 批量过滤掉命令调用。
+    ///
+    /// **只取一次读锁** —— 原来每条语料都要重新 `read()` 一次，
+    /// 500 条语料就是 500 次加解锁。
     fn filter_corpus(&self, texts: Vec<String>) -> Vec<String> {
-        texts.into_iter().filter(|t| !self.is_command(t)).collect()
+        let Ok(commands) = self.commands.read() else {
+            return texts;
+        };
+        texts
+            .into_iter()
+            .filter(|t| !Self::is_command_in(&commands, t))
+            .collect()
     }
 
     /// 当前跟踪的会话数（用于验证内存上限）。
@@ -209,7 +225,8 @@ fn rank(counts: HashMap<String, u32>) -> Vec<WordItem> {
 }
 
 fn count_words(jieba: &Jieba, texts: &[String]) -> HashMap<String, u32> {
-    let mut counts: HashMap<String, u32> = HashMap::new();
+    // 粗略预估：平均每条消息约 4 个有效词，避免反复 rehash。
+    let mut counts: HashMap<String, u32> = HashMap::with_capacity(texts.len() * 4);
     for text in texts {
         for token in tokenize(jieba, text) {
             *counts.entry(token).or_insert(0) += 1;
@@ -264,7 +281,7 @@ impl Handler for WordCloudPlugin {
         Handled::Next
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "词云"
     }
 }

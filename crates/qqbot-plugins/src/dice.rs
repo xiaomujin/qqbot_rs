@@ -37,7 +37,7 @@ impl Handler for DicePlugin {
         Handled::Consumed
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "骰子"
     }
 }

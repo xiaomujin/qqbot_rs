@@ -6,20 +6,19 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
-metrics = "0.24.6"
-qqbot-api = { version = "0.1.0", path = "../qqbot-api" }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["raw_value"] }
-thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "native-tls"] }
-tracing = "0.1.44"
+futures-util = { workspace = true, features = ["sink"] }
+metrics = { workspace = true }
+qqbot-api = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

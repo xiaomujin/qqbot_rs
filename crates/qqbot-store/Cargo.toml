@@ -6,12 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow = "1.0.104"
-rusqlite = { version = "0.37", features = ["bundled"] }
-tokio = { version = "1.53.1", features = ["rt", "sync", "time", "macros"] }
-tracing = "0.1.44"
-metrics = "0.24.6"
-
+anyhow = { workspace = true }
+metrics = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

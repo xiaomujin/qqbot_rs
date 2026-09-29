@@ -28,4 +28,8 @@ pub enum GatewayError {
 
     #[error("事件通道已关闭")]
     EventChannelClosed,
+
+    /// Identify 并发闸门被关闭（正常情况下不会发生，信号量从不 close）。
+    #[error("Identify 并发闸门已关闭")]
+    IdentifyGateClosed,
 }

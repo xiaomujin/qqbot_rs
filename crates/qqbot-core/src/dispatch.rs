@@ -186,9 +186,15 @@ fn is_plausible_ts(ts: i64, now: i64) -> bool {
 
 /// 日志里截断过长内容，避免把整篇消息灌进日志。
 fn truncate_for_log(s: &str, max: usize) -> String {
-    let mut out: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
-        out.push('…');
+    // 单遍完成。原实现先 `take(max).collect()` 再 `count()`，是两遍扫描，
+    // 而这个函数对**每条消息**都会调用一次。
+    let mut out = String::with_capacity(s.len().min(max.saturating_mul(4).saturating_add(3)));
+    for (i, c) in s.chars().enumerate() {
+        if i == max {
+            out.push('…');
+            break;
+        }
+        out.push(c);
     }
     out
 }

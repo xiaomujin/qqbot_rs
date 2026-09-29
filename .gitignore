@@ -1,0 +1,20 @@
+# 凭据：绝不入库
+bot.txt
+config.local.toml
+.env
+
+# 构建产物
+/target
+/target-verify
+**/*.rs.bk
+
+# 自检产物
+target/selftest/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+/data
+/docs

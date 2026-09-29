@@ -1,0 +1,64 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+qqbot-api = { path = "crates/qqbot-api" }
+qqbot-gateway = { path = "crates/qqbot-gateway" }
+qqbot-core = { path = "crates/qqbot-core" }
+qqbot-media = { path = "crates/qqbot-media" }
+qqbot-render = { path = "crates/qqbot-render" }
+qqbot-plugins = { path = "crates/qqbot-plugins" }
+qqbot-store = { path = "crates/qqbot-store" }
+
+[package]
+name = "qqbot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+mimalloc = "0.1.52"
+qqbot-api = { version = "0.1.0", path = "crates/qqbot-api" }
+qqbot-core = { version = "0.1.0", path = "crates/qqbot-core" }
+qqbot-gateway = { version = "0.1.0", path = "crates/qqbot-gateway" }
+qqbot-media = { version = "0.1.0", path = "crates/qqbot-media" }
+qqbot-plugins = { version = "0.1.0", path = "crates/qqbot-plugins" }
+qqbot-render = { version = "0.1.0", path = "crates/qqbot-render" }
+qqbot-store = { version = "0.1.0", path = "crates/qqbot-store" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# 统一 lint 策略。项目已经做到 clippy 零警告，这里把它**固化**下来，
+# 而不是依赖每个人的本地习惯。
+[workspace.lints.rust]
+# 本项目刻意零 unsafe（vendored 依赖里的不算）。这条保证它不会悄悄退化。
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# correctness 是「几乎肯定是 bug」的那一类，按错误处理。
+correctness = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+
+[lints]
+workspace = true
+

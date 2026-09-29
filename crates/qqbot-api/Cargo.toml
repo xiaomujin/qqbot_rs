@@ -1,0 +1,18 @@
+[package]
+name = "qqbot-api"
+description = "QQ 官方 API v2 协议类型与 HTTP 客户端"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "charset", "native-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1.44"
+
+
+[lints]
+workspace = true

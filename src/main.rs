@@ -1,0 +1,296 @@
+//! QQ 机器人（官方 API v2）。
+//!
+//! 运行模式：
+//! - `cargo run`（默认）   连接网关并开始服务
+//! - `cargo run -- check`  只校验凭据与网关信息，不建立长连接
+//! - `cargo run -- self-test` 离线渲染自检（不需要网络，不需要凭据）
+
+mod config;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use qqbot_api::ApiClient;
+use qqbot_core::{DispatchConfig, Dispatcher, Router, Services, SessionRegistry};
+use qqbot_gateway::{spawn_gateway, GatewayConfig};
+use qqbot_media::MediaUploader;
+use qqbot_render::{build_wordcloud_svg, RenderConfig, RenderService, WordItem};
+use qqbot_store::MessageStore;
+use tracing_subscriber::EnvFilter;
+
+use crate::config::Config;
+
+/// 高并发场景下 mimalloc 明显优于系统分配器。
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "run".to_string());
+
+    match mode.as_str() {
+        "self-test" | "--self-test" => {
+            init_tracing("debug");
+            self_test().await
+        }
+        "check" | "--check" => {
+            init_tracing("info");
+            check().await
+        }
+        "help" | "--help" | "-h" => {
+            println!("用法: qqbot [run|check|self-test]");
+            Ok(())
+        }
+        other => {
+            if other != "run" {
+                eprintln!("未知模式 {other:?}，回退到 run");
+            }
+            init_tracing("info");
+            run().await
+        }
+    }
+}
+
+fn init_tracing(default_level: &str) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+}
+
+/// 离线渲染自检：验证 resvg 链路、中文字体与缓存是否正常。
+async fn self_test() -> Result<()> {
+    let out_dir = std::path::Path::new("target/selftest");
+    std::fs::create_dir_all(out_dir)?;
+
+    let started = Instant::now();
+    let render = RenderService::new(RenderConfig::default());
+    println!("渲染服务就绪（初始化 {:?}）", started.elapsed());
+
+    // ---- 1) 模板卡片 ----
+    let t0 = Instant::now();
+    let card = render
+        .render_template(
+            "card.svg",
+            serde_json::json!({
+                "title": "自检 · 模板渲染",
+                "rows": [
+                    {"label": "渲染后端", "value": "resvg (纯 Rust)"},
+                    {"label": "外部依赖", "value": "无 Chromium / 无 Node"},
+                    {"label": "中文字体", "value": "系统字体"},
+                    {"label": "输出倍率", "value": "2.0x"}
+                ],
+                "width": 720,
+                "height": 340
+            }),
+        )
+        .await
+        .context("模板渲染失败")?;
+    let card_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    std::fs::write(out_dir.join("card.png"), &card.png)?;
+    println!(
+        "✓ card.svg   {}x{}  {} 字节  {:.1}ms",
+        card.width,
+        card.height,
+        card.png.len(),
+        card_ms
+    );
+
+    // ---- 2) 词云（算法布局，非模板） ----
+    // 刻意用长尾分布：字号按 sqrt(词频) 缩放、透明度同维度，
+    // 线性映射会让尾部词全部挤在最小字号上。
+    let words = vec![
+        WordItem::new("签到", 100),
+        WordItem::new("词云", 55),
+        WordItem::new("骰子", 30),
+        WordItem::new("机器人", 18),
+        WordItem::new("渲染", 10),
+        WordItem::new("性能", 6),
+        WordItem::new("rust", 4),
+        WordItem::new("异步", 3),
+        WordItem::new("actor", 2),
+        WordItem::new("缓存", 1),
+    ];
+    let svg = build_wordcloud_svg(&words, 900, 640, "自检 · 词云");
+    let t1 = Instant::now();
+    let cloud = render.render_svg(svg).await.context("词云渲染失败")?;
+    let cloud_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    std::fs::write(out_dir.join("wordcloud.png"), &cloud.png)?;
+    println!(
+        "✓ wordcloud  {}x{}  {} 字节  {:.1}ms",
+        cloud.width,
+        cloud.height,
+        cloud.png.len(),
+        cloud_ms
+    );
+
+    // ---- 3) 缓存命中 ----
+    let t2 = Instant::now();
+    let _ = render
+        .render_template(
+            "card.svg",
+            serde_json::json!({
+                "title": "自检 · 模板渲染",
+                "rows": [
+                    {"label": "渲染后端", "value": "resvg (纯 Rust)"},
+                    {"label": "外部依赖", "value": "无 Chromium / 无 Node"},
+                    {"label": "中文字体", "value": "系统字体"},
+                    {"label": "输出倍率", "value": "2.0x"}
+                ],
+                "width": 720,
+                "height": 340
+            }),
+        )
+        .await?;
+    println!("✓ 缓存命中   二次渲染 {:?}", t2.elapsed());
+
+    let stats = render.stats();
+    println!("渲染统计: {stats:?}");
+    println!("产物目录: {}", out_dir.display());
+    Ok(())
+}
+
+/// 只校验凭据，不建立长连接。
+async fn check() -> Result<()> {
+    let cfg = Config::load()?;
+    println!("AppID = {}（密钥长度 {}）", cfg.app_id, cfg.client_secret.len());
+
+    let api = ApiClient::new(cfg.api_config())?;
+    let token = api.token().await.context("获取 access_token 失败")?;
+    println!("✓ access_token 获取成功（长度 {}）", token.len());
+
+    let info = api.gateway().await.context("获取网关信息失败")?;
+    println!(
+        "✓ 网关地址 = {}，建议分片 = {}，剩余 session 额度 = {:?}",
+        info.url,
+        info.shards,
+        info.session_start_limit.as_ref().map(|s| s.remaining)
+    );
+    Ok(())
+}
+
+/// 正常服务模式。
+async fn run() -> Result<()> {
+    let cfg = Config::load()?;
+    let api = ApiClient::new(cfg.api_config())?;
+
+    let media = MediaUploader::new(api.clone());
+    let render = RenderService::new(cfg.render.clone());
+    let sessions = Arc::new(SessionRegistry::new(
+        api.clone(),
+        cfg.session_shards,
+        256,
+        Duration::from_secs(10),
+    ));
+    // 消息持久化。**打开失败不致命**：降级为内存语料，机器人照常服务。
+    let store = match &cfg.store {
+        Some(sc) => match MessageStore::open_async(sc.clone()).await {
+            Ok(s) => {
+                // 第一次 tick 立即触发 → 进程启动就会清理一次过期消息
+                s.spawn_sweeper();
+                tracing::info!(
+                    path = %sc.path.display(),
+                    retention_days = sc.retention_days(),
+                    "消息持久化已启用"
+                );
+                Some(s)
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "消息存储打开失败，词云将退化为内存语料");
+                None
+            }
+        },
+        None => {
+            tracing::warn!("未启用消息持久化（QQBOT_DB_PATH 为空），词云只用内存语料");
+            None
+        }
+    };
+
+    let mut services = Services::new(api.clone(), media, render, sessions);
+    if let Some(s) = &store {
+        services = services.with_store(Arc::clone(s));
+    }
+    let services = Arc::new(services);
+
+    let mut router = Router::new();
+    qqbot_plugins::register(&mut router, store.clone(), cfg.wordcloud_window);
+    let route_count = router.len();
+
+    let dispatcher = Arc::new(Dispatcher::new(
+        router,
+        services.clone(),
+        DispatchConfig {
+            dedup_capacity: cfg.dedup_capacity,
+            concurrency: cfg.dispatch_concurrency,
+            ..DispatchConfig::default()
+        },
+    ));
+
+    tracing::info!(
+        app_id = %cfg.app_id,
+        routes = route_count,
+        session_shards = cfg.session_shards,
+        "启动中"
+    );
+
+    let gateway = spawn_gateway(
+        api,
+        GatewayConfig {
+            intents: cfg.intents,
+            shards: cfg.shards,
+            event_buffer: cfg.event_buffer,
+            url_override: cfg.gateway_url.clone(),
+        },
+    )
+    .await
+    .context("建立网关连接失败")?;
+
+    let mut gateway = gateway;
+    tracing::info!(shards = gateway.shard_count(), "网关已连接，开始接收事件");
+
+    // ⚠️ 事件处理必须**派生**出去，不能在 select 分支里直接 await：
+    // 否则主循环要等 handle() 完全返回才去 poll gateway.recv()，
+    // dispatch 里的 Semaphore(concurrency) 永远只能拿到 1 个许可，
+    // 一条慢命令（如词云）会阻塞所有消息处理，还会把网关事件挤到丢弃。
+    let mut inflight = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("收到退出信号");
+                break;
+            }
+            event = gateway.recv() => {
+                match event {
+                    Some(event) => {
+                        let dispatcher = Arc::clone(&dispatcher);
+                        inflight.spawn(async move { dispatcher.handle(event).await });
+                    }
+                    None => {
+                        tracing::warn!("事件通道已关闭");
+                        break;
+                    }
+                }
+            }
+            // 回收已完成的任务，避免 JoinSet 无界增长。
+            Some(_) = inflight.join_next(), if !inflight.is_empty() => {}
+        }
+    }
+
+    // 给在途事件一个收尾窗口；超时则强制取消，不为了几个慢插件卡住退出。
+    if tokio::time::timeout(Duration::from_secs(10), async {
+        while inflight.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(inflight = inflight.len(), "在途事件未在 10s 内处理完，强制退出");
+        inflight.shutdown().await;
+    }
+
+    gateway.shutdown().await;
+    tracing::info!("已退出");
+    Ok(())
+}

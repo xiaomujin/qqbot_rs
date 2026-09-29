@@ -1066,3 +1066,29 @@ async fn wordcloud_lookalike_does_not_trigger() {
         "近似说法不该触发词云渲染"
     );
 }
+
+/// B8 塔科夫时间：纯本地换算，回两行时刻（左 / 右相差 12 小时）。
+#[tokio::test]
+async fn tarkov_time_replies_with_two_clocks() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"TKF_1","author":{"member_openid":"U1"},"content":"塔科夫时间","group_openid":"GTKF"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GTKF/messages")
+        .expect("应当回复塔科夫时间");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "与源项目一致：两行时刻: {text}");
+    for line in lines {
+        assert_eq!(line.len(), 8, "HH:MM:SS: {text}");
+        assert_eq!(line.as_bytes()[2], b':', "HH:MM:SS: {text}");
+    }
+}

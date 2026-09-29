@@ -7,6 +7,7 @@ pub mod dice;
 pub mod help;
 pub mod http;
 pub mod resource;
+pub mod tarkov;
 pub mod timewin;
 pub mod wordcloud;
 
@@ -92,6 +93,8 @@ pub async fn register(
     }
     // 通配监听器：只用于累积语料，不作为用户可见命令出现在帮助里。
     router.on_listener(Matcher::Any, wordcloud.clone());
+
+    router.on_any(Matcher::Exact("塔科夫时间".into()), tarkov::TarkovPlugin::new());
 
     let routes = router.routes();
     router.on_any(Matcher::Command("帮助".into()), HelpPlugin::new(routes));

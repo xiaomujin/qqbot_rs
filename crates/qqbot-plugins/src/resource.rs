@@ -22,13 +22,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use qqbot_core::{Ctx, FnHandler, Handled, Handler, Matcher, Router, Rule, Scope};
 use qqbot_media::FileType;
+// 存储层的 `Scope`（group/c2c）与插件层的 `Scope`（群/单聊/全部）同名但无关，
+// 所以给前者起个别名 —— 直接用会让 `recent_raw` 收到错误的类型。
 use qqbot_store::{
-    KeywordEntry, Resource, ResourceScope, ResourceSpec, ResourceStore, SYSTEM_CONTROLLERS_KEY,
-    SYSTEM_OWNER,
+    now_unix, KeywordEntry, MessageStore, Resource, ResourceScope, ResourceSpec, ResourceStore,
+    Scope as MessageScope, SYSTEM_CONTROLLERS_KEY, SYSTEM_OWNER,
 };
 
 /// 触发监听器的优先级。
@@ -39,6 +42,79 @@ const TRIGGER_PRIORITY: i32 = -100;
 
 /// 从消息收录时允许的最大字节数。
 const MAX_RESOURCE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// 往前找多久之内的消息。
+///
+/// 用户习惯是「先发图，再发命令」，所以命令到达时附件在**上一条**消息里。
+const ATTACHMENT_WINDOW: Duration = Duration::from_secs(600);
+/// 一次最多回看多少条消息。
+///
+/// 消息库里存的是**原始事件 JSON**，附件只能从原文里读 ——
+/// 类型里没声明的字段在入库前就没了。
+const ATTACHMENT_SCAN: usize = 50;
+
+/// 「引用消息」在 `msg_elements[].message_type` 里的取值（实测）。
+const QUOTED_MESSAGE_TYPE: i64 = 103;
+
+/// 一条待收录的附件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingImage {
+    url: String,
+    content_type: Option<String>,
+    filename: Option<String>,
+    size: Option<u64>,
+}
+
+/// 从一条消息的原始 JSON 里取出可收录的附件。
+///
+/// 两个来源，按精确度排序：
+///
+/// 1. **本条消息**的 `attachments`；
+/// 2. **被引用的消息** —— 实测回复一条带图的消息时，事件里会多出
+///    `message_type = 103` 的 `msg_elements`，被引用消息的附件就在它的
+///    `attachments` 里（`message_scene.ext` 同时多出 `ref_msg_idx`）。
+///
+/// 用 `serde_json::Value` 而不是反序列化成 `MessageEvent`：这里只要几个字段，
+/// 而原文里可能有当前类型还没声明的结构 —— 解析成强类型反而会丢掉要找的东西。
+fn attachment_from_raw(raw: &str) -> Option<PendingImage> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+
+    if let Some(found) = value.get("attachments").and_then(first_attachment) {
+        return Some(found);
+    }
+
+    value
+        .get("msg_elements")?
+        .as_array()?
+        .iter()
+        .filter(|e| {
+            e.get("message_type").and_then(serde_json::Value::as_i64)
+                == Some(QUOTED_MESSAGE_TYPE)
+        })
+        .find_map(|e| e.get("attachments").and_then(first_attachment))
+}
+
+/// 取附件数组里的第一个可用项。
+fn first_attachment(attachments: &serde_json::Value) -> Option<PendingImage> {
+    let first = attachments.as_array()?.first()?;
+    let url = first.get("url")?.as_str()?;
+    // 空地址要当成「没有」，否则会把一个必定失败的上传留到后面才炸。
+    if url.is_empty() {
+        return None;
+    }
+    Some(PendingImage {
+        url: url.to_string(),
+        content_type: first
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        filename: first
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        size: first.get("size").and_then(serde_json::Value::as_u64),
+    })
+}
 
 /// 保留命令名。
 ///
@@ -59,6 +135,9 @@ const RESERVED: &[&str] = &[
 #[derive(Clone)]
 pub struct ResourcesConfig {
     pub store: Arc<ResourceStore>,
+    /// 消息库。收录时靠它找回「上一条带图片的消息」——
+    /// 不再另建内存缓存：消息本来就落库了，再存一份只会多一处不一致。
+    pub messages: Arc<MessageStore>,
     /// 从消息收录的素材保存目录（basepath）。
     pub basepath: PathBuf,
     /// 显式配置的系统控制者。`Some` 时**覆盖数据库**，也是锁定恢复通道。
@@ -122,6 +201,7 @@ struct State {
 /// 共享状态与逻辑。
 struct Core {
     store: Arc<ResourceStore>,
+    messages: Arc<MessageStore>,
     basepath: PathBuf,
     /// 下载附件用。与其它插件共用同一个客户端，超时策略统一。
     http: reqwest::Client,
@@ -145,6 +225,7 @@ impl Core {
         let index = Index::build(&cfg.store.keywords().await?);
         Ok(Arc::new(Self {
             store: cfg.store,
+            messages: cfg.messages,
             basepath: cfg.basepath,
             http,
             state: RwLock::new(State { index, controllers }),
@@ -302,6 +383,48 @@ impl Core {
         Ok((id, size))
     }
 
+    /// 决定这次「收录」用哪张图。
+    ///
+    /// 三级回退，从最精确到最宽松：
+    ///
+    /// 1. 本条消息自带的附件；
+    /// 2. **被引用的消息**的附件（`msg_elements` 里的 `message_type = 103`）；
+    /// 3. 回消息库找该会话最近一条带附件的消息 —— 覆盖「先发图、再发命令」
+    ///    这种图片和命令分属两条消息、且没有回复关系的用法。
+    ///
+    /// 去库里找而不是另建内存缓存：消息本来就落库了，再存一份只是多一处
+    /// 需要保持一致的状态，而它并不会更准确。
+    async fn resolve_pending(&self, ctx: &Ctx) -> Option<PendingImage> {
+        if let Some(att) = ctx.message.first_attachment()
+            && let Some(url) = att.url.as_deref().filter(|u| !u.is_empty())
+        {
+            return Some(PendingImage {
+                url: url.to_string(),
+                content_type: att.content_type.clone(),
+                filename: att.filename.clone(),
+                size: att.size,
+            });
+        }
+
+        // 引用消息：事件原文里带着被引用消息的附件，比扫库精确得多，
+        // 也不受「消息是否已落盘」的影响。
+        if let Some(raw) = ctx.message.raw.as_deref()
+            && let Some(found) = attachment_from_raw(raw)
+        {
+            return Some(found);
+        }
+
+        let scope = if ctx.is_group() { MessageScope::Group } else { MessageScope::C2c };
+        let since = now_unix() - ATTACHMENT_WINDOW.as_secs() as i64;
+        let raws = self
+            .messages
+            .recent_raw(scope, ctx.target.id(), since, ATTACHMENT_SCAN)
+            .await
+            .map_err(|err| tracing::warn!(error = %err, "回查消息库失败"))
+            .ok()?;
+        raws.iter().find_map(|raw| attachment_from_raw(raw))
+    }
+
     async fn collect_from_attachment(
         &self,
         ctx: &Ctx,
@@ -309,19 +432,17 @@ impl Core {
         owner: &str,
         name: &str,
     ) -> Result<(i64, u64)> {
-        let att = ctx
-            .message
-            .first_attachment()
-            .ok_or_else(|| anyhow!("本条消息没有附件，请把图片和命令发在同一条消息里"))?;
-        if let Some(size) = att.size
+        let pending = self.resolve_pending(ctx).await.ok_or_else(|| {
+            anyhow!(
+                "没有找到可收录的图片。把图片和命令发在同一条消息里，或先发图片再发命令（10 分钟内有效）"
+            )
+        })?;
+        if let Some(size) = pending.size
             && size > MAX_RESOURCE_BYTES
         {
             return Err(anyhow!("附件过大（{size} 字节），上限 {MAX_RESOURCE_BYTES} 字节"));
         }
-        let url = att
-            .url
-            .as_deref()
-            .ok_or_else(|| anyhow!("附件没有下载地址"))?;
+        let url = pending.url.as_str();
 
         let resp = self.http.get(url).send().await.context("下载附件失败")?;
         if !resp.status().is_success() {
@@ -336,7 +457,7 @@ impl Core {
         }
 
         // QQ 的附件地址是带签名的临时地址，**必须落盘**，否则迟早取不到。
-        let ext = guess_ext(att.content_type.as_deref(), att.filename.as_deref(), url);
+        let ext = guess_ext(pending.content_type.as_deref(), pending.filename.as_deref(), url);
         let file_name = format!("{}.{ext}", sanitize(name));
         let dir = self.basepath.join(scope.as_str()).join(dir_name(owner));
         tokio::fs::create_dir_all(&dir)
@@ -618,7 +739,10 @@ impl Core {
 
     fn usage(&self, scope: ResourceScope) -> String {
         let cmd = self.cmd(scope, "收录");
-        format!("用法：{cmd} 关键词（本条消息带图片），或 {cmd} 关键词 文件路径 [说明]")
+        format!(
+            "用法：{cmd} 关键词 —— 图片与命令发在同一条消息里，或先发图片再发命令；\
+             也可用 {cmd} 关键词 文件路径 [说明] 从服务器本地导入"
+        )
     }
 
     async fn reply(&self, ctx: &Ctx, text: String) {
@@ -910,5 +1034,74 @@ mod tests {
         assert!(RESERVED.contains(&"资源列表"));
         assert!(RESERVED.contains(&"系统控制者"));
     }
+    #[test]
+    fn reads_attachment_from_stored_raw_json() {
+        // 形状取自实测的图片消息：content 为空，图片全在 attachments 里。
+        let raw = r#"{"content":"","attachments":[{"content":"","content_type":"image/jpeg","filename":"a.jpg","height":2400,"size":1434766,"url":"https://example.invalid/x.jpg","width":1080}]}"#;
+        let pending = attachment_from_raw(raw).expect("应当取到附件");
+        assert_eq!(pending.url, "https://example.invalid/x.jpg");
+        assert_eq!(pending.content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(pending.filename.as_deref(), Some("a.jpg"));
+        assert_eq!(pending.size, Some(1434766));
+    }
+
+    /// 实测结构：回复一条带图的消息时，被引用消息的附件在 `msg_elements` 里，
+    /// 且该元素的 `message_type = 103`。
+    ///
+    /// 这条是「回复收录」能成立的全部依据 —— 早先基于非回复消息得出的
+    /// 「引用内容不在事件里」是错的。
+    #[test]
+    fn reads_attachment_from_a_quoted_message() {
+        let raw = r#"{"content":" 123","message_type":103,"message_scene":{"ext":["ref_msg_idx=REFIDX_AAA","msg_idx=REFIDX_BBB","auth_token=T"],"source":"default"},"msg_elements":[{"message_type":103,"content":"1\n2","msg_idx":"REFIDX_AAA","attachments":[{"content":"","content_type":"image/jpeg","filename":"a.jpeg","height":440,"size":47195,"url":"https://example.invalid/quoted.jpeg","width":583}]}]}"#;
+        let pending = attachment_from_raw(raw).expect("应当从引用消息里取到附件");
+        assert_eq!(pending.url, "https://example.invalid/quoted.jpeg");
+        assert_eq!(pending.filename.as_deref(), Some("a.jpeg"));
+        assert_eq!(pending.size, Some(47195));
+        assert_eq!(pending.content_type.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn own_attachment_wins_over_the_quoted_one() {
+        let raw = r#"{"attachments":[{"url":"https://example.invalid/own.png"}],"msg_elements":[{"message_type":103,"attachments":[{"url":"https://example.invalid/quoted.png"}]}]}"#;
+        assert_eq!(
+            attachment_from_raw(raw).unwrap().url,
+            "https://example.invalid/own.png",
+            "本条消息自带的附件优先"
+        );
+    }
+
+    #[test]
+    fn quoted_message_without_attachment_yields_none() {
+        let raw = r#"{"msg_elements":[{"message_type":103,"content":"纯文本"}]}"#;
+        assert!(attachment_from_raw(raw).is_none());
+    }
+
+    #[test]
+    fn non_quoted_msg_elements_are_ignored() {
+        // message_type 不是 103 的元素不是「被引用的消息」，不能当成图源。
+        let raw = r#"{"msg_elements":[{"message_type":0,"attachments":[{"url":"https://x/a.png"}]}]}"#;
+        assert!(attachment_from_raw(raw).is_none());
+    }
+
+    #[test]
+    fn raw_without_attachment_yields_none() {
+        assert!(attachment_from_raw(r#"{"content":"纯文本"}"#).is_none());
+        assert!(attachment_from_raw(r#"{"attachments":[]}"#).is_none());
+        assert!(attachment_from_raw(r#"{"attachments":[{"content_type":"image/png"}]}"#).is_none());
+        // 空地址要当成没有，否则会把一个必定失败的上传留到后面才炸。
+        assert!(attachment_from_raw(r#"{"attachments":[{"url":""}]}"#).is_none());
+        assert!(attachment_from_raw("不是 JSON").is_none());
+    }
+
+    #[test]
+    fn raw_missing_optional_fields_still_works() {
+        let pending = attachment_from_raw(r#"{"attachments":[{"url":"https://x/a"}]}"#)
+            .expect("只有 url 也应当可用");
+        assert_eq!(pending.url, "https://x/a");
+        assert!(pending.content_type.is_none());
+        assert!(pending.filename.is_none());
+        assert!(pending.size.is_none());
+    }
 }
+
 

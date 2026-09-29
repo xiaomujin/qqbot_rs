@@ -232,22 +232,27 @@ async fn run(cfg: Config) -> Result<()> {
     // 资源库与消息库**共用同一个文件**，但用独立连接：
     // 资源操作由管理命令触发，频率是人手级别，没必要挤进消息的批量写线程。
     // 打开失败不致命，降级为「不注册资源命令」。
-    let resources = match &cfg.store {
-        Some(sc) => match qqbot_store::open_resource_store(sc.path.clone()).await {
-            Ok(rs) => {
-                tracing::info!(basepath = %cfg.resources_basepath.display(), "资源管理已启用");
-                Some(qqbot_plugins::ResourcesConfig {
-                    store: Arc::new(rs),
-                    basepath: cfg.resources_basepath.clone(),
-                    controllers: cfg.system_controllers.clone(),
-                })
+    // 资源管理依赖**两个**库：资源映射，以及消息库（收录时要回查上一条带图片的消息）。
+    // 所以只有消息库确实打开了才启用它。
+    let resources = match (&cfg.store, &store) {
+        (Some(sc), Some(messages)) => {
+            match qqbot_store::open_resource_store(sc.path.clone()).await {
+                Ok(rs) => {
+                    tracing::info!(basepath = %cfg.resources_basepath.display(), "资源管理已启用");
+                    Some(qqbot_plugins::ResourcesConfig {
+                        store: Arc::new(rs),
+                        messages: Arc::clone(messages),
+                        basepath: cfg.resources_basepath.clone(),
+                        controllers: cfg.system_controllers.clone(),
+                    })
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "资源库打开失败，资源管理命令不可用");
+                    None
+                }
             }
-            Err(err) => {
-                tracing::error!(error = %err, "资源库打开失败，资源管理命令不可用");
-                None
-            }
-        },
-        None => {
+        }
+        _ => {
             tracing::warn!("未启用消息持久化，资源管理命令不可用");
             None
         }

@@ -196,6 +196,10 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/presigned/") {
         return ("200 OK", String::new());
     }
+    // 资源收录会去下载附件。内容无所谓 —— 插件只负责把字节落盘。
+    if path.starts_with("/test-image") {
+        return ("200 OK", "FAKE-IMAGE-BYTES".to_string());
+    }
     if path.contains("/upload_part_finish") {
         return ("200 OK", "{}".to_string());
     }
@@ -736,12 +740,23 @@ async fn stack_with_resource(
         .await
         .expect("写入资源");
 
+    // 资源管理依赖消息库（收录时要回查上一条带图片的消息），所以两个都要建。
+    let messages = MessageStore::open_async(StoreConfig {
+        path: dir.join("msg.db"),
+        flush_interval: Duration::from_millis(10),
+        sweep_interval: Duration::from_secs(3600),
+        ..StoreConfig::default()
+    })
+    .await
+    .expect("打开消息库");
+
     let cfg = qqbot_plugins::ResourcesConfig {
         store,
+        messages: Arc::clone(&messages),
         basepath: dir.join("collected"),
         controllers: None,
     };
-    (build_stack_with(mock, None, Some(cfg)).await, dir)
+    (build_stack_with(mock, Some(messages), Some(cfg)).await, dir)
 }
 
 /// 关键词触发：应当读到磁盘上的文件、上传富媒体、并走**被动回复**。
@@ -837,5 +852,177 @@ async fn non_resource_keyword_falls_through() {
         body["content"].as_str().unwrap_or_default().contains("pong"),
         "ping 被资源监听器吞掉了: {body}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 用户的实际用法：**先发图片，再发命令**（两条独立消息）。
+///
+/// 图片消息的 content 是空的，命令消息本身没有附件 —— 两者靠
+/// 「回消息库找上一条带附件的消息」关联起来。
+#[tokio::test]
+async fn collect_picks_up_an_image_from_a_previous_message() {
+    let mock = MockServer::start().await;
+    let dir = std::env::temp_dir().join(format!("qqbot-collect-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+
+    let store = Arc::new(
+        qqbot_store::open_resource_store(dir.join("res.db"))
+            .await
+            .expect("打开资源库"),
+    );
+    let messages = MessageStore::open_async(StoreConfig {
+        path: dir.join("msg.db"),
+        flush_interval: Duration::from_millis(10),
+        sweep_interval: Duration::from_secs(3600),
+        ..StoreConfig::default()
+    })
+    .await
+    .expect("打开消息库");
+    let cfg = qqbot_plugins::ResourcesConfig {
+        store: Arc::clone(&store),
+        messages: Arc::clone(&messages),
+        basepath: dir.join("collected"),
+        controllers: None,
+    };
+    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+
+    // 1) 先发图片：content 为空，图片在 attachments 里。
+    let url = format!("{}/test-image.png", mock.base_url());
+    let img = format!(
+        r#"{{"id":"IN_IMG","author":{{"member_openid":"U1"}},"content":"","group_openid":"GCOL","attachments":[{{"url":"{url}","content_type":"image/png","filename":"a.png","size":16}}]}}"#
+    );
+    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
+    // 入库是**异步批量**的（写线程每 flush_interval 提交一次），
+    // 不等一下的话命令会跑在图片落库之前。
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // 2) 再发命令：本身没有附件，必须回消息库找回上一条的图。
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_CMD","author":{"member_openid":"U1","member_role":"admin"},"content":"收录 测试","group_openid":"GCOL"}"#,
+    )
+    .await;
+
+    let items = store
+        .list(qqbot_store::ResourceScope::Group, "GCOL")
+        .await
+        .expect("列资源");
+    assert_eq!(items.len(), 1, "应当收录到一条资源");
+    assert_eq!(items[0].name, "测试");
+    let saved = std::fs::read(&items[0].path).expect("素材应当已落盘");
+    assert_eq!(saved, b"FAKE-IMAGE-BYTES", "落盘的应当是下载到的字节");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **允许收录别人发的图**：同会话内不做发送者限制。
+///
+/// 群里常见的用法就是「有人发了张图，管理员顺手收录」。
+#[tokio::test]
+async fn collect_accepts_another_senders_image() {
+    let mock = MockServer::start().await;
+    let dir = std::env::temp_dir().join(format!("qqbot-other-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+
+    let store = Arc::new(
+        qqbot_store::open_resource_store(dir.join("res.db"))
+            .await
+            .expect("打开资源库"),
+    );
+    let messages = MessageStore::open_async(StoreConfig {
+        path: dir.join("msg.db"),
+        flush_interval: Duration::from_millis(10),
+        sweep_interval: Duration::from_secs(3600),
+        ..StoreConfig::default()
+    })
+    .await
+    .expect("打开消息库");
+    let cfg = qqbot_plugins::ResourcesConfig {
+        store: Arc::clone(&store),
+        messages: Arc::clone(&messages),
+        basepath: dir.join("collected"),
+        controllers: None,
+    };
+    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+
+    // U1 发图，U2 收录。
+    let img = format!(
+        r#"{{"id":"IN_IMG2","author":{{"member_openid":"U1"}},"content":"","group_openid":"GST","attachments":[{{"url":"{}/test-image.png"}}]}}"#,
+        mock.base_url()
+    );
+    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_CMD2","author":{"member_openid":"U2","member_role":"admin"},"content":"收录 别人发的","group_openid":"GST"}"#,
+    )
+    .await;
+
+    let items = store
+        .list(qqbot_store::ResourceScope::Group, "GST")
+        .await
+        .expect("列资源");
+    assert_eq!(items.len(), 1, "别人发的图也应当能收录");
+    assert_eq!(items[0].name, "别人发的");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **回复收录**：命令消息本身带 `message_type = 103` 与 `msg_elements`，
+/// 被引用消息的图片就在里面。
+///
+/// 这条路比「扫消息库」精确得多，而且不依赖消息是否已落盘 ——
+/// 所以它排在扫库之前。
+#[tokio::test]
+async fn collect_reads_the_quoted_message_attachment() {
+    let mock = MockServer::start().await;
+    let dir = std::env::temp_dir().join(format!("qqbot-quote-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+
+    let store = Arc::new(
+        qqbot_store::open_resource_store(dir.join("res.db"))
+            .await
+            .expect("打开资源库"),
+    );
+    let messages = MessageStore::open_async(StoreConfig {
+        path: dir.join("msg.db"),
+        flush_interval: Duration::from_millis(10),
+        sweep_interval: Duration::from_secs(3600),
+        ..StoreConfig::default()
+    })
+    .await
+    .expect("打开消息库");
+    let cfg = qqbot_plugins::ResourcesConfig {
+        store: Arc::clone(&store),
+        messages: Arc::clone(&messages),
+        basepath: dir.join("collected"),
+        controllers: None,
+    };
+    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+
+    // 结构照抄实测的回复消息：content 是用户输入，图在被引用的消息里。
+    let url = format!("{}/test-image.png", mock.base_url());
+    let reply = format!(
+        concat!(
+            r#"{{"id":"IN_QUOTE","author":{{"member_openid":"U1","member_role":"admin"}},"content":" 收录 引用图","group_openid":"GQ","message_type":103,"msg_elements":[{{"message_type":103,"content":"1\n2","attachments":[{{"content_type":"image/jpeg","filename":"a.jpeg","size":47195,"url":"{}"}}]}}]}}"#
+        ),
+        url
+    );
+    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &reply).await;
+
+    let items = store
+        .list(qqbot_store::ResourceScope::Group, "GQ")
+        .await
+        .expect("列资源");
+    assert_eq!(items.len(), 1, "应当从引用消息里收录成功");
+    assert_eq!(items[0].name, "引用图");
+    let saved = std::fs::read(&items[0].path).expect("素材应当已落盘");
+    assert_eq!(saved, b"FAKE-IMAGE-BYTES");
+
     let _ = std::fs::remove_dir_all(&dir);
 }

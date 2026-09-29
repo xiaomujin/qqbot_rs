@@ -7,6 +7,7 @@ pub mod dice;
 pub mod help;
 pub mod http;
 pub mod ba;
+pub mod bili;
 pub mod resource;
 pub mod tarkov;
 pub mod timewin;
@@ -17,6 +18,7 @@ pub use dice::{parse_spec, DicePlugin};
 pub use help::HelpPlugin;
 pub use resource::{register_resources, ResourcesConfig};
 pub use ba::BaConfig;
+pub use bili::BiliConfig;
 pub use tarkov::TarkovConfig;
 pub use wordcloud::{tokenize, WordCloudPlugin};
 
@@ -43,6 +45,8 @@ pub struct PluginsConfig {
     pub tarkov: TarkovConfig,
     /// BA 图片查询的配置。
     pub ba: BaConfig,
+    /// B 站链接解析的配置。
+    pub bili: BiliConfig,
 }
 
 /// 把所有内置插件注册到路由表。
@@ -106,6 +110,11 @@ pub async fn register(
     }
     // 通配监听器：只用于累积语料，不作为用户可见命令出现在帮助里。
     router.on_listener(Matcher::Any, wordcloud.clone());
+
+    // B 站链接：不是命令，是「看到链接就展开」。
+    // 用监听器而不是命令路由 —— 帮助里列一条正则没有意义，
+    // 而它本来就不需要用户主动输入。
+    router.on_listener(Matcher::Any, bili::BiliPlugin::new(cfg.bili.clone(), http.clone()));
 
     // `ba <名>`：正则路由，真正的判定在插件里（`parse_query`），两者保持一致。
     router.on_any(

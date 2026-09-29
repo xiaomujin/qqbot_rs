@@ -274,6 +274,7 @@ async fn run(cfg: Config) -> Result<()> {
             resources: resources.clone(),
             tarkov: qqbot_plugins::TarkovConfig::default(),
             ba: qqbot_plugins::BaConfig::default(),
+            bili: qqbot_plugins::BiliConfig::default(),
         },
     )
     .await

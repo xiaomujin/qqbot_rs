@@ -218,6 +218,29 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/test-image") {
         return ("200 OK", "FAKE-IMAGE-BYTES".to_string());
     }
+    // B 站稿件信息 + 封面。
+    if path.starts_with("/x/web-interface/view") {
+        return (
+            "200 OK",
+            json!({
+                "code": 0,
+                "message": "0",
+                "data": {
+                    "bvid": "BV1mokxBtEZh",
+                    "aid": 115914909417877i64,
+                    "title": "测试稿件",
+                    "pic": format!("http://{addr}/cover.jpg"),
+                    "pubdate": 1_759_000_000,
+                    "owner": {"name": "测试UP"},
+                    "stat": {"view": 12345, "danmaku": 67, "coin": 8, "like": 9, "reply": 10, "share": 11}
+                }
+            })
+            .to_string(),
+        );
+    }
+    if path.starts_with("/cover.jpg") {
+        return ("200 OK", "FAKE-COVER".to_string());
+    }
     // 塔科夫服务器状态：形状照 status.escapefromtarkov.com 的响应。
     if path.starts_with("/api/services") {
         return (
@@ -354,6 +377,9 @@ async fn build_stack_with(
             ba: qqbot_plugins::BaConfig {
                 api: format!("{}/api/v2/image?name=", mock.base_url()),
                 cdn: format!("{}/image/s", mock.base_url()),
+            },
+            bili: qqbot_plugins::BiliConfig {
+                view_api: format!("{}/x/web-interface/view?bvid=", mock.base_url()),
             },
         },
     )
@@ -1355,4 +1381,49 @@ async fn tarkov_server_status_lists_services_in_chinese() {
     assert!(text.contains("战局匹配：🟡部分故障"), "{text}");
     assert!(text.contains("总体状态：⚙️正在更新"), "{text}");
     assert!(text.contains("信息：正在维护"), "{text}");
+}
+
+/// C1：链接消息自动展开成卡片，且图与文字在**同一条**消息里 ——
+/// 拆成两条会白占一次被动回复配额（群聊一共只有 5 次）。
+#[tokio::test]
+async fn bilibili_link_expands_into_one_card_message() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"BILI_1","author":{"member_openid":"U1"},"content":"https://www.bilibili.com/video/BV1mokxBtEZh","group_openid":"GBL"}"#,
+    )
+    .await;
+
+    let sends = mock.all(|h| h.path == "/v2/groups/GBL/messages");
+    assert_eq!(sends.len(), 1, "图与文字必须在同一条消息里，不能拆开");
+    let body: serde_json::Value = serde_json::from_str(&sends[0].body).unwrap();
+    assert_eq!(body["msg_type"], 7, "卡片是富媒体: {body}");
+    assert!(body["media"]["file_info"].is_string(), "应当带 file_info: {body}");
+    let content = body["content"].as_str().unwrap_or_default();
+    assert!(content.contains("测试稿件"), "{content}");
+    assert!(content.contains("播放：1.2万 弹幕：67"), "{content}");
+    assert!(content.contains("UP：测试UP"), "{content}");
+}
+
+/// 同一条链接在一个会话里只展开一次 —— 群里常被几个人先后转发。
+#[tokio::test]
+async fn bilibili_link_is_not_expanded_twice_in_a_row() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    for id in ["BILI_D1", "BILI_D2"] {
+        let payload = format!(
+            r#"{{"id":"{id}","author":{{"member_openid":"U1"}},"content":"https://www.bilibili.com/video/BV1mokxBtEZh","group_openid":"GBL2"}}"#
+        );
+        feed(&dispatcher, "GROUP_MESSAGE_CREATE", &payload).await;
+    }
+
+    assert_eq!(
+        mock.all(|h| h.path == "/v2/groups/GBL2/messages").len(),
+        1,
+        "同一条链接短时间内不该重复展开"
+    );
 }

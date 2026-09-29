@@ -204,6 +204,30 @@ impl Ctx {
             .await
     }
 
+    /// 发送素材并附上一段说明文字。
+    ///
+    /// 官方 API 的富媒体消息**可以**带 `content`，所以图和说明能一条发完，
+    /// 不必拆成两条 —— 那会白占一次被动回复配额（群聊一共只有 5 次）。
+    pub async fn reply_media_with_text(
+        &self,
+        file_type: FileType,
+        file_name: &str,
+        bytes: &[u8],
+        text: &str,
+    ) -> Result<SendResult, CoreError> {
+        let file_info = self
+            .services
+            .media
+            .upload_bytes(&self.target, file_type, file_name, bytes)
+            .await?;
+        self.services
+            .send(
+                SendRequest::media_with_text(self.target.clone(), file_info, text)
+                    .replying_to(self.message.id.clone()),
+            )
+            .await
+    }
+
     /// 渲染模板并作为图片回复。
     pub async fn reply_template(
         &self,

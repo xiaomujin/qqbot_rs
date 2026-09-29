@@ -334,6 +334,11 @@ event="GROUP_MESSAGE_CREATE" content="<@0F1E2D3C4B5A69788796A5B4C3D2E1F0> 日报
 | 2 | Markdown | `markdown` | ✅ | - |
 | 7 | 富媒体 | `media`（需先上传得 `file_info`） | ✅ | ✅ |
 
+> `msg_type=7` **可以同时带 `content`**，客户端把图和文字放在同一个气泡里。
+> 想发「封面图 + 说明」时用一条消息就够，拆成两条会白占一次被动回复配额
+> （群聊一条入站消息一共只有 5 次）。对应 `SendRequest::media_with_text` /
+> `Ctx::reply_media_with_text`。
+
 ---
 
 ## 8. 频率与时效规则（★ 核心约束）

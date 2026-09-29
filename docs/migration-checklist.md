@@ -207,11 +207,34 @@
 或者直接在群里**发图 + 回复它**发 `系统收录 <关键词>`（图片会落到 `basepath`）。
 需要的图片：地图、任务流程图、任务物品图、信誉栏位图、boss丢包时间、3x4道具、耳机强度。
 
-### B3 / B4 / B5 / B6 / B7 —— 等 `api.tarkov.dev` 恢复
+### B3 / B4 / B5 / B6 / B7 —— 卡在**本地化名称**，不是数据本身
 
-该 GraphQL 后端自 2026-09-29 起对**所有**查询返回 422
-（连 `{ __typename }` 都失败，而主站返回 200），是它自己的故障。
-**B7 代码已完成**，接口恢复后跑一次即可确认；B3/B4/B5/B6 需要它恢复才能开工。
+`api.tarkov.dev` 的 GraphQL 后端自 2026-09-29 起对所有查询返回 422
+（连 `{ __typename }` 都失败，而主站返回 200）。
+
+**但数据并没有丢** —— 静态 JSON 一直在线，且 GraphQL 挂掉时它照样能用：
+
+| 路径 | 大小 | 内容 |
+|---|---|---|
+| `https://json.tarkov.dev/regular/items` | 17 MB | 5442 件物品（含弹药、价格） |
+| `https://json.tarkov.dev/regular/tasks` | 2.1 MB | 任务 |
+| `https://json.tarkov.dev/regular/maps` | 8.6 MB | 17 张地图（含 BOSS 刷新率） |
+| `https://json.tarkov.dev/regular/traders` | 50 KB | 商人 |
+
+**真正缺的是本地化名称。** 静态 JSON 里的 `name` 是**翻译键**而不是文本，
+形如 `"5448be9a4bdc2dfd2f8b456a Name"`；`?lang=zh` / `?locale=zh` 都无效。
+只有 GraphQL 的 `lang: zh` 会把它解析成中文，而那个后端正是挂掉的那个。
+站点的 i18next 语言包也没挂在可猜到的路径上（`/locales/**` 一律回落到 SPA 页面）。
+
+**所以：数据有、名字没有。** 解除方式二选一 ——
+
+1. 等 `api.tarkov.dev` 的 GraphQL 恢复（**B7 代码已完成**，恢复后跑一次即可确认）；
+2. **导出 cq-bot 的 `bot.db`**，里面有现成的 `bullet`（2629 行）与
+   `tkf_task` / `tkf_task_target`，**且是中文名**。
+   这条路比等上游更可控，而且能一次解锁 B4 + B6。
+
+如果接受英文/原始名，也可以用静态 JSON 直接做 —— 但翻译键形态的名字对用户没有意义，
+所以没有按这条路实现。
 
 ### C2 / C6 —— 等 B 站登录 Cookie
 

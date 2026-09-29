@@ -23,6 +23,16 @@ pub enum ReadReq {
         limit: usize,
         reply: oneshot::Sender<Result<Vec<String>>>,
     },
+    /// 取最近若干条消息的**原始 JSON**。
+    ///
+    /// 附件、引用这类结构只能从原文里读 —— 类型里没声明的字段在入库前就没了。
+    RecentRaw {
+        scope: String,
+        target_id: String,
+        since: i64,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<String>>>,
+    },
     PurgeBefore {
         cutoff: i64,
         reply: oneshot::Sender<Result<usize>>,
@@ -69,6 +79,24 @@ impl ReadHandle {
         rx.await.context("存储读线程未回复")?
     }
 
+    pub async fn recent_raw(
+        &self,
+        scope: &str,
+        target_id: &str,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let (reply, rx) = oneshot::channel();
+        self.dispatch(ReadReq::RecentRaw {
+            scope: scope.to_string(),
+            target_id: target_id.to_string(),
+            since,
+            limit,
+            reply,
+        })?;
+        rx.await.context("存储读线程未回复")?
+    }
+
     pub async fn purge_before(&self, cutoff: i64) -> Result<usize> {
         let (reply, rx) = oneshot::channel();
         self.dispatch(ReadReq::PurgeBefore { cutoff, reply })?;
@@ -87,6 +115,9 @@ fn reader_loop(conn: Connection, rx: Receiver<ReadReq>) {
         match req {
             ReadReq::RecentTexts { scope, target_id, since, limit, reply } => {
                 let _ = reply.send(recent_texts(&conn, &scope, &target_id, since, limit));
+            }
+            ReadReq::RecentRaw { scope, target_id, since, limit, reply } => {
+                let _ = reply.send(recent_raw(&conn, &scope, &target_id, since, limit));
             }
             ReadReq::PurgeBefore { cutoff, reply } => {
                 let _ = reply.send(purge_before(&conn, cutoff));
@@ -131,6 +162,33 @@ fn recent_texts(
             tracing::debug!(rows = out.len(), chars, "词云语料已达字符上限，提前截断");
             break;
         }
+    }
+    Ok(out)
+}
+
+/// 取最近若干条消息的原始 JSON，按时间倒序。
+///
+/// `raw IS NOT NULL` 直接过滤掉 v3 之前入库的老行 —— 它们没有原文可读。
+fn recent_raw(
+    conn: &Connection,
+    scope: &str,
+    target_id: &str,
+    since: i64,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let limit = limit.min(MAX_TEXT_ROWS) as i64;
+    let mut stmt = conn.prepare_cached(
+        "SELECT raw FROM messages
+          WHERE scope = ?1 AND target_id = ?2 AND created_at >= ?3 AND raw IS NOT NULL
+          ORDER BY created_at DESC
+          LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![scope, target_id, since, limit], |r| {
+        r.get::<_, String>(0)
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
     }
     Ok(out)
 }

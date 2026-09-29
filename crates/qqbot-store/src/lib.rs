@@ -173,6 +173,22 @@ impl MessageStore {
             .await
     }
 
+    /// 某会话在时间窗口内的**原始事件 JSON**（按时间倒序）。
+    ///
+    /// 资源收录靠它找回「上一条带图片的消息」—— 附件不在 `content` 里，
+    /// 只有原文有。
+    pub async fn recent_raw(
+        &self,
+        scope: Scope,
+        target_id: &str,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        self.reader
+            .recent_raw(scope.as_str(), target_id, since, limit)
+            .await
+    }
+
     /// 删除早于 `cutoff`（Unix 秒）的消息，返回删除行数。
     pub async fn purge_before(&self, cutoff: i64) -> Result<usize> {
         self.reader.purge_before(cutoff).await

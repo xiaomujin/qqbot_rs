@@ -16,8 +16,8 @@ use crate::model::NewMessage;
 
 /// 消息 id 是主键 → 重复推送天然被忽略，与内存 dedup 形成双保险。
 const INSERT_SQL: &str = "INSERT OR IGNORE INTO messages
-    (id, scope, target_id, sender_id, sender_name, event_name, content, created_at)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+    (id, scope, target_id, sender_id, sender_name, event_name, content, raw, created_at)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 
 /// 写入侧计数器，用于观测丢弃率。
 #[derive(Debug, Default)]
@@ -139,6 +139,7 @@ fn flush(conn: &mut Connection, buf: &mut Vec<NewMessage>, stats: &WriteStats) {
                     m.sender_name,
                     m.event_name,
                     m.truncated_content().as_ref(),
+                    m.raw,
                     m.created_at,
                 ])?;
             }

@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         sender_id: None,
         sender_name: Some("seed".into()),
         event_name: "SEED".into(),
+        raw: None,
         content,
         created_at: now_unix() - days * DAY_SECS as i64,
     });

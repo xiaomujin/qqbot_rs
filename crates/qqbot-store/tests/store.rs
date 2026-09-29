@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use qqbot_store::{MessageStore, NewMessage, Scope, StoreConfig, DAY_SECS};
+use qqbot_store::{now_unix, MessageStore, NewMessage, Scope, StoreConfig, DAY_SECS};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -43,6 +43,7 @@ fn msg(id: &str, scope: Scope, target: &str, content: &str, ts: i64) -> NewMessa
             Scope::C2c => "C2C_MESSAGE_CREATE".into(),
         },
         content: content.into(),
+        raw: None,
         created_at: ts,
     }
 }
@@ -258,4 +259,32 @@ async fn sweeper_task_runs_and_purges_expired_rows() {
     assert_eq!(store.count().await.unwrap(), 1, "超过保留期的消息应被定时任务删除");
     let texts = store.recent_texts(Scope::Group, "G", 0, 10).await.unwrap();
     assert_eq!(texts, vec!["刚刚"]);
+}
+
+/// 原始事件 JSON 要能落库并按会话查回来 —— 资源收录靠它找附件。
+///
+/// 附件不在 `content` 里，而类型又只声明了文档写到的字段，
+/// 所以「原文」是唯一能事后还原完整消息的东西。
+#[tokio::test]
+async fn raw_payload_is_persisted_and_queryable() {
+    let store = MessageStore::open(cfg(temp_db())).unwrap();
+
+    let raw = r#"{"content":"","attachments":[{"url":"https://example.invalid/a.jpg"}]}"#;
+    let mut with_raw = msg("M_RAW", Scope::Group, "G1", "", now_unix());
+    with_raw.raw = Some(raw.to_string());
+    store.record(with_raw);
+
+    // 没有原文的消息（调用方没提供）不该被查出来，
+    // 否则收录会拿到一条读不出附件的空壳。
+    store.record(msg("M_PLAIN", Scope::Group, "G1", "纯文本", now_unix()));
+
+    assert_eq!(wait_for_rows(&store, 2).await, 2);
+
+    let raws = store.recent_raw(Scope::Group, "G1", 0, 10).await.unwrap();
+    assert_eq!(raws.len(), 1, "只有带原文的那条应当被返回：{raws:?}");
+    assert_eq!(raws[0], raw);
+
+    // 会话与场景都要隔离，否则会捞到别的群的图。
+    assert!(store.recent_raw(Scope::Group, "G2", 0, 10).await.unwrap().is_empty());
+    assert!(store.recent_raw(Scope::C2c, "G1", 0, 10).await.unwrap().is_empty());
 }

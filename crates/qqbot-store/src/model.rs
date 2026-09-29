@@ -39,6 +39,8 @@ pub struct NewMessage {
     /// 事件名，保留来源便于排查（GROUP_MESSAGE_CREATE / C2C_MESSAGE_CREATE …）。
     pub event_name: String,
     pub content: String,
+    /// 原始事件 JSON。`None` 表示调用方没提供（例如老数据或测试）。
+    pub raw: Option<String>,
     /// Unix 秒。
     pub created_at: i64,
 }
@@ -84,6 +86,7 @@ mod tests {
             sender_name: None,
             event_name: "GROUP_MESSAGE_CREATE".into(),
             content: content.into(),
+            raw: None,
             created_at: 0,
         }
     }

@@ -8,7 +8,8 @@ use rusqlite::Connection;
 /// 当前 schema 版本，记录在 `meta` 表里。
 ///
 /// v2 增加了资源映射（`resources` / `resource_keywords`）与系统设置（`settings`）。
-pub const SCHEMA_VERSION: i64 = 2;
+/// v3 给 `messages` 增加 `raw` 列，保存**原始事件 JSON**。
+pub const SCHEMA_VERSION: i64 = 3;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -19,6 +20,10 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_name TEXT,
     event_name  TEXT NOT NULL,
     content     TEXT NOT NULL,
+    -- 原始事件 JSON。类型里只声明了文档写到的字段，**没声明的会在
+    -- 反序列化时丢掉** —— 附件、引用、聊天记录恰恰是文档最含糊的部分。
+    -- 存原文是为了将来能重新提取，而不是只能靠当时解析出的那几个字段。
+    raw         TEXT,
     created_at  INTEGER NOT NULL
 );
 
@@ -109,6 +114,34 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 逐版本升级**已存在的表**。
+///
+/// `DDL` 里的 `CREATE TABLE IF NOT EXISTS` 只能建新表；
+/// 给已存在的表**加列**必须显式 ALTER。这一步最容易漏 ——
+/// 新库一切正常，旧库直到读那一列时才报 `no such column: raw`。
+fn upgrade(conn: &Connection, from: i64) -> Result<()> {
+    if from < 3 {
+        add_column_if_missing(conn, "messages", "raw", "TEXT")?;
+    }
+    Ok(())
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    // 先查一遍再 ALTER：`ALTER TABLE ADD COLUMN` 没有 IF NOT EXISTS，
+    // 重复执行会直接报错。
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == column);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+            .with_context(|| format!("给 {table} 增加列 {column} 失败"))?;
+        tracing::info!(table, column, "已增加列");
+    }
+    Ok(())
+}
+
 /// 建表并写入 schema 版本。
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(DDL).context("建表失败")?;
@@ -137,6 +170,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         Some(v) if v < SCHEMA_VERSION => {
             // 目前只有 v1，后续版本在这里按序升级。
             tracing::info!(from = v, to = SCHEMA_VERSION, "数据库 schema 已升级");
+            upgrade(conn, v)?;
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",

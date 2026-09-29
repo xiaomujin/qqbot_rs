@@ -46,6 +46,17 @@ api_url = "https://v2.alapi.cn/api/zaobao?format=json"
 # 结果缓存时长（秒，1 ~ 86400）。早报一天只更新一次，默认 30 分钟。
 cache_secs = 1800
 
+# ---- 资源管理 ----
+[resources]
+# 从消息收录的素材落盘根目录。
+# 注意：用「收录 关键词 文件路径」导入时**不复制**，只记录该路径。
+basepath = "data/resources"
+# 系统控制者 openid 列表。**注释掉则沿用数据库里的值**
+# （首次建库会自动播种一个默认控制者）。
+# 显式设置时**覆盖数据库** —— 这也是控制者列表被改坏后的恢复通道。
+# 环境变量：QQBOT_SYSTEM_CONTROLLERS（逗号或空格分隔）。
+# system_controllers = ["0123456789ABCDEF0123456789ABCDEF"]
+
 # ---- 按需打开（默认值随机器规格而定，所以默认注释掉）----
 # 接口基址（调试 / 私有化部署用）
 # api_base = "https://api.bot.qq.com"

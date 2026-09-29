@@ -47,6 +47,13 @@ cargo run -- self-test     # 离线渲染自检（无需网络与凭据）
 | `骰子` / `骰子 3d6` / `roll 2d20` | 掷骰（Markdown 渲染） |
 | `词云` | 用消息库里最近的群聊消息渲染词云图片（字号与透明度按词频映射） |
 | `日报` | 当日早报长图（需在配置里填 `daily.token`，否则该指令不注册） |
+| `<关键词>` | 发送收录的素材。**本群优先，其次系统资源** |
+| `资源列表` | 本群资源 + 系统资源清单（含别名与说明） |
+| `收录 <关键词>` | **群管理员**：把本条消息的图片收进本群；或 `收录 <关键词> <路径>` 从服务器本地导入（保真） |
+| `别名 <关键词> <新词>` | **群管理员**：给本群资源加触发词 |
+| `删除资源 <关键词>` | **群管理员**：删除本群资源（删不到系统资源） |
+| `系统收录` / `系统别名` / `系统删除` / `系统列表` | **系统控制者**：管理全局资源 |
+| `系统控制者 添加/移除 <openid>` | **系统控制者**：管理控制者名单 |
 | `帮助` | 自动生成的指令表 |
 
 ---
@@ -85,6 +92,8 @@ cp config.example.toml config.toml
 | `daily.token` | `QQBOT_DAILY_TOKEN` | 空 | 早报接口令牌。**留空则不注册 `日报` 指令** |
 | `daily.api_url` | `QQBOT_DAILY_API_URL` | alapi 早报 | 早报接口地址（任何返回 `data.image` 的接口都能换） |
 | `daily.cache_secs` | `QQBOT_DAILY_CACHE_SECS` | `1800` | 早报缓存时长（1 ~ 86400） |
+| `resources.basepath` | `QQBOT_RESOURCES_BASEPATH` | `data/resources` | 从消息收录的素材落盘目录 |
+| `resources.system_controllers` | `QQBOT_SYSTEM_CONTROLLERS` | 数据库 | 系统控制者 openid（逗号或空格分隔）。**显式设置时覆盖数据库** |
 
 > 「缺失」与「非法」是两回事：**没写** → 用默认值；**写了但解析不了**
 > （例如 `QQBOT_RETENTION_DAYS=abc`）→ 启动直接报错，不会静默回退成 365 天。

@@ -41,6 +41,8 @@ struct MockInner {
     fail_graphql: AtomicBool,
     /// BA 图片接口是否返回「模糊搜索」（code 101）。
     ba_fuzzy: AtomicBool,
+    /// 番剧更新页是否返回一个解析不出条目的页面（模拟站点改版）。
+    bangumi_empty: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -55,7 +57,7 @@ impl MockServer {
     }
 
     fn builder() -> MockBuilder {
-        MockBuilder { fail_first_sends: 0, fail_graphql: false, ba_fuzzy: false }
+        MockBuilder { fail_first_sends: 0, fail_graphql: false, ba_fuzzy: false, bangumi_empty: false }
     }
 
     fn base_url(&self) -> String {
@@ -79,6 +81,7 @@ struct MockBuilder {
     fail_first_sends: usize,
     fail_graphql: bool,
     ba_fuzzy: bool,
+    bangumi_empty: bool,
 }
 
 impl MockBuilder {
@@ -97,6 +100,11 @@ impl MockBuilder {
         self
     }
 
+    fn bangumi_empty(mut self, on: bool) -> Self {
+        self.bangumi_empty = on;
+        self
+    }
+
     async fn start(self) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
         let addr = listener.local_addr().unwrap();
@@ -106,6 +114,7 @@ impl MockBuilder {
             fail_first_sends: self.fail_first_sends,
             fail_graphql: AtomicBool::new(self.fail_graphql),
             ba_fuzzy: AtomicBool::new(self.ba_fuzzy),
+            bangumi_empty: AtomicBool::new(self.bangumi_empty),
         });
 
         let inner_for_task = inner.clone();
@@ -240,6 +249,22 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     }
     if path.starts_with("/cover.jpg") {
         return ("200 OK", "FAKE-COVER".to_string());
+    }
+    // 番剧更新页：结构照 agedm.io/update 的片段。
+    if path.starts_with("/update") {
+        if inner.bangumi_empty.load(Ordering::Relaxed) {
+            return ("200 OK", "<html><body>改版了</body></html>".to_string());
+        }
+        return (
+            "200 OK",
+            concat!(
+                r#"<span class="video_item--info rounded-1 text-truncate">第12集(完结)</span>"#,
+                r#"<a href="http://x/detail/1" class="link-light text-decoration-none stretched-link">柔光魔女 &amp; 公司</a>"#,
+                r#"<span class="video_item--info rounded-1 text-truncate">第01集</span>"#,
+                r#"<a href="http://x/detail/2" class="link-light text-decoration-none stretched-link">转生贵族</a>"#,
+            )
+            .to_string(),
+        );
     }
     // UP 主信息：订阅时用它校验 UID。
     if path.starts_with("/x/web-interface/card") {
@@ -392,6 +417,9 @@ async fn build_stack_with(
                 view_api: format!("{}/x/web-interface/view?bvid=", mock.base_url()),
                 card_api: format!("{}/x/web-interface/card?mid=", mock.base_url()),
                 store: None,
+            },
+            bangumi: qqbot_plugins::BangumiConfig {
+                update_url: format!("{}/update", mock.base_url()),
             },
         },
     )
@@ -1568,4 +1596,56 @@ async fn bili_subscribe_rejects_unknown_uid() {
     assert!(text.contains("订阅失败"), "{text}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// E4 番剧日历：抓更新页 → 提取条目 → 复用 `card.svg` 渲染成图。
+///
+/// 源项目靠 Chromium 截图，本项目必须纯 Rust 渲染。
+#[tokio::test]
+async fn bangumi_calendar_renders_a_card() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"BG_1","author":{"member_openid":"U1"},"content":"今日番剧","group_openid":"GBG"}"#,
+    )
+    .await;
+
+    assert!(
+        mock.find(|h| h.path.starts_with("/update")).is_some(),
+        "应当抓取更新页"
+    );
+    let send = match mock.find(|h| h.path == "/v2/groups/GBG/messages") {
+        Some(hit) => hit,
+        None => panic!(
+            "应当回复卡片，实际收到的请求: {:?}",
+            mock.hits().iter().map(|h| h.path.clone()).collect::<Vec<_>>()
+        ),
+    };
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    assert_eq!(body["msg_type"], 7, "卡片是图片: {body}");
+    assert!(body["media"]["file_info"].is_string(), "应当走富媒体上传: {body}");
+}
+
+/// 站点改版导致提取为空时，要给一句可操作的提示，而不是一张空卡片。
+#[tokio::test]
+async fn bangumi_reports_when_nothing_was_parsed() {
+    let mock = MockServer::builder().bangumi_empty(true).start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"BG_2","author":{"member_openid":"U1"},"content":"最新番剧","group_openid":"GBG2"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GBG2/messages")
+        .expect("应当回复提示");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("没有解析出"), "{text}");
 }

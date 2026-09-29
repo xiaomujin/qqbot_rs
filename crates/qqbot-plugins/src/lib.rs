@@ -7,6 +7,7 @@ pub mod dice;
 pub mod help;
 pub mod http;
 pub mod ba;
+pub mod bangumi;
 pub mod bili;
 pub mod resource;
 pub mod tarkov;
@@ -18,6 +19,7 @@ pub use dice::{parse_spec, DicePlugin};
 pub use help::HelpPlugin;
 pub use resource::{register_resources, ResourcesConfig};
 pub use ba::BaConfig;
+pub use bangumi::BangumiConfig;
 pub use bili::BiliConfig;
 pub use tarkov::TarkovConfig;
 pub use wordcloud::{tokenize, WordCloudPlugin};
@@ -47,6 +49,8 @@ pub struct PluginsConfig {
     pub ba: BaConfig,
     /// B 站链接解析的配置。
     pub bili: BiliConfig,
+    /// 番剧日历的配置。
+    pub bangumi: BangumiConfig,
 }
 
 /// 把所有内置插件注册到路由表。
@@ -115,6 +119,12 @@ pub async fn register(
     ] {
         router.on_any(Matcher::Exact(keyword.into()), wordcloud.clone());
     }
+    // 番剧更新：三个写法整串匹配。
+    let bangumi = bangumi::BangumiPlugin::new(cfg.bangumi.clone(), http.clone());
+    for keyword in ["今日番剧", "每日番剧", "最新番剧"] {
+        router.on_any(Matcher::Exact(keyword.into()), bangumi.clone());
+    }
+
     // 通配监听器：只用于累积语料，不作为用户可见命令出现在帮助里。
     router.on_listener(Matcher::Any, wordcloud.clone());
 

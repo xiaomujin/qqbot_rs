@@ -222,11 +222,15 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
 
 // ---------------------------------------------------------------- harness
 
-fn build_stack(mock: &MockServer) -> Arc<Dispatcher> {
-    build_stack_with(mock, None)
+async fn build_stack(mock: &MockServer) -> Arc<Dispatcher> {
+    build_stack_with(mock, None, None).await
 }
 
-fn build_stack_with(mock: &MockServer, store: Option<Arc<MessageStore>>) -> Arc<Dispatcher> {
+async fn build_stack_with(
+    mock: &MockServer,
+    store: Option<Arc<MessageStore>>,
+    resources: Option<qqbot_plugins::ResourcesConfig>,
+) -> Arc<Dispatcher> {
     let cfg = ApiClientConfig {
         app_id: "mock-app".to_string(),
         client_secret: "mock-secret".to_string(),
@@ -253,8 +257,10 @@ fn build_stack_with(mock: &MockServer, store: Option<Arc<MessageStore>>) -> Arc<
         &qqbot_plugins::PluginsConfig {
             wordcloud_window: Duration::from_secs(30 * 24 * 3600),
             daily: None,
+            resources,
         },
     )
+    .await
     .expect("初始化插件失败");
 
     Arc::new(Dispatcher::new(router, services, DispatchConfig::default()))
@@ -287,7 +293,7 @@ async fn inbound_messages_are_persisted_for_both_scopes() {
     })
     .unwrap();
 
-    let dispatcher = build_stack_with(&mock, Some(Arc::clone(&store)));
+    let dispatcher = build_stack_with(&mock, Some(Arc::clone(&store)), None).await;
 
     feed(
         &dispatcher,
@@ -326,7 +332,7 @@ async fn inbound_messages_are_persisted_for_both_scopes() {
 #[tokio::test]
 async fn text_reply_carries_msg_id_and_incremented_msg_seq() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     feed(
         &dispatcher,
@@ -357,7 +363,7 @@ async fn text_reply_carries_msg_id_and_incremented_msg_seq() {
 #[tokio::test]
 async fn dice_reply_uses_markdown_so_bold_is_rendered() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     feed(
         &dispatcher,
@@ -388,7 +394,7 @@ async fn dice_reply_uses_markdown_so_bold_is_rendered() {
 #[tokio::test]
 async fn full_mode_at_prefix_still_routes() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     feed(
         &dispatcher,
@@ -409,7 +415,7 @@ async fn full_mode_at_prefix_still_routes() {
 #[tokio::test]
 async fn full_mode_bare_keyword_routes_passively() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     feed(
         &dispatcher,
@@ -428,7 +434,7 @@ async fn full_mode_bare_keyword_routes_passively() {
 #[tokio::test]
 async fn repeated_replies_increment_msg_seq() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     feed(
         &dispatcher,
@@ -468,7 +474,7 @@ async fn repeated_replies_increment_msg_seq() {
 #[tokio::test]
 async fn c2c_reply_targets_user_endpoint() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     feed(
         &dispatcher,
@@ -489,7 +495,7 @@ async fn c2c_reply_targets_user_endpoint() {
 #[tokio::test]
 async fn wordcloud_command_renders_uploads_and_sends_image() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     // 语料要选 jieba 能切出 >= MIN_DISTINCT(3) 个实词的句子。
     // 「今天天气不错」只会切成 今天天气/不错 两个词，达不到门槛。
@@ -577,7 +583,7 @@ async fn wordcloud_command_renders_uploads_and_sends_image() {
 #[tokio::test]
 async fn help_lists_registered_routes() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     feed(
         &dispatcher,
@@ -599,7 +605,7 @@ async fn help_lists_registered_routes() {
 #[tokio::test]
 async fn unknown_event_is_ignored_without_side_effects() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     feed(&dispatcher, "SOME_FUTURE_EVENT", r#"{"whatever":1}"#).await;
 
@@ -611,7 +617,7 @@ async fn unknown_event_is_ignored_without_side_effects() {
 #[tokio::test]
 async fn expired_passive_window_falls_back_to_active_message() {
     let mock = MockServer::builder().fail_first_sends(1).start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
 
     feed(
         &dispatcher,
@@ -642,7 +648,7 @@ async fn expired_passive_window_falls_back_to_active_message() {
 #[tokio::test]
 async fn event_reply_carries_event_id_instead_of_msg_id() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
     let services = dispatcher.services().clone();
 
     services
@@ -668,7 +674,7 @@ async fn event_reply_carries_event_id_instead_of_msg_id() {
 #[tokio::test]
 async fn active_quota_is_enforced_before_hitting_the_api() {
     let mock = MockServer::start().await;
-    let dispatcher = build_stack(&mock);
+    let dispatcher = build_stack(&mock).await;
     let services = dispatcher.services().clone();
 
     let target = Target::group("GQ");
@@ -687,4 +693,149 @@ async fn active_quota_is_enforced_before_hitting_the_api() {
 
     let sends = mock.all(|h| h.path == "/v2/groups/GQ/messages");
     assert_eq!(sends.len(), 20, "被本地配额拦截的请求不应发到线上");
+}
+
+// ------------------------------------------------------------ 资源管理
+
+/// 造一个带资源库的栈，并放一条群资源。返回 (dispatcher, 临时目录)。
+async fn stack_with_resource(
+    mock: &MockServer,
+    group: &str,
+    keyword: &str,
+    scope: qqbot_store::ResourceScope,
+    tag: &str,
+) -> (Arc<Dispatcher>, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("qqbot-res-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+
+    let store = Arc::new(
+        qqbot_store::open_resource_store(dir.join("res.db"))
+            .await
+            .expect("打开资源库"),
+    );
+
+    // 内容无所谓：测试断言的是「读到了文件并作为富媒体发出」。
+    let img = dir.join("map.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nfake-image").expect("写素材");
+
+    let owner = match scope {
+        qqbot_store::ResourceScope::Group => group.to_string(),
+        qqbot_store::ResourceScope::System => qqbot_store::SYSTEM_OWNER.to_string(),
+    };
+    store
+        .upsert(qqbot_store::ResourceSpec {
+            scope,
+            owner_id: owner,
+            name: keyword.to_string(),
+            path: img,
+            file_name: "map.png".to_string(),
+            file_type: 1,
+            description: None,
+        })
+        .await
+        .expect("写入资源");
+
+    let cfg = qqbot_plugins::ResourcesConfig {
+        store,
+        basepath: dir.join("collected"),
+        controllers: None,
+    };
+    (build_stack_with(mock, None, Some(cfg)).await, dir)
+}
+
+/// 关键词触发：应当读到磁盘上的文件、上传富媒体、并走**被动回复**。
+#[tokio::test]
+async fn resource_keyword_sends_the_file_passively() {
+    let mock = MockServer::start().await;
+    let (dispatcher, dir) =
+        stack_with_resource(&mock, "GRES", "地图", qqbot_store::ResourceScope::Group, "send").await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_RES","author":{"member_openid":"U1"},"content":"地图","group_openid":"GRES"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.method == "POST" && h.path == "/v2/groups/GRES/messages")
+        .expect("应当发出资源消息");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    assert_eq!(body["msg_type"], 7, "资源必须以富媒体发送");
+    assert_eq!(body["msg_id"], "IN_RES", "关键词触发必须走被动回复");
+    assert!(body["media"]["file_info"].is_string(), "缺少 file_info: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 群隔离：A 群收录的资源，B 群不能触发。
+#[tokio::test]
+async fn group_resource_is_invisible_to_other_groups() {
+    let mock = MockServer::start().await;
+    let (dispatcher, dir) =
+        stack_with_resource(&mock, "GA", "本群专属", qqbot_store::ResourceScope::Group, "iso").await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_ISO","author":{"member_openid":"U1"},"content":"本群专属","group_openid":"GB"}"#,
+    )
+    .await;
+
+    assert!(
+        mock.find(|h| h.path == "/v2/groups/GB/messages").is_none(),
+        "B 群不该看到 A 群的资源"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 系统资源对所有群可见。
+#[tokio::test]
+async fn system_resource_is_visible_everywhere() {
+    let mock = MockServer::start().await;
+    let (dispatcher, dir) = stack_with_resource(
+        &mock,
+        "",
+        "全局图",
+        qqbot_store::ResourceScope::System,
+        "sys",
+    )
+    .await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_SYS","author":{"member_openid":"U1"},"content":"全局图","group_openid":"GANY"}"#,
+    )
+    .await;
+
+    assert!(
+        mock.find(|h| h.path == "/v2/groups/GANY/messages").is_some(),
+        "系统资源应当在任何群都能触发"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 非资源关键词必须放行给后面的插件，而不是被监听器吞掉。
+#[tokio::test]
+async fn non_resource_keyword_falls_through() {
+    let mock = MockServer::start().await;
+    let (dispatcher, dir) =
+        stack_with_resource(&mock, "GF", "地图", qqbot_store::ResourceScope::Group, "pass").await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_PING","author":{"member_openid":"U1"},"content":"ping","group_openid":"GF"}"#,
+    )
+    .await;
+
+    let send = mock.find(|h| h.path == "/v2/groups/GF/messages").expect("ping 应当仍然生效");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    assert!(
+        body["content"].as_str().unwrap_or_default().contains("pong"),
+        "ping 被资源监听器吞掉了: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

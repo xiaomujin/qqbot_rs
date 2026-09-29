@@ -229,6 +229,30 @@ async fn run(cfg: Config) -> Result<()> {
         }
     };
 
+    // 资源库与消息库**共用同一个文件**，但用独立连接：
+    // 资源操作由管理命令触发，频率是人手级别，没必要挤进消息的批量写线程。
+    // 打开失败不致命，降级为「不注册资源命令」。
+    let resources = match &cfg.store {
+        Some(sc) => match qqbot_store::open_resource_store(sc.path.clone()).await {
+            Ok(rs) => {
+                tracing::info!(basepath = %cfg.resources_basepath.display(), "资源管理已启用");
+                Some(qqbot_plugins::ResourcesConfig {
+                    store: Arc::new(rs),
+                    basepath: cfg.resources_basepath.clone(),
+                    controllers: cfg.system_controllers.clone(),
+                })
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "资源库打开失败，资源管理命令不可用");
+                None
+            }
+        },
+        None => {
+            tracing::warn!("未启用消息持久化，资源管理命令不可用");
+            None
+        }
+    };
+
     let mut services = Services::new(api.clone(), media, render, sessions);
     if let Some(s) = &store {
         services = services.with_store(Arc::clone(s));
@@ -242,8 +266,10 @@ async fn run(cfg: Config) -> Result<()> {
         &qqbot_plugins::PluginsConfig {
             wordcloud_window: cfg.wordcloud_window,
             daily: cfg.daily.clone(),
+            resources: resources.clone(),
         },
     )
+    .await
     .context("初始化插件失败")?;
     let route_count = router.len();
 

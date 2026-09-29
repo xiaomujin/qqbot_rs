@@ -30,6 +30,30 @@ impl FileType {
             FileType::File => 4,
         }
     }
+
+    /// 从数据库里存的数值还原。未知值返回 None，由调用方决定怎么处理。
+    pub const fn from_u8(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(FileType::Image),
+            2 => Some(FileType::Video),
+            3 => Some(FileType::Voice),
+            4 => Some(FileType::File),
+            _ => None,
+        }
+    }
+
+    /// 按扩展名推断类型。收录素材时用它把类型一次定下来。
+    ///
+    /// 只有 silk 算语音：官方语音消息要求 silk 编码，
+    /// 把 mp3 标成语音会被服务端拒绝，标成文件反而能正常送达。
+    pub fn from_extension(ext: &str) -> Self {
+        match ext.to_ascii_lowercase().as_str() {
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" => FileType::Image,
+            "mp4" | "mov" | "mkv" | "webm" => FileType::Video,
+            "silk" => FileType::Voice,
+            _ => FileType::File,
+        }
+    }
 }
 
 #[derive(Clone)]

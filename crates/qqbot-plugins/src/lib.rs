@@ -6,11 +6,13 @@ pub mod daily;
 pub mod dice;
 pub mod help;
 pub mod http;
+pub mod resource;
 pub mod wordcloud;
 
 pub use daily::{DailyConfig, DailyPlugin};
 pub use dice::{parse_spec, DicePlugin};
 pub use help::HelpPlugin;
+pub use resource::{register_resources, ResourcesConfig};
 pub use wordcloud::{tokenize, WordCloudPlugin};
 
 use std::sync::Arc;
@@ -23,12 +25,15 @@ use qqbot_store::MessageStore;
 ///
 /// 做成结构体而不是继续加参数：迁移中的插件数量还会增长，
 /// 每加一个功能就改一次 `register` 签名会让调用点反复变动。
-#[derive(Debug, Clone, Default)]
+// 不派生 Debug：ResourcesConfig 里的连接池没有有意义的 Debug 表示。
+#[derive(Clone, Default)]
 pub struct PluginsConfig {
     /// 词云统计窗口。
     pub wordcloud_window: Duration,
     /// 日报配置。`None` 表示未配置 token，**该命令不会被注册**。
     pub daily: Option<DailyConfig>,
+    /// 资源管理配置。`None` 表示未启用持久化，相关命令不会被注册。
+    pub resources: Option<ResourcesConfig>,
 }
 
 /// 把所有内置插件注册到路由表。
@@ -39,13 +44,15 @@ pub struct PluginsConfig {
 ///
 /// # Errors
 ///
-/// 共享 HTTP 客户端构建失败（TLS 后端不可用）时返回错误 ——
-/// 此时依赖网络的插件都无法工作，应当在启动阶段就暴露。
-pub fn register(
+/// - 共享 HTTP 客户端构建失败（TLS 后端不可用）；
+/// - 资源库读取失败。
+///
+/// 两者都应当在启动阶段暴露，而不是留到用户第一次触发命令。
+pub async fn register(
     router: &mut Router,
     store: Option<Arc<MessageStore>>,
     cfg: &PluginsConfig,
-) -> Result<(), reqwest::Error> {
+) -> anyhow::Result<()> {
     // 统一超时与连接池。即使当前没有插件用到也建一个：成本可忽略，
     // 而省掉了「以后新增网络插件时忘记加超时」这类问题。
     let http = http::build_client()?;
@@ -57,7 +64,12 @@ pub fn register(
 
     // 日报：精确匹配。全量模式下群消息都会到达，宽匹配会频繁误触发。
     if let Some(daily) = &cfg.daily {
-        router.on_any(Matcher::Exact("日报".into()), DailyPlugin::new(daily.clone(), http));
+        router.on_any(Matcher::Exact("日报".into()), DailyPlugin::new(daily.clone(), http.clone()));
+    }
+
+    // 资源管理：注册一条最低优先级的通配监听器 + 若干显式命令。
+    if let Some(res) = &cfg.resources {
+        register_resources(router, res.clone(), http.clone()).await?;
     }
 
     // 词云：同一个实例既负责渲染命令，也负责静默累积语料。

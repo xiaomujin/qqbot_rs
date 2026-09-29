@@ -67,6 +67,9 @@ const DEFAULT_DAILY_CACHE_SECS: u64 = 1800;
 /// 日报缓存上界（秒）—— 一天的秒数，再长就失去「日报」的意义了。
 const MAX_DAILY_CACHE_SECS: u64 = 86_400;
 
+/// 从消息收录的素材默认落盘目录。
+const DEFAULT_RESOURCES_BASEPATH: &str = "data/resources";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub app_id: String,
@@ -88,6 +91,10 @@ pub struct Config {
     pub wordcloud_window: Duration,
     /// 日报插件配置。`None` 表示未配置 token，**该命令不会被注册**。
     pub daily: Option<DailyConfig>,
+    /// 从消息收录的素材落盘根目录。
+    pub resources_basepath: PathBuf,
+    /// 系统控制者。`None` 表示沿用数据库里的值（首次建库会播种默认值）。
+    pub system_controllers: Option<Vec<String>>,
     /// 日志级别。`RUST_LOG` 未设置时生效。
     pub log_level: String,
     /// 配置来源摘要，供启动日志打印。**不含任何密钥值**，只有来源名与路径。
@@ -226,6 +233,18 @@ impl Config {
             None => None,
         };
 
+        // ---- 资源管理 ----
+        let resources_basepath = PathBuf::from(
+            non_empty(env.get("QQBOT_RESOURCES_BASEPATH"))
+                .or_else(|| file.and_then(|f| non_empty(f.resources.basepath.as_deref())))
+                .unwrap_or_else(|| DEFAULT_RESOURCES_BASEPATH.to_string()),
+        );
+        // 显式配置时**覆盖数据库**，这也是控制者列表被改坏后的恢复通道。
+        let system_controllers = match non_empty(env.get("QQBOT_SYSTEM_CONTROLLERS")) {
+            Some(raw) => Some(split_list(&raw)),
+            None => file.and_then(|f| f.resources.system_controllers.clone()),
+        };
+
         Ok(Self {
             app_id,
             client_secret,
@@ -247,6 +266,8 @@ impl Config {
             store,
             wordcloud_window: Duration::from_secs(window_days * DAY_SECS),
             daily,
+            resources_basepath,
+            system_controllers,
             log_level,
             sources: describe_sources(env, found),
         })
@@ -362,6 +383,8 @@ struct FileConfig {
     render: RenderSection,
     #[serde(default)]
     daily: DailySection,
+    #[serde(default)]
+    resources: ResourcesSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -377,6 +400,29 @@ struct DailySection {
     api_url: Option<String>,
     token: Option<String>,
     cache_secs: Option<u64>,
+}
+
+/// `[resources]` 段。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourcesSection {
+    /// 从消息收录的素材落盘根目录。
+    basepath: Option<String>,
+    /// 系统控制者。显式设置时覆盖数据库。
+    system_controllers: Option<Vec<String>>,
+}
+
+/// 按逗号或空白切分列表，丢掉空项。
+///
+/// 环境变量里写列表只能用字符串，所以逗号与空白都当分隔符 ——
+/// 手写配置时多打一个空格不该变成「多了一个空控制者」。
+fn split_list(raw: &str) -> Vec<String> {
+    raw.split([',', ';'])
+        .flat_map(str::split_whitespace)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// 配置文件发现结果。
@@ -499,11 +545,56 @@ mod tests {
             api_url = "https://example.invalid/api"
             token = "t"
             cache_secs = 1
+            [resources]
+            basepath = "data/x"
+            system_controllers = ["abc"]
         "#;
         let parsed: FileConfig = toml::from_str(text).expect("所有已暴露的键都必须被接受");
         assert_eq!(parsed.retention_days, Some(1));
         assert_eq!(parsed.render.timeout_secs, Some(1));
         assert_eq!(parsed.daily.cache_secs, Some(1));
+        assert_eq!(parsed.resources.basepath.as_deref(), Some("data/x"));
+    }
+
+    #[test]
+    fn resources_basepath_defaults_and_env_wins() {
+        let cfg = resolve(&creds(&[]), None).unwrap();
+        assert_eq!(cfg.resources_basepath, PathBuf::from(DEFAULT_RESOURCES_BASEPATH));
+        assert!(cfg.system_controllers.is_none(), "未显式配置时应沿用数据库");
+
+        let cfg = resolve(&creds(&[("QQBOT_RESOURCES_BASEPATH", "D:/img")]), None).unwrap();
+        assert_eq!(cfg.resources_basepath, PathBuf::from("D:/img"));
+    }
+
+    #[test]
+    fn system_controllers_accept_comma_or_space() {
+        let cfg = resolve(&creds(&[("QQBOT_SYSTEM_CONTROLLERS", "a,b")]), None).unwrap();
+        assert_eq!(cfg.system_controllers, Some(vec!["a".into(), "b".into()]));
+
+        // 多打一个空格不该变成「多了一个空控制者」。
+        let cfg = resolve(&creds(&[("QQBOT_SYSTEM_CONTROLLERS", "a, b  c")]), None).unwrap();
+        assert_eq!(
+            cfg.system_controllers,
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn system_controllers_env_beats_file() {
+        let toml = "[resources]\nsystem_controllers = [\"from-file\"]";
+        let cfg = resolve(&creds(&[]), Some(toml)).unwrap();
+        assert_eq!(cfg.system_controllers, Some(vec!["from-file".into()]));
+
+        let cfg = resolve(&creds(&[("QQBOT_SYSTEM_CONTROLLERS", "from-env")]), Some(toml)).unwrap();
+        assert_eq!(cfg.system_controllers, Some(vec!["from-env".into()]));
+    }
+
+    #[test]
+    fn split_list_drops_blanks() {
+        assert_eq!(split_list("a,,b"), vec!["a", "b"]);
+        assert_eq!(split_list("  a   b  "), vec!["a", "b"]);
+        assert_eq!(split_list("a;b"), vec!["a", "b"]);
+        assert!(split_list("  ").is_empty());
     }
 
     /// 日报的典型配置片段，多个用例共用。

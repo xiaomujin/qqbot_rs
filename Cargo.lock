@@ -1437,9 +1437,11 @@ dependencies = [
 name = "qqbot-plugins"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "jieba-rs",
  "qqbot-core",
+ "qqbot-media",
  "qqbot-render",
  "qqbot-store",
  "rand",

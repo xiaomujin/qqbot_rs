@@ -181,7 +181,24 @@ impl Ctx {
         file_name: &str,
         bytes: &[u8],
     ) -> Result<SendResult, CoreError> {
-        let file_info = self.services.upload_image(&self.target, file_name, bytes).await?;
+        self.reply_media(FileType::Image, file_name, bytes).await
+    }
+
+    /// 发送任意类型的素材（图片 / 视频 / 语音 / 文件）。
+    ///
+    /// file_type 与 file_name 都要对：平台按文件名判格式，
+    /// 而 file_type 决定走哪条上传通道。
+    pub async fn reply_media(
+        &self,
+        file_type: FileType,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<SendResult, CoreError> {
+        let file_info = self
+            .services
+            .media
+            .upload_bytes(&self.target, file_type, file_name, bytes)
+            .await?;
         self.services
             .send(SendRequest::media(self.target.clone(), file_info).replying_to(self.message.id.clone()))
             .await

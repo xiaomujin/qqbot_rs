@@ -163,7 +163,12 @@
 源项目这几项靠 Chromium 截图，本项目必须改写成模板 —— 这是**主要工作量**所在。
 
 - [ ] **B2 跳蚤市场** —— `跳蚤 <名>` ｜ `tarkov-market.com/api/be/items`
-      ｜ ⛔ **上游已加反爬（2026-09-29 实测）**：`tarkov-market.com` 带 Referer 返回
+      ｜ 🟡 **原上游已死，但静态 JSON 里有替代数据**：`json.tarkov.dev/regular/items`
+      的 5442 件物品中 **3525 件有跳蚤价格**（`lastLowPrice` / `avg24hPrice` /
+      `low24hPrice` / `high24hPrice`），字段齐全，`normalizedName` 可读。
+      **B2 与 B3 可以合并成一条命令**（`跳蚤 <名|24位id>`）用同一张表服务，
+      与 B4/B5/B6 同一套「静态 JSON + 本地表」管线 —— 下一轮做
+      ｜ 原上游确实已加反爬：`tarkov-market.com` 带 Referer 返回
       403 Cloudflare 挑战页；`api.tarkov-market.app` 返回 200 但载荷是加密串
       （`{"result":"ok","items":"JTVCJNjMkgTVE"}`），cq-bot 的解析代码早于这次改动。
       解密需要逆向其前端 JS，成本高且随时失效 —— **不做**，除非找到官方接口

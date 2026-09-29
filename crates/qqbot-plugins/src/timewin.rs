@@ -76,6 +76,19 @@ fn weekday_monday_offset(day: i64) -> i64 {
     (weekday + 6).rem_euclid(7)
 }
 
+/// 格式化为 `YYYY-MM-DD HH:MM:SS`（按 `offset` 指定的固定时区）。
+pub fn format_datetime(now: i64, offset: i64) -> String {
+    let local = now + offset;
+    let (y, m, d) = civil_from_days(local.div_euclid(DAY));
+    let secs = local.rem_euclid(DAY);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 /// Unix 天数 → (年, 月, 日)。Hinnant 的 `civil_from_days`。
 pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -183,6 +196,17 @@ mod tests {
             assert_eq!(Window::parse(w.label()), Some(w));
         }
         assert_eq!(Window::parse("昨天"), None);
+    }
+
+    #[test]
+    fn datetime_is_zero_padded_and_uses_the_offset() {
+        // 1970-01-01 00:00:00 UTC → 北京 08:00:00
+        assert_eq!(format_datetime(0, SHANGHAI_OFFSET), "1970-01-01 08:00:00");
+        assert_eq!(format_datetime(0, MOSCOW_OFFSET), "1970-01-01 03:00:00");
+        // 跨日：UTC 16:00 已经是北京的次日 0 点。
+        let utc_16 = 20_725 * DAY + 16 * 3600;
+        assert_eq!(format_datetime(utc_16, SHANGHAI_OFFSET), "2026-09-30 00:00:00");
+        assert_eq!(format_datetime(utc_16, MOSCOW_OFFSET), "2026-09-29 19:00:00");
     }
 
     #[test]

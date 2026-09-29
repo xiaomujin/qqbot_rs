@@ -1445,6 +1445,7 @@ dependencies = [
  "qqbot-render",
  "qqbot-store",
  "rand",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

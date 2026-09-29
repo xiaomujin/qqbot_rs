@@ -8,7 +8,7 @@
 //! 鉴权头、分片规划、msg_seq 分配等真实细节。
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,8 @@ struct MockInner {
     sends: AtomicUsize,
     /// 前多少次发消息请求返回 err_code 40034005（被动窗口已过期）。
     fail_first_sends: usize,
+    /// `/graphql` 是否返回上游故障（模拟 tarkov.dev 后端不可用）。
+    fail_graphql: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -51,7 +53,7 @@ impl MockServer {
     }
 
     fn builder() -> MockBuilder {
-        MockBuilder { fail_first_sends: 0 }
+        MockBuilder { fail_first_sends: 0, fail_graphql: false }
     }
 
     fn base_url(&self) -> String {
@@ -73,11 +75,17 @@ impl MockServer {
 
 struct MockBuilder {
     fail_first_sends: usize,
+    fail_graphql: bool,
 }
 
 impl MockBuilder {
     fn fail_first_sends(mut self, n: usize) -> Self {
         self.fail_first_sends = n;
+        self
+    }
+
+    fn fail_graphql(mut self, on: bool) -> Self {
+        self.fail_graphql = on;
         self
     }
 
@@ -88,6 +96,7 @@ impl MockBuilder {
             hits: Mutex::new(Vec::new()),
             sends: AtomicUsize::new(0),
             fail_first_sends: self.fail_first_sends,
+            fail_graphql: AtomicBool::new(self.fail_graphql),
         });
 
         let inner_for_task = inner.clone();
@@ -200,6 +209,26 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/test-image") {
         return ("200 OK", "FAKE-IMAGE-BYTES".to_string());
     }
+    // 塔科夫 BOSS 刷新率：形状照 tarkov.dev 的 GraphQL 响应。
+    if path.starts_with("/graphql") {
+        if inner.fail_graphql.load(Ordering::Relaxed) {
+            // 后端故障时 tarkov.dev 真实返回的就是 422 + 这段 errors。
+            return (
+                "422 Unprocessable Entity",
+                json!({"errors": ["GraphQL server unavailable. Try again later."]}).to_string(),
+            );
+        }
+        return (
+            "200 OK",
+            concat!(
+                r#"{"data":{"maps":["#,
+                r#"{"name":"海关","bosses":[{"boss":{"name":"Reshala"},"spawnChance":0.4},{"boss":{"name":"Reshala"},"spawnChance":0.6}]},"#,
+                r#"{"name":"储备站","bosses":[{"boss":{"name":"Glukhar"},"spawnChance":1.0}]}"#,
+                r#"]}}"#,
+            )
+            .to_string(),
+        );
+    }
     if path.contains("/upload_part_finish") {
         return ("200 OK", "{}".to_string());
     }
@@ -262,6 +291,11 @@ async fn build_stack_with(
             wordcloud_window: Duration::from_secs(30 * 24 * 3600),
             daily: None,
             resources,
+            // 指向 mock，否则塔科夫的 GraphQL 会真的打出去。
+            tarkov: qqbot_plugins::TarkovConfig {
+                graphql_url: format!("{}/graphql", mock.base_url()),
+                ..Default::default()
+            },
         },
     )
     .await
@@ -1091,4 +1125,49 @@ async fn tarkov_time_replies_with_two_clocks() {
         assert_eq!(line.len(), 8, "HH:MM:SS: {text}");
         assert_eq!(line.as_bytes()[2], b':', "HH:MM:SS: {text}");
     }
+}
+
+/// B7 BOSS 刷新率：GraphQL 结果按地图聚合，同一 BOSS 的多个刷新点取平均。
+#[tokio::test]
+async fn boss_chance_aggregates_by_map_and_averages() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"BOSS_1","author":{"member_openid":"U1"},"content":"boss刷新率","group_openid":"GB"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GB/messages")
+        .expect("应当回复 BOSS 刷新率");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("海关"), "应当列出地图名: {text}");
+    assert!(text.contains("Reshala: 50%"), "(0.4+0.6)/2 = 50%: {text}");
+    assert!(text.contains("Glukhar: 100%"), "1.0 是比例不是百分数: {text}");
+}
+
+/// 上游故障时要给出可读提示，而不是把 422 原文丢给用户。
+#[tokio::test]
+async fn boss_chance_reports_upstream_failure_gracefully() {
+    let mock = MockServer::builder().fail_graphql(true).start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"BOSS_2","author":{"member_openid":"U1"},"content":"boss概率","group_openid":"GB2"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GB2/messages")
+        .expect("失败也要回复，不能静默");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("查询失败"), "应当是给用户看的话: {text}");
+    assert!(!text.contains("422"), "不该把上游原文丢给用户: {text}");
 }

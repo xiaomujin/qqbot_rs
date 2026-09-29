@@ -272,6 +272,7 @@ async fn run(cfg: Config) -> Result<()> {
             wordcloud_window: cfg.wordcloud_window,
             daily: cfg.daily.clone(),
             resources: resources.clone(),
+            tarkov: qqbot_plugins::TarkovConfig::default(),
         },
     )
     .await

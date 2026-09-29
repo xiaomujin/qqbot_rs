@@ -15,6 +15,7 @@ pub use daily::{DailyConfig, DailyPlugin};
 pub use dice::{parse_spec, DicePlugin};
 pub use help::HelpPlugin;
 pub use resource::{register_resources, ResourcesConfig};
+pub use tarkov::TarkovConfig;
 pub use wordcloud::{tokenize, WordCloudPlugin};
 
 use std::sync::Arc;
@@ -36,6 +37,8 @@ pub struct PluginsConfig {
     pub daily: Option<DailyConfig>,
     /// 资源管理配置。`None` 表示未启用持久化，相关命令不会被注册。
     pub resources: Option<ResourcesConfig>,
+    /// 塔科夫相关命令的配置。
+    pub tarkov: TarkovConfig,
 }
 
 /// 把所有内置插件注册到路由表。
@@ -94,7 +97,14 @@ pub async fn register(
     // 通配监听器：只用于累积语料，不作为用户可见命令出现在帮助里。
     router.on_listener(Matcher::Any, wordcloud.clone());
 
-    router.on_any(Matcher::Exact("塔科夫时间".into()), tarkov::TarkovPlugin::new());
+    let tarkov = tarkov::TarkovPlugin::new(cfg.tarkov.clone(), http.clone());
+    router.on_any(Matcher::Exact("塔科夫时间".into()), tarkov.clone());
+    // 源项目的正则是 `^(?i)boss(刷|概)`：前缀匹配、大小写不敏感。
+    // 路由用正则，真正的判定在插件里（`is_boss_query`），两者保持一致。
+    router.on_any(
+        Matcher::Regex(regex::Regex::new(r"(?i)^\s*boss(刷|概)").expect("BOSS 刷新率正则字面量")),
+        tarkov.clone(),
+    );
 
     let routes = router.routes();
     router.on_any(Matcher::Command("帮助".into()), HelpPlugin::new(routes));

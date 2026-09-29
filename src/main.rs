@@ -277,6 +277,7 @@ async fn run(cfg: Config) -> Result<()> {
             bili: qqbot_plugins::BiliConfig::default(),
             bangumi: qqbot_plugins::BangumiConfig::default(),
             ammo: qqbot_plugins::AmmoConfig::default(),
+            task: qqbot_plugins::TaskConfig::default(),
         },
     )
     .await

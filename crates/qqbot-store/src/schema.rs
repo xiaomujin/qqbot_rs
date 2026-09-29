@@ -12,7 +12,8 @@ use rusqlite::Connection;
 /// v4 增加 `bili_subscriptions`（B 站订阅）。
 /// v5 增加 `pending_captions`（图语：等下一张图配字）。
 /// v6 增加 `ammo`（塔科夫弹药数据，从 tarkov.dev 静态 JSON 导入）。
-pub const SCHEMA_VERSION: i64 = 6;
+/// v7 增加 `tarkov_task`（塔科夫任务数据，同一来源）。
+pub const SCHEMA_VERSION: i64 = 7;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -124,6 +125,25 @@ CREATE TABLE IF NOT EXISTS ammo (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ammo_normalized_name ON ammo(normalized_name);
+
+-- 塔科夫任务。字段对齐 cq-bot 的 `tkf_task`（MIT），但只保留静态 JSON
+-- 里真实有值的项 —— 它没有 `finish_reward` / `pre_task` 这些。
+CREATE TABLE IF NOT EXISTS tarkov_task (
+    id              TEXT PRIMARY KEY,
+    -- 可读 slug（`gunsmith-part-1`）。与弹药同理：`name` 是翻译键。
+    normalized_name TEXT NOT NULL,
+    -- 商人的可读 slug（`prapor`），由 traders 表解析而来。
+    trader          TEXT NOT NULL DEFAULT '',
+    min_level       INTEGER NOT NULL DEFAULT 0,
+    is_kappa        INTEGER NOT NULL DEFAULT 0,
+    is_lightkeeper  INTEGER NOT NULL DEFAULT 0,
+    experience      INTEGER NOT NULL DEFAULT 0,
+    -- 目标条数。目标的**文字**也是翻译键，所以只存个数。
+    objectives      INTEGER NOT NULL DEFAULT 0,
+    wiki_link       TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_tarkov_task_name ON tarkov_task(normalized_name);
 "#;
 
 /// 打开（必要时创建）数据库并应用 PRAGMA。

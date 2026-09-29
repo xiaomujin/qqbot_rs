@@ -130,6 +130,22 @@ pub struct Ammo {
     pub base_price: i64,
 }
 
+/// 一个塔科夫任务。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TarkovTask {
+    pub id: String,
+    /// 可读 slug，如 `gunsmith-part-1`。
+    pub normalized_name: String,
+    /// 商人的可读 slug，如 `prapor`。
+    pub trader: String,
+    pub min_level: i64,
+    pub is_kappa: bool,
+    pub is_lightkeeper: bool,
+    pub experience: i64,
+    pub objectives: i64,
+    pub wiki_link: String,
+}
+
 /// 资源库句柄。
 #[derive(Clone)]
 pub struct ResourceStore {
@@ -406,6 +422,93 @@ impl ResourceStore {
                 out.push(row?);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    // ---- 塔科夫任务 ----
+
+    /// 整表替换任务数据。返回写入行数。理由同 `replace_ammo`。
+    pub async fn replace_tasks(&self, items: Vec<TarkovTask>) -> Result<usize> {
+        self.with(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM tarkov_task", [])?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_task(id, normalized_name, trader, min_level, \
+                     is_kappa, is_lightkeeper, experience, objectives, wiki_link) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )?;
+                for t in &items {
+                    stmt.execute(rusqlite::params![
+                        t.id,
+                        t.normalized_name,
+                        t.trader,
+                        t.min_level,
+                        t.is_kappa,
+                        t.is_lightkeeper,
+                        t.experience,
+                        t.objectives,
+                        t.wiki_link,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(items.len())
+        })
+        .await
+    }
+
+    /// 按关键词检索任务。`tokens` 的语义同 `search_ammo`。
+    pub async fn search_tasks(
+        &self,
+        tokens: Vec<String>,
+        limit: usize,
+    ) -> Result<Vec<TarkovTask>> {
+        self.with(move |conn| {
+            let mut sql = String::from(
+                "SELECT id, normalized_name, trader, min_level, is_kappa, is_lightkeeper, \
+                 experience, objectives, wiki_link FROM tarkov_task WHERE 1 = 1",
+            );
+            for i in 0..tokens.len() {
+                let _ = write!(sql, " AND normalized_name LIKE ?{}", i + 1);
+            }
+            let _ = write!(sql, " ORDER BY normalized_name LIMIT ?{}", tokens.len() + 1);
+
+            let mut params: Vec<rusqlite::types::Value> = tokens
+                .iter()
+                .map(|t| rusqlite::types::Value::Text(format!("%{t}%")))
+                .collect();
+            params.push(rusqlite::types::Value::Integer(limit as i64));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                Ok(TarkovTask {
+                    id: r.get(0)?,
+                    normalized_name: r.get(1)?,
+                    trader: r.get(2)?,
+                    min_level: r.get(3)?,
+                    is_kappa: r.get(4)?,
+                    is_lightkeeper: r.get(5)?,
+                    experience: r.get(6)?,
+                    objectives: r.get(7)?,
+                    wiki_link: r.get(8)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// 任务表当前行数。为 0 表示还没导入过。
+    pub async fn task_count(&self) -> Result<i64> {
+        self.with(|conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM tarkov_task", [], |r| r.get(0))?;
+            Ok(n)
         })
         .await
     }
@@ -825,6 +928,46 @@ mod tests {
         let items: Vec<Ammo> = (0..20).map(|i| ammo(&format!("a{i}"), &format!("545x39mm-{i:02}"), i)).collect();
         s.replace_ammo(items).await.unwrap();
         assert_eq!(s.search_ammo(vec!["545".into()], 5).await.unwrap().len(), 5);
+    }
+
+    fn task(id: &str, slug: &str, trader: &str, level: i64) -> TarkovTask {
+        TarkovTask {
+            id: id.into(),
+            normalized_name: slug.into(),
+            trader: trader.into(),
+            min_level: level,
+            is_kappa: level > 40,
+            is_lightkeeper: false,
+            experience: 1000,
+            objectives: 2,
+            wiki_link: "https://x".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_replace_and_search() {
+        let s = store();
+        assert_eq!(s.task_count().await.unwrap(), 0);
+
+        s.replace_tasks(vec![
+            task("k1", "gunsmith-part-1", "mechanic", 5),
+            task("k2", "gunsmith-part-2", "mechanic", 10),
+            task("k3", "first-in-line", "prapor", 1),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(s.task_count().await.unwrap(), 3);
+
+        assert_eq!(s.search_tasks(vec!["gunsmith".into()], 10).await.unwrap().len(), 2);
+        let one = s.search_tasks(vec!["gunsmith".into(), "part-2".into()], 10).await.unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].normalized_name, "gunsmith-part-2");
+        assert_eq!(one[0].trader, "mechanic");
+        assert_eq!(one[0].min_level, 10);
+
+        // 整表替换：第二次只剩一条。
+        s.replace_tasks(vec![task("k9", "only-one", "prapor", 1)]).await.unwrap();
+        assert_eq!(s.task_count().await.unwrap(), 1);
     }
 
     #[tokio::test]

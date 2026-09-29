@@ -241,6 +241,26 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
             .to_string(),
         );
     }
+    // 塔科夫静态 JSON：任务与商人。
+    if path.starts_with("/regular/tasks") {
+        return (
+            "200 OK",
+            concat!(
+                r#"{"data":{"tasks":{"#,
+                r#""k1":{"normalizedName":"gunsmith-part-1","trader":"t1","minPlayerLevel":5,"kappaRequired":true,"lightkeeperRequired":false,"experience":3000,"objectives":[{},{}],"wikiLink":"https://x/1"},"#,
+                r#""k2":{"normalizedName":"first-in-line","trader":"t2","minPlayerLevel":1,"kappaRequired":false,"lightkeeperRequired":true,"experience":500,"objectives":[]}"#,
+                r#"}}}"#,
+            )
+            .to_string(),
+        );
+    }
+    if path.starts_with("/regular/traders") {
+        return (
+            "200 OK",
+            json!({"data": {"t1": {"normalizedName": "mechanic"}, "t2": {"normalizedName": "prapor"}}})
+                .to_string(),
+        );
+    }
     // B 站稿件信息 + 封面。
     if path.starts_with("/x/web-interface/view") {
         return (
@@ -437,6 +457,11 @@ async fn build_stack_with(
             },
             ammo: qqbot_plugins::AmmoConfig {
                 items_url: format!("{}/regular/items", mock.base_url()),
+                store: None,
+            },
+            task: qqbot_plugins::TaskConfig {
+                tasks_url: format!("{}/regular/tasks", mock.base_url()),
+                traders_url: format!("{}/regular/traders", mock.base_url()),
                 store: None,
             },
         },
@@ -1809,5 +1834,66 @@ async fn ammo_import_requires_admin() {
     .await;
 
     assert_eq!(store.ammo_count().await.unwrap(), 0, "非管理员不该触发导入");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B4 / B5：管理员导入任务 → 检索 → 出卡片。
+#[tokio::test]
+async fn task_import_then_search_renders_a_card() {
+    let mock = MockServer::start().await;
+    let (dispatcher, store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"TK_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新任务","group_openid":"GTK"}"#,
+    )
+    .await;
+
+    assert_eq!(store.task_count().await.unwrap(), 2, "应当导入两条");
+    let imported = store.search_tasks(vec!["gunsmith".into()], 10).await.unwrap();
+    assert_eq!(imported[0].trader, "mechanic", "商人 id 要换成人看得懂的 slug");
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"TK_2","author":{"member_openid":"U1"},"content":"查任务 gunsmith","group_openid":"GTK"}"#,
+    )
+    .await;
+
+    let card = mock
+        .all(|h| h.path == "/v2/groups/GTK/messages")
+        .into_iter()
+        .find(|h| {
+            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            body["msg_type"] == 7
+        })
+        .expect("应当回一张卡片");
+    let body: serde_json::Value = serde_json::from_str(&card.body).unwrap();
+    assert!(body["media"]["file_info"].is_string(), "应当走富媒体上传: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 没导入过时要给可操作的提示。
+#[tokio::test]
+async fn task_search_before_import_says_so() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"TK_3","author":{"member_openid":"U1"},"content":"查任务 gunsmith","group_openid":"GTK2"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GTK2/messages")
+        .expect("应当回复提示");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("更新任务"), "要告诉用户怎么解决: {text}");
+
     let _ = std::fs::remove_dir_all(&dir);
 }

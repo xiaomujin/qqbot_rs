@@ -236,7 +236,15 @@ async fn run(cfg: Config) -> Result<()> {
     let services = Arc::new(services);
 
     let mut router = Router::new();
-    qqbot_plugins::register(&mut router, store.clone(), cfg.wordcloud_window);
+    qqbot_plugins::register(
+        &mut router,
+        store.clone(),
+        &qqbot_plugins::PluginsConfig {
+            wordcloud_window: cfg.wordcloud_window,
+            daily: cfg.daily.clone(),
+        },
+    )
+    .context("初始化插件失败")?;
     let route_count = router.len();
 
     let dispatcher = Arc::new(Dispatcher::new(

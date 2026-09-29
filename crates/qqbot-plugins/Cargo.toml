@@ -12,6 +12,8 @@ qqbot-core = { workspace = true }
 qqbot-render = { workspace = true }
 qqbot-store = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing = { workspace = true }

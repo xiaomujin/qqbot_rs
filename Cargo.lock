@@ -1443,6 +1443,8 @@ dependencies = [
  "qqbot-render",
  "qqbot-store",
  "rand",
+ "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

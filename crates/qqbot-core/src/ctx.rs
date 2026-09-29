@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use qqbot_api::{ApiClient, MessageEvent, SendResult, Target};
-use qqbot_media::MediaUploader;
+use qqbot_media::{FileType, MediaUploader};
 use qqbot_render::RenderService;
 use qqbot_store::MessageStore;
 
@@ -75,6 +75,19 @@ impl Services {
     /// 上传 PNG 并返回 `file_info`（带秒传缓存）。
     pub async fn upload_png(&self, target: &Target, png: &[u8]) -> Result<String, CoreError> {
         Ok(self.media.upload_png(target, png).await?)
+    }
+
+    /// 上传任意格式的图片并返回 `file_info`（带秒传缓存）。
+    ///
+    /// 平台靠 `file_name` 判定格式，所以从上游转发来的 JPEG **不能**冒充
+    /// `image.png` —— 这正是它比 `upload_png` 多一个参数的原因。
+    pub async fn upload_image(
+        &self,
+        target: &Target,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<String, CoreError> {
+        Ok(self.media.upload_bytes(target, FileType::Image, file_name, bytes).await?)
     }
 }
 
@@ -157,6 +170,18 @@ impl Ctx {
     /// 直接发送 PNG 字节（内部完成上传 + 发送）。
     pub async fn reply_image(&self, png: &[u8]) -> Result<SendResult, CoreError> {
         let file_info = self.services.upload_png(&self.target, png).await?;
+        self.services
+            .send(SendRequest::media(self.target.clone(), file_info).replying_to(self.message.id.clone()))
+            .await
+    }
+
+    /// 发送任意格式的图片（`file_name` 决定格式，如 `daily.jpg`）。
+    pub async fn reply_image_named(
+        &self,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<SendResult, CoreError> {
+        let file_info = self.services.upload_image(&self.target, file_name, bytes).await?;
         self.services
             .send(SendRequest::media(self.target.clone(), file_info).replying_to(self.message.id.clone()))
             .await

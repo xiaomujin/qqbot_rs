@@ -35,6 +35,17 @@ log_level = "info"
 # 单次渲染超时（秒），超时降级为纯文本。默认 5。
 timeout_secs = 5
 
+# ---- 日报 ----
+[daily]
+# 接口令牌。**留空则整个「日报」命令不会被注册**（不会出现在帮助里）。
+# 默认接口是 alapi 早报，令牌在 https://www.alapi.cn/ 申请。
+# 也可以走环境变量 QQBOT_DAILY_TOKEN。
+token = ""
+# 接口地址。任何返回 data.image 的接口都能用；想换源改这一行即可。
+api_url = "https://v2.alapi.cn/api/zaobao?format=json"
+# 结果缓存时长（秒，1 ~ 86400）。早报一天只更新一次，默认 30 分钟。
+cache_secs = 1800
+
 # ---- 按需打开（默认值随机器规格而定，所以默认注释掉）----
 # 接口基址（调试 / 私有化部署用）
 # api_base = "https://api.bot.qq.com"

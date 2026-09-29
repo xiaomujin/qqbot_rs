@@ -46,6 +46,7 @@ cargo run -- self-test     # 离线渲染自检（无需网络与凭据）
 | `ping` | 存活探测 |
 | `骰子` / `骰子 3d6` / `roll 2d20` | 掷骰（Markdown 渲染） |
 | `词云` | 用消息库里最近的群聊消息渲染词云图片（字号与透明度按词频映射） |
+| `日报` | 当日早报长图（需在配置里填 `daily.token`，否则该指令不注册） |
 | `帮助` | 自动生成的指令表 |
 
 ---
@@ -81,6 +82,9 @@ cp config.example.toml config.toml
 | `session_shards` | `QQBOT_SESSION_SHARDS` | CPU 核数 × 2 | 会话分片数 |
 | `dispatch_concurrency` | `QQBOT_DISPATCH_CONCURRENCY` | `16` | 单条事件处理的最大并发 |
 | `render.timeout_secs` | `QQBOT_RENDER_TIMEOUT_SECS` | `5` | 单次渲染超时（秒），超时降级为纯文本 |
+| `daily.token` | `QQBOT_DAILY_TOKEN` | 空 | 早报接口令牌。**留空则不注册 `日报` 指令** |
+| `daily.api_url` | `QQBOT_DAILY_API_URL` | alapi 早报 | 早报接口地址（任何返回 `data.image` 的接口都能换） |
+| `daily.cache_secs` | `QQBOT_DAILY_CACHE_SECS` | `1800` | 早报缓存时长（1 ~ 86400） |
 
 > 「缺失」与「非法」是两回事：**没写** → 用默认值；**写了但解析不了**
 > （例如 `QQBOT_RETENTION_DAYS=abc`）→ 启动直接报错，不会静默回退成 365 天。

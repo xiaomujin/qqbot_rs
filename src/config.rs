@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use qqbot_api::{ApiClientConfig, Intents};
+use qqbot_plugins::DailyConfig;
 use qqbot_render::RenderConfig;
 use qqbot_store::{StoreConfig, DAY_SECS};
 use serde::Deserialize;
@@ -59,6 +60,13 @@ const MAX_DISPATCH_CONCURRENCY: usize = 4096;
 /// 渲染超时上界（秒）。
 const MAX_RENDER_TIMEOUT_SECS: u64 = 3600;
 
+/// 默认日报接口。换成任何返回 `data.image` 的接口都能用。
+const DEFAULT_DAILY_API_URL: &str = "https://v2.alapi.cn/api/zaobao?format=json";
+/// 默认日报缓存时长（秒）。早报一天只更新一次，30 分钟足够挡住连点。
+const DEFAULT_DAILY_CACHE_SECS: u64 = 1800;
+/// 日报缓存上界（秒）—— 一天的秒数，再长就失去「日报」的意义了。
+const MAX_DAILY_CACHE_SECS: u64 = 86_400;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub app_id: String,
@@ -78,6 +86,8 @@ pub struct Config {
     pub store: Option<StoreConfig>,
     /// 词云统计窗口：只看最近这段时间的消息。
     pub wordcloud_window: Duration,
+    /// 日报插件配置。`None` 表示未配置 token，**该命令不会被注册**。
+    pub daily: Option<DailyConfig>,
     /// 日志级别。`RUST_LOG` 未设置时生效。
     pub log_level: String,
     /// 配置来源摘要，供启动日志打印。**不含任何密钥值**，只有来源名与路径。
@@ -190,6 +200,32 @@ impl Config {
             .unwrap_or(DEFAULT_RENDER_TIMEOUT_SECS)
             .clamp(1, MAX_RENDER_TIMEOUT_SECS);
 
+        // ---- 日报 ----
+        // token 为空即视为**不启用**：宁可没有这个命令，也不要一个每次调用
+        // 都必然失败的插件挂在帮助列表里。
+        // 注意缓存时长只在启用时才解析 —— 关掉的功能不该因为一个拼错的
+        // 环境变量而让整个进程起不来。
+        let daily = match non_empty(env.get("QQBOT_DAILY_TOKEN"))
+            .or_else(|| file.and_then(|f| non_empty(f.daily.token.as_deref())))
+        {
+            Some(token) => {
+                let api_url = non_empty(env.get("QQBOT_DAILY_API_URL"))
+                    .or_else(|| file.and_then(|f| non_empty(f.daily.api_url.as_deref())))
+                    .unwrap_or_else(|| DEFAULT_DAILY_API_URL.to_string());
+                let cache_secs = env
+                    .parsed::<u64>("QQBOT_DAILY_CACHE_SECS")?
+                    .or(file.and_then(|f| f.daily.cache_secs))
+                    .unwrap_or(DEFAULT_DAILY_CACHE_SECS)
+                    .clamp(1, MAX_DAILY_CACHE_SECS);
+                Some(DailyConfig {
+                    api_url,
+                    token,
+                    cache: Duration::from_secs(cache_secs),
+                })
+            }
+            None => None,
+        };
+
         Ok(Self {
             app_id,
             client_secret,
@@ -210,6 +246,7 @@ impl Config {
             gateway_url,
             store,
             wordcloud_window: Duration::from_secs(window_days * DAY_SECS),
+            daily,
             log_level,
             sources: describe_sources(env, found),
         })
@@ -323,12 +360,23 @@ struct FileConfig {
     dispatch_concurrency: Option<usize>,
     #[serde(default)]
     render: RenderSection,
+    #[serde(default)]
+    daily: DailySection,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RenderSection {
     timeout_secs: Option<u64>,
+}
+
+/// `[daily]` 段。`token` 缺失或为空 → 不注册日报插件。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DailySection {
+    api_url: Option<String>,
+    token: Option<String>,
+    cache_secs: Option<u64>,
 }
 
 /// 配置文件发现结果。
@@ -447,10 +495,100 @@ mod tests {
             dispatch_concurrency = 1
             [render]
             timeout_secs = 1
+            [daily]
+            api_url = "https://example.invalid/api"
+            token = "t"
+            cache_secs = 1
         "#;
         let parsed: FileConfig = toml::from_str(text).expect("所有已暴露的键都必须被接受");
         assert_eq!(parsed.retention_days, Some(1));
         assert_eq!(parsed.render.timeout_secs, Some(1));
+        assert_eq!(parsed.daily.cache_secs, Some(1));
+    }
+
+    /// 日报的典型配置片段，多个用例共用。
+    const DAILY_TOML: &str = r#"
+[daily]
+token = "ft"
+api_url = "https://f.invalid"
+cache_secs = 60
+"#;
+
+    /// token 为空串的日报片段 —— 应与「未设置」等价。
+    const EMPTY_DAILY_TOML: &str = r#"
+[daily]
+token = ""
+"#;
+
+    #[test]
+    fn daily_is_disabled_without_token() {
+        // 没配 token 就不该注册这个命令 —— 宁可没有，也不要一个必然失败的插件。
+        assert!(resolve(&creds(&[]), None).unwrap().daily.is_none());
+        // 空串与「未设置」等价，这点与 app_id 的处理保持一致。
+        assert!(resolve(&creds(&[("QQBOT_DAILY_TOKEN", "")]), None).unwrap().daily.is_none());
+        let blank = resolve(&creds(&[]), Some(EMPTY_DAILY_TOML)).unwrap();
+        assert!(blank.daily.is_none());
+    }
+
+    #[test]
+    fn daily_reads_from_file_and_env() {
+        let file = resolve(&creds(&[]), Some(DAILY_TOML)).unwrap();
+        let d = file.daily.expect("配了 token 就应当启用");
+        assert_eq!(d.token, "ft");
+        assert_eq!(d.api_url, "https://f.invalid");
+        assert_eq!(d.cache, Duration::from_secs(60));
+
+        // 环境变量优先，且只覆盖它自己那一个键。
+        let env = resolve(
+            &creds(&[("QQBOT_DAILY_TOKEN", "et"), ("QQBOT_DAILY_CACHE_SECS", "5")]),
+            Some(DAILY_TOML),
+        )
+        .unwrap();
+        let d = env.daily.expect("应当启用");
+        assert_eq!(d.token, "et");
+        assert_eq!(d.cache, Duration::from_secs(5));
+        assert_eq!(d.api_url, "https://f.invalid", "未覆盖的键应当保留文件里的值");
+    }
+
+    #[test]
+    fn daily_defaults_and_clamp() {
+        let d = resolve(&creds(&[("QQBOT_DAILY_TOKEN", "t")]), None).unwrap().daily.unwrap();
+        assert_eq!(d.api_url, DEFAULT_DAILY_API_URL);
+        assert_eq!(d.cache, Duration::from_secs(DEFAULT_DAILY_CACHE_SECS));
+
+        // 上界：缓存超过一天会让「日报」永远停在同一天。
+        let d = resolve(
+            &creds(&[("QQBOT_DAILY_TOKEN", "t"), ("QQBOT_DAILY_CACHE_SECS", "99999999")]),
+            None,
+        )
+        .unwrap()
+        .daily
+        .unwrap();
+        assert_eq!(d.cache, Duration::from_secs(MAX_DAILY_CACHE_SECS));
+
+        // 0 秒缓存等于没有缓存，钳到 1 秒。
+        let d = resolve(
+            &creds(&[("QQBOT_DAILY_TOKEN", "t"), ("QQBOT_DAILY_CACHE_SECS", "0")]),
+            None,
+        )
+        .unwrap()
+        .daily
+        .unwrap();
+        assert_eq!(d.cache, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn malformed_daily_cache_is_loud() {
+        // 「缺失」用默认，「非法」直接报错 —— 与其它键一致。
+        let err = resolve(
+            &creds(&[("QQBOT_DAILY_TOKEN", "t"), ("QQBOT_DAILY_CACHE_SECS", "abc")]),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("QQBOT_DAILY_CACHE_SECS"), "{err}");
+
+        // 但功能没启用时不该因为它而拒绝启动。
+        assert!(resolve(&creds(&[("QQBOT_DAILY_CACHE_SECS", "abc")]), None).is_ok());
     }
 
     #[test]

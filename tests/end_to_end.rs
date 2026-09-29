@@ -39,6 +39,8 @@ struct MockInner {
     fail_first_sends: usize,
     /// `/graphql` 是否返回上游故障（模拟 tarkov.dev 后端不可用）。
     fail_graphql: AtomicBool,
+    /// BA 图片接口是否返回「模糊搜索」（code 101）。
+    ba_fuzzy: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -53,7 +55,7 @@ impl MockServer {
     }
 
     fn builder() -> MockBuilder {
-        MockBuilder { fail_first_sends: 0, fail_graphql: false }
+        MockBuilder { fail_first_sends: 0, fail_graphql: false, ba_fuzzy: false }
     }
 
     fn base_url(&self) -> String {
@@ -76,6 +78,7 @@ impl MockServer {
 struct MockBuilder {
     fail_first_sends: usize,
     fail_graphql: bool,
+    ba_fuzzy: bool,
 }
 
 impl MockBuilder {
@@ -89,6 +92,11 @@ impl MockBuilder {
         self
     }
 
+    fn ba_fuzzy(mut self, on: bool) -> Self {
+        self.ba_fuzzy = on;
+        self
+    }
+
     async fn start(self) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
         let addr = listener.local_addr().unwrap();
@@ -97,6 +105,7 @@ impl MockBuilder {
             sends: AtomicUsize::new(0),
             fail_first_sends: self.fail_first_sends,
             fail_graphql: AtomicBool::new(self.fail_graphql),
+            ba_fuzzy: AtomicBool::new(self.ba_fuzzy),
         });
 
         let inner_for_task = inner.clone();
@@ -209,6 +218,36 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/test-image") {
         return ("200 OK", "FAKE-IMAGE-BYTES".to_string());
     }
+    // BA 图片查询：形状照 arona 的响应。
+    if path.starts_with("/api/v2/image") {
+        if inner.ba_fuzzy.load(Ordering::Relaxed) {
+            return (
+                "200 OK",
+                json!({
+                    "code": 101,
+                    "message": "Fuzzy Search",
+                    "data": [
+                        {"name": "汉堡", "type": "file", "content": "/student_rank/泉.png"},
+                        {"name": "水汉堡", "type": "file", "content": "/student_rank/泳装泉.png"},
+                    ],
+                })
+                .to_string(),
+            );
+        }
+        return (
+            "200 OK",
+            json!({
+                "code": 200,
+                "message": "OK",
+                "data": [{"name": "爱丽丝", "type": "file", "content": "/student_rank/爱丽丝.png"}],
+            })
+            .to_string(),
+        );
+    }
+    // BA 图片 CDN。
+    if path.starts_with("/image/s/") {
+        return ("200 OK", "FAKE-BA-IMAGE".to_string());
+    }
     // 塔科夫 BOSS 刷新率：形状照 tarkov.dev 的 GraphQL 响应。
     if path.starts_with("/graphql") {
         if inner.fail_graphql.load(Ordering::Relaxed) {
@@ -295,6 +334,10 @@ async fn build_stack_with(
             tarkov: qqbot_plugins::TarkovConfig {
                 graphql_url: format!("{}/graphql", mock.base_url()),
                 ..Default::default()
+            },
+            ba: qqbot_plugins::BaConfig {
+                api: format!("{}/api/v2/image?name=", mock.base_url()),
+                cdn: format!("{}/image/s", mock.base_url()),
             },
         },
     )
@@ -1170,4 +1213,58 @@ async fn boss_chance_reports_upstream_failure_gracefully() {
     let text = body["content"].as_str().unwrap_or_default();
     assert!(text.contains("查询失败"), "应当是给用户看的话: {text}");
     assert!(!text.contains("422"), "不该把上游原文丢给用户: {text}");
+}
+
+/// E3 BA 图片：官方 API 不接受远程 URL 直发，必须先下载再上传。
+#[tokio::test]
+async fn ba_image_is_downloaded_then_uploaded() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"BA_1","author":{"member_openid":"U1"},"content":"ba 爱丽丝","group_openid":"GBA"}"#,
+    )
+    .await;
+
+    assert!(
+        mock.find(|h| h.path.contains("/image/s/")).is_some(),
+        "应当去 CDN 下载图片"
+    );
+    assert!(
+        mock.find(|h| h.path.contains("/upload_prepare")).is_some(),
+        "必须先上传拿 file_info，不能直发远程 URL"
+    );
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GBA/messages")
+        .expect("应当回复图片");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    assert_eq!(body["msg_type"], 7, "富媒体必须用 msg_type=7: {body}");
+}
+
+/// 模糊搜索要列候选让人重问，而不是报错或发一堆图。
+#[tokio::test]
+async fn ba_fuzzy_search_lists_candidates_instead_of_images() {
+    let mock = MockServer::builder().ba_fuzzy(true).start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"BA_2","author":{"member_openid":"U1"},"content":"ba 泉","group_openid":"GBA2"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GBA2/messages")
+        .expect("应当回复候选");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("是想问什么呢"), "{text}");
+    assert!(text.contains("汉堡") && text.contains("水汉堡"), "要列出全部候选: {text}");
+    assert!(
+        mock.find(|h| h.path.contains("/image/s/")).is_none(),
+        "模糊搜索不该去下载图片"
+    );
 }

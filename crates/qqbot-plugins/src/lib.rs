@@ -6,6 +6,7 @@ pub mod daily;
 pub mod dice;
 pub mod help;
 pub mod http;
+pub mod ba;
 pub mod resource;
 pub mod tarkov;
 pub mod timewin;
@@ -15,6 +16,7 @@ pub use daily::{DailyConfig, DailyPlugin};
 pub use dice::{parse_spec, DicePlugin};
 pub use help::HelpPlugin;
 pub use resource::{register_resources, ResourcesConfig};
+pub use ba::BaConfig;
 pub use tarkov::TarkovConfig;
 pub use wordcloud::{tokenize, WordCloudPlugin};
 
@@ -39,6 +41,8 @@ pub struct PluginsConfig {
     pub resources: Option<ResourcesConfig>,
     /// 塔科夫相关命令的配置。
     pub tarkov: TarkovConfig,
+    /// BA 图片查询的配置。
+    pub ba: BaConfig,
 }
 
 /// 把所有内置插件注册到路由表。
@@ -96,6 +100,12 @@ pub async fn register(
     }
     // 通配监听器：只用于累积语料，不作为用户可见命令出现在帮助里。
     router.on_listener(Matcher::Any, wordcloud.clone());
+
+    // `ba <名>`：正则路由，真正的判定在插件里（`parse_query`），两者保持一致。
+    router.on_any(
+        Matcher::Regex(regex::Regex::new(r"(?i)^ba\s+\S").expect("BA 图片正则字面量")),
+        ba::BaPlugin::new(cfg.ba.clone(), http.clone()),
+    );
 
     let tarkov = tarkov::TarkovPlugin::new(cfg.tarkov.clone(), http.clone());
     router.on_any(Matcher::Exact("塔科夫时间".into()), tarkov.clone());

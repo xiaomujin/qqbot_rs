@@ -273,6 +273,7 @@ async fn run(cfg: Config) -> Result<()> {
             daily: cfg.daily.clone(),
             resources: resources.clone(),
             tarkov: qqbot_plugins::TarkovConfig::default(),
+            ba: qqbot_plugins::BaConfig::default(),
         },
     )
     .await

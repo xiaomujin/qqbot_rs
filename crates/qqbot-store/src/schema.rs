@@ -10,7 +10,8 @@ use rusqlite::Connection;
 /// v2 增加了资源映射（`resources` / `resource_keywords`）与系统设置（`settings`）。
 /// v3 给 `messages` 增加 `raw` 列，保存**原始事件 JSON**。
 /// v4 增加 `bili_subscriptions`（B 站订阅）。
-pub const SCHEMA_VERSION: i64 = 4;
+/// v5 增加 `pending_captions`（图语：等下一张图配字）。
+pub const SCHEMA_VERSION: i64 = 5;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -91,6 +92,16 @@ CREATE TABLE IF NOT EXISTS bili_subscriptions (
     name       TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     PRIMARY KEY (uid, group_id)
+);
+
+-- 图语：`图语 <文本>` 之后，等同一会话里同一个人发的下一张图。
+-- 一次性，用完即删；过期判断在读取时做。
+CREATE TABLE IF NOT EXISTS pending_captions (
+    target_id  TEXT NOT NULL,
+    sender_id  TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (target_id, sender_id)
 );
 "#;
 

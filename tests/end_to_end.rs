@@ -1649,3 +1649,70 @@ async fn bangumi_reports_when_nothing_was_parsed() {
     let text = body["content"].as_str().unwrap_or_default();
     assert!(text.contains("没有解析出"), "{text}");
 }
+
+/// F3 图语：`图语 <文字>` 之后，同一个人发的下一张图会被配上文字重发。
+#[tokio::test]
+async fn caption_is_applied_to_the_next_image() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"CAP_1","author":{"member_openid":"U1"},"content":"图语 你好呀","group_openid":"GCAP"}"#,
+    )
+    .await;
+
+    let url = format!("{}/test-image.png", mock.base_url());
+    let img = format!(
+        r#"{{"id":"CAP_2","author":{{"member_openid":"U1"}},"content":"","group_openid":"GCAP","attachments":[{{"url":"{url}","content_type":"image/png","filename":"a.png"}}]}}"#
+    );
+    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
+
+    let card = mock
+        .all(|h| h.path == "/v2/groups/GCAP/messages")
+        .into_iter()
+        .find(|h| {
+            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            body["msg_type"] == 7
+        })
+        .expect("应当把图片配字重发");
+    let body: serde_json::Value = serde_json::from_str(&card.body).unwrap();
+    assert_eq!(body["content"], "你好呀", "图与文字要在同一条消息里: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 图语是一次性的：配过一次就不再对后面的图生效。
+#[tokio::test]
+async fn caption_is_consumed_by_the_first_image_only() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"CAP_3","author":{"member_openid":"U1"},"content":"图语 只用一次","group_openid":"GCAP2"}"#,
+    )
+    .await;
+
+    let url = format!("{}/test-image.png", mock.base_url());
+    for id in ["CAP_4", "CAP_5"] {
+        let img = format!(
+            r#"{{"id":"{id}","author":{{"member_openid":"U1"}},"content":"","group_openid":"GCAP2","attachments":[{{"url":"{url}","filename":"a.png"}}]}}"#
+        );
+        feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
+    }
+
+    let cards = mock
+        .all(|h| h.path == "/v2/groups/GCAP2/messages")
+        .into_iter()
+        .filter(|h| {
+            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            body["msg_type"] == 7
+        })
+        .count();
+    assert_eq!(cards, 1, "只有第一张图该被配字");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

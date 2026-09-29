@@ -9,6 +9,7 @@ pub mod http;
 pub mod ba;
 pub mod bangumi;
 pub mod bili;
+pub mod caption;
 pub mod resource;
 pub mod tarkov;
 pub mod timewin;
@@ -124,6 +125,14 @@ pub async fn register(
     for keyword in ["今日番剧", "每日番剧", "最新番剧"] {
         router.on_any(Matcher::Exact(keyword.into()), bangumi.clone());
     }
+
+    // 图语：命令记下文字，监听器在下一条图片消息上配字重发。
+    let caption = caption::CaptionPlugin::new(
+        cfg.resources.as_ref().map(|res| Arc::clone(&res.store)),
+        http.clone(),
+    );
+    router.on_any(Matcher::Command("图语".into()), caption.clone());
+    router.on_listener(Matcher::Any, caption.clone());
 
     // 通配监听器：只用于累积语料，不作为用户可见命令出现在帮助里。
     router.on_listener(Matcher::Any, wordcloud.clone());

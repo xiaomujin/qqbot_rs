@@ -387,6 +387,69 @@ impl ResourceStore {
         .await
     }
 
+    // ---- 图语 ----
+
+    /// 记下待用的图语。同一个人重复设置时覆盖上一条。
+    pub async fn set_caption(&self, target_id: &str, sender_id: &str, text: &str) -> Result<()> {
+        let target_id = target_id.to_string();
+        let sender_id = sender_id.to_string();
+        let text = text.to_string();
+        self.with(move |conn| {
+            conn.execute(
+                "INSERT INTO pending_captions(target_id, sender_id, text, created_at) \
+                 VALUES(?1, ?2, ?3, ?4) \
+                 ON CONFLICT(target_id, sender_id) DO UPDATE SET \
+                   text = excluded.text, created_at = excluded.created_at",
+                rusqlite::params![target_id, sender_id, text, now_unix()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 取出并**删除**待用图语。
+    ///
+    /// 无论是否过期都会删掉：这是一次性状态，留着只会让下一张图莫名其妙被配字。
+    /// 返回 `None` 表示没有，或已经超过 `ttl_secs`。
+    pub async fn take_caption(
+        &self,
+        target_id: &str,
+        sender_id: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<String>> {
+        let target_id = target_id.to_string();
+        let sender_id = sender_id.to_string();
+        self.with(move |conn| {
+            let row: Option<(String, i64)> = conn
+                .query_row(
+                    "SELECT text, created_at FROM pending_captions \
+                     WHERE target_id = ?1 AND sender_id = ?2",
+                    rusqlite::params![target_id, sender_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            conn.execute(
+                "DELETE FROM pending_captions WHERE target_id = ?1 AND sender_id = ?2",
+                rusqlite::params![target_id, sender_id],
+            )?;
+            Ok(row.filter(|(_, at)| now_unix() - at < ttl_secs).map(|(text, _)| text))
+        })
+        .await
+    }
+
+    /// 清掉过期条目，供将来的清理任务使用。
+    pub async fn purge_captions(&self, ttl_secs: i64) -> Result<usize> {
+        self.with(move |conn| {
+            let cutoff = now_unix() - ttl_secs;
+            let removed = conn.execute(
+                "DELETE FROM pending_captions WHERE created_at < ?1",
+                rusqlite::params![cutoff],
+            )?;
+            Ok(removed)
+        })
+        .await
+    }
+
     /// 读一条系统设置。
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let key = key.to_string();
@@ -525,6 +588,59 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].0, "G1", "应当按群排序，供推送任务按群聚合");
         assert_eq!(all[1].0, "G2");
+    }
+
+    #[tokio::test]
+    async fn caption_round_trips_and_is_consumed_once() {
+        let s = store();
+        assert!(s.take_caption("G1", "U1", 300).await.unwrap().is_none(), "没设过就是 None");
+
+        s.set_caption("G1", "U1", "你好").await.unwrap();
+        assert_eq!(s.take_caption("G1", "U1", 300).await.unwrap().as_deref(), Some("你好"));
+        assert!(
+            s.take_caption("G1", "U1", 300).await.unwrap().is_none(),
+            "取过一次之后就该没了"
+        );
+    }
+
+    #[tokio::test]
+    async fn caption_is_scoped_to_target_and_sender() {
+        let s = store();
+        s.set_caption("G1", "U1", "甲的话").await.unwrap();
+        assert!(s.take_caption("G2", "U1", 300).await.unwrap().is_none(), "会话之间不能串");
+        assert!(s.take_caption("G1", "U2", 300).await.unwrap().is_none(), "不能拿别人的");
+        assert_eq!(s.take_caption("G1", "U1", 300).await.unwrap().as_deref(), Some("甲的话"));
+    }
+
+    #[tokio::test]
+    async fn stale_caption_is_dropped_but_still_deleted() {
+        let s = store();
+        s.set_caption("G1", "U1", "过期了").await.unwrap();
+        // ttl 为 0：写入时刻已经「过期」。
+        assert!(s.take_caption("G1", "U1", 0).await.unwrap().is_none(), "过期的不该返回");
+        assert!(
+            s.take_caption("G1", "U1", 300).await.unwrap().is_none(),
+            "过期的也要删掉，否则下一张图会莫名被配字"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_removes_only_stale_captions() {
+        let s = store();
+        s.set_caption("G1", "U1", "新的").await.unwrap();
+        // cutoff = now - 300，刚写入的条目比它新，不该被清。
+        assert_eq!(s.purge_captions(300).await.unwrap(), 0, "没过期的不该被清");
+        assert_eq!(
+            s.take_caption("G1", "U1", 300).await.unwrap().as_deref(),
+            Some("新的"),
+            "清理不该动到还能用的条目"
+        );
+
+        // 时间戳是秒级，所以要跨过一个整秒才能构造出「更旧」的条目。
+        s.set_caption("G1", "U1", "旧的").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert_eq!(s.purge_captions(0).await.unwrap(), 1);
+        assert!(s.take_caption("G1", "U1", 300).await.unwrap().is_none());
     }
 
     #[tokio::test]

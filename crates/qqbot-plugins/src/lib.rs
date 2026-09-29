@@ -5,6 +5,7 @@
 pub mod daily;
 pub mod dice;
 pub mod help;
+pub mod market;
 pub mod http;
 pub mod ammo;
 pub mod ba;
@@ -22,6 +23,7 @@ pub use dice::{parse_spec, DicePlugin};
 pub use help::HelpPlugin;
 pub use resource::{register_resources, ResourcesConfig};
 pub use ammo::AmmoConfig;
+pub use market::MarketConfig;
 pub use task::TaskConfig;
 pub use ba::BaConfig;
 pub use bangumi::BangumiConfig;
@@ -60,6 +62,8 @@ pub struct PluginsConfig {
     pub ammo: AmmoConfig,
     /// 塔科夫任务的配置。
     pub task: TaskConfig,
+    /// 塔科夫跳蚤市场的配置。
+    pub market: MarketConfig,
 }
 
 /// 把所有内置插件注册到路由表。
@@ -145,6 +149,15 @@ pub async fn register(
     let task = task::TaskPlugin::new(task_cfg, http.clone());
     router.on_any(Matcher::Command("查任务".into()), task.clone());
     router.on_any(Matcher::Command("更新任务".into()), task.clone());
+
+    // 塔科夫跳蚤市场：B2（关键词搜）与 B3（按 id 查详情）共用一条命令。
+    let mut market_cfg = cfg.market.clone();
+    if market_cfg.store.is_none() {
+        market_cfg.store = cfg.resources.as_ref().map(|res| Arc::clone(&res.store));
+    }
+    let market = market::MarketPlugin::new(market_cfg, http.clone());
+    router.on_any(Matcher::Command("跳蚤".into()), market.clone());
+    router.on_any(Matcher::Command("更新物品".into()), market.clone());
 
     // 番剧更新：三个写法整串匹配。
     let bangumi = bangumi::BangumiPlugin::new(cfg.bangumi.clone(), http.clone());

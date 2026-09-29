@@ -235,7 +235,10 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
                 r#"{"data":{"items":{"#,
                 r#""a1":{"normalizedName":"556x45mm-m855","basePrice":180,"properties":{"propertiesType":"ItemPropertiesAmmo","caliber":"Caliber556x45NATO","damage":54,"penetrationPower":31,"armorDamage":37,"initialSpeed":922,"projectileCount":1,"tracer":false}},"#,
                 r#""a2":{"normalizedName":"545x39mm-bp","basePrice":110,"properties":{"propertiesType":"ItemPropertiesAmmo","caliber":"Caliber545x39","damage":51,"penetrationPower":37,"armorDamage":42,"initialSpeed":890,"projectileCount":1,"tracer":false}},"#,
-                r#""a3":{"normalizedName":"f-1-grenade","basePrice":100,"properties":{"propertiesType":"ItemPropertiesGrenade","damage":80}}"#,
+                r#""a3":{"normalizedName":"f-1-grenade","basePrice":100,"properties":{"propertiesType":"ItemPropertiesGrenade","damage":80}},"#,
+                // 跳蚤市场用：一件有跳蚤价、一件只有商人价。
+                r#""5447a9cd4bdc2dbd208b4567":{"normalizedName":"colt-m4a1-556x45-assault-rifle","basePrice":18397,"lastLowPrice":23932,"avg24hPrice":93642,"low24hPrice":20000,"high24hPrice":185000,"weight":3.4},"#,
+                r#""5c0e53c886f7744a13f54933":{"normalizedName":"slick-body-armor","basePrice":100000,"lastLowPrice":null,"avg24hPrice":null}"#,
                 r#"}}}"#,
             )
             .to_string(),
@@ -454,6 +457,10 @@ async fn build_stack_with(
                 update_url: format!("{}/update", mock.base_url()),
             },
             ammo: qqbot_plugins::AmmoConfig {
+                items_url: format!("{}/regular/items", mock.base_url()),
+                store: None,
+            },
+            market: qqbot_plugins::MarketConfig {
                 items_url: format!("{}/regular/items", mock.base_url()),
                 store: None,
             },
@@ -1892,6 +1899,102 @@ async fn task_search_before_import_says_so() {
     let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
     let text = body["content"].as_str().unwrap_or_default();
     assert!(text.contains("更新任务"), "要告诉用户怎么解决: {text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B2：管理员导入物品 → 关键词搜 → 出卡片。
+#[tokio::test]
+async fn market_search_renders_a_card() {
+    let mock = MockServer::start().await;
+    let (dispatcher, store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"MK_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新物品","group_openid":"GMK"}"#,
+    )
+    .await;
+
+    // 弹药条目也有 slug，所以一并入库；这里只断言目标物品在。
+    assert!(store.item_count().await.unwrap() >= 4, "应当导入物品");
+    let m4 = store.search_items(vec!["m4a1".into()], 10).await.unwrap();
+    assert_eq!(m4.len(), 1);
+    assert_eq!(m4[0].avg24h_price, Some(93642));
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"MK_2","author":{"member_openid":"U1"},"content":"跳蚤 m4a1","group_openid":"GMK"}"#,
+    )
+    .await;
+
+    let card = mock
+        .all(|h| h.path == "/v2/groups/GMK/messages")
+        .into_iter()
+        .find(|h| {
+            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            body["msg_type"] == 7
+        })
+        .expect("应当回一张卡片");
+    let body: serde_json::Value = serde_json::from_str(&card.body).unwrap();
+    assert!(body["media"]["file_info"].is_string(), "应当走富媒体上传: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B3：参数是 24 位 id 时走详情视图，不是关键词搜。
+#[tokio::test]
+async fn market_item_id_gives_the_detail_view() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"MK_3","author":{"member_openid":"U1","member_role":"admin"},"content":"更新物品","group_openid":"GMK2"}"#,
+    )
+    .await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"MK_4","author":{"member_openid":"U1"},"content":"跳蚤 5447a9cd4bdc2dbd208b4567","group_openid":"GMK2"}"#,
+    )
+    .await;
+
+    let card = mock
+        .all(|h| h.path == "/v2/groups/GMK2/messages")
+        .into_iter()
+        .find(|h| {
+            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            body["msg_type"] == 7
+        })
+        .expect("按 id 查也应当回卡片");
+    assert!(serde_json::from_str::<serde_json::Value>(&card.body).is_ok());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 没导入过时要给可操作的提示。
+#[tokio::test]
+async fn market_search_before_import_says_so() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"MK_5","author":{"member_openid":"U1"},"content":"跳蚤 m4a1","group_openid":"GMK3"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GMK3/messages")
+        .expect("应当回复提示");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("更新物品"), "要告诉用户怎么解决: {text}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

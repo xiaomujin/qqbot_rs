@@ -13,7 +13,8 @@ use rusqlite::Connection;
 /// v5 增加 `pending_captions`（图语：等下一张图配字）。
 /// v6 增加 `ammo`（塔科夫弹药数据，从 tarkov.dev 静态 JSON 导入）。
 /// v7 增加 `tarkov_task`（塔科夫任务数据，同一来源）。
-pub const SCHEMA_VERSION: i64 = 7;
+/// v8 增加 `tarkov_item`（塔科夫物品与跳蚤价格，同一来源）。
+pub const SCHEMA_VERSION: i64 = 8;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -144,6 +145,22 @@ CREATE TABLE IF NOT EXISTS tarkov_task (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tarkov_task_name ON tarkov_task(normalized_name);
+
+-- 塔科夫物品与跳蚤价格。价格字段可为 NULL —— 实测 5442 件里只有 3525 件有价。
+CREATE TABLE IF NOT EXISTS tarkov_item (
+    id              TEXT PRIMARY KEY,
+    -- 可读 slug（`colt-m4a1-556x45-assault-rifle`）。理由同 ammo / tarkov_task。
+    normalized_name TEXT NOT NULL,
+    base_price      INTEGER NOT NULL DEFAULT 0,
+    -- 跳蚤市场价：最低挂牌 / 24 小时均价 / 24 小时最低 / 24 小时最高。
+    last_low_price  INTEGER,
+    avg24h_price    INTEGER,
+    low24h_price    INTEGER,
+    high24h_price   INTEGER,
+    weight          REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_tarkov_item_name ON tarkov_item(normalized_name);
 "#;
 
 /// 打开（必要时创建）数据库并应用 PRAGMA。

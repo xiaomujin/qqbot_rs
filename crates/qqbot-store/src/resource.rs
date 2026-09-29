@@ -146,6 +146,36 @@ pub struct TarkovTask {
     pub wiki_link: String,
 }
 
+/// 一件塔科夫物品（含跳蚤价格）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TarkovItem {
+    pub id: String,
+    /// 可读 slug，如 `colt-m4a1-556x45-assault-rifle`。
+    pub normalized_name: String,
+    /// 商人基础价。
+    pub base_price: i64,
+    /// 跳蚤市场价。`None` 表示这件物品没有跳蚤数据（实测 5442 件里只有 3525 件有）。
+    pub last_low_price: Option<i64>,
+    pub avg24h_price: Option<i64>,
+    pub low24h_price: Option<i64>,
+    pub high24h_price: Option<i64>,
+    pub weight: f64,
+}
+
+/// 从一行读出物品。三个查询共用同一段列映射，列顺序必须与 SQL 里一致。
+fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<TarkovItem> {
+    Ok(TarkovItem {
+        id: row.get(0)?,
+        normalized_name: row.get(1)?,
+        base_price: row.get(2)?,
+        last_low_price: row.get(3)?,
+        avg24h_price: row.get(4)?,
+        low24h_price: row.get(5)?,
+        high24h_price: row.get(6)?,
+        weight: row.get(7)?,
+    })
+}
+
 /// 资源库句柄。
 #[derive(Clone)]
 pub struct ResourceStore {
@@ -422,6 +452,97 @@ impl ResourceStore {
                 out.push(row?);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    // ---- 塔科夫物品与跳蚤价格 ----
+
+    /// 整表替换物品数据。返回写入行数。理由同 `replace_ammo`。
+    pub async fn replace_items(&self, items: Vec<TarkovItem>) -> Result<usize> {
+        self.with(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM tarkov_item", [])?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_item(id, normalized_name, base_price, \
+                     last_low_price, avg24h_price, low24h_price, high24h_price, weight) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                for it in &items {
+                    stmt.execute(rusqlite::params![
+                        it.id,
+                        it.normalized_name,
+                        it.base_price,
+                        it.last_low_price,
+                        it.avg24h_price,
+                        it.low24h_price,
+                        it.high24h_price,
+                        it.weight,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(items.len())
+        })
+        .await
+    }
+
+    /// 按关键词检索物品。`tokens` 的语义同 `search_ammo`。
+    pub async fn search_items(
+        &self,
+        tokens: Vec<String>,
+        limit: usize,
+    ) -> Result<Vec<TarkovItem>> {
+        self.with(move |conn| {
+            let mut sql = String::from(
+                "SELECT id, normalized_name, base_price, last_low_price, avg24h_price, \
+                 low24h_price, high24h_price, weight FROM tarkov_item WHERE 1 = 1",
+            );
+            for i in 0..tokens.len() {
+                let _ = write!(sql, " AND normalized_name LIKE ?{}", i + 1);
+            }
+            let _ = write!(sql, " ORDER BY normalized_name LIMIT ?{}", tokens.len() + 1);
+
+            let mut params: Vec<rusqlite::types::Value> = tokens
+                .iter()
+                .map(|t| rusqlite::types::Value::Text(format!("%{t}%")))
+                .collect();
+            params.push(rusqlite::types::Value::Integer(limit as i64));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), read_item)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// 按游戏内 id 精确取一件物品。
+    pub async fn get_item(&self, id: &str) -> Result<Option<TarkovItem>> {
+        let id = id.to_string();
+        self.with(move |conn| {
+            let found = conn
+                .query_row(
+                    "SELECT id, normalized_name, base_price, last_low_price, avg24h_price, \
+                     low24h_price, high24h_price, weight FROM tarkov_item WHERE id = ?1",
+                    rusqlite::params![id],
+                    read_item,
+                )
+                .optional()?;
+            Ok(found)
+        })
+        .await
+    }
+
+    /// 物品表当前行数。为 0 表示还没导入过。
+    pub async fn item_count(&self) -> Result<i64> {
+        self.with(|conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM tarkov_item", [], |r| r.get(0))?;
+            Ok(n)
         })
         .await
     }
@@ -968,6 +1089,47 @@ mod tests {
         // 整表替换：第二次只剩一条。
         s.replace_tasks(vec![task("k9", "only-one", "prapor", 1)]).await.unwrap();
         assert_eq!(s.task_count().await.unwrap(), 1);
+    }
+
+    fn item(id: &str, slug: &str, avg: Option<i64>) -> TarkovItem {
+        TarkovItem {
+            id: id.into(),
+            normalized_name: slug.into(),
+            base_price: 1000,
+            last_low_price: avg.map(|v| v - 10),
+            avg24h_price: avg,
+            low24h_price: avg.map(|v| v - 100),
+            high24h_price: avg.map(|v| v + 100),
+            weight: 1.5,
+        }
+    }
+
+    #[tokio::test]
+    async fn item_replace_search_and_get_by_id() {
+        let s = store();
+        assert_eq!(s.item_count().await.unwrap(), 0);
+
+        s.replace_items(vec![
+            item("5447a9cd4bdc2dbd208b4567", "colt-m4a1-556x45-assault-rifle", Some(93642)),
+            item("5c0e53c886f7744a13f54933", "slick-body-armor", None),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(s.item_count().await.unwrap(), 2);
+
+        let found = s.search_items(vec!["m4a1".into()], 10).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].avg24h_price, Some(93642), "数值字段要完整取回");
+
+        // 按 id 精确取：这是 B3 详情视图走的路。
+        let by_id = s.get_item("5447a9cd4bdc2dbd208b4567").await.unwrap();
+        assert_eq!(by_id.unwrap().normalized_name, "colt-m4a1-556x45-assault-rifle");
+        assert!(s.get_item("不存在的id").await.unwrap().is_none());
+
+        // 缺价要真的存成 NULL，不能变成 0。
+        let slick = s.search_items(vec!["slick".into()], 10).await.unwrap();
+        assert_eq!(slick[0].avg24h_price, None);
+        assert_eq!(slick[0].base_price, 1000, "商人价仍在");
     }
 
     #[tokio::test]

@@ -44,7 +44,8 @@ cargo run -- self-test     # 离线渲染自检（无需网络与凭据）
 | 指令 | 说明 |
 |---|---|
 | `ping` | 存活探测 |
-| `骰子` / `骰子 3d6` / `roll 2d20` | 掷骰（Markdown 渲染） |
+| `骰子` / `骰子 3d6` / `roll 2d20` | NdM 记法掷骰，会列出每一颗骰子（Markdown 渲染） |
+| `.r 100` / `.r 5 10` | 区间记法，取 `[a,b]` 内的一个整数；`。r` 同样识别，两数自动排序 |
 | `塔科夫时间` | 游戏内时刻（现实 × 7），按莫斯科时区取，回两行（左 / 右相差 12 小时） |
 | `boss刷` / `boss概` | 各地图 BOSS 刷新率（`tarkov.dev` GraphQL，结果缓存 10 分钟） |
 | `ba <名>` | 蔚蓝档案角色图（arona 接口）。查不到时列出候选名；一次最多发 3 张 |
@@ -215,7 +216,7 @@ crates/
 ├─ qqbot-media/     富媒体分片上传、md5_10m 秒传、file_info 缓存
 ├─ qqbot-render/    SVG → PNG 渲染服务（resvg）与词云布局
 ├─ qqbot-store/     消息持久化（嵌入式 SQLite）：写线程批量提交 + 读线程 + 保留期清理
-└─ qqbot-plugins/   业务插件（帮助 / 骰子 / 词云）
+└─ qqbot-plugins/   业务插件（帮助 / 骰子 / 词云 / 日报 / 资源 / 塔科夫 / BA）
 src/
 ├─ main.rs          组合根：装配服务、连接网关、事件循环
 └─ config.rs        配置加载（环境变量 > config.toml > 默认值）

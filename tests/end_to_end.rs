@@ -1268,3 +1268,50 @@ async fn ba_fuzzy_search_lists_candidates_instead_of_images() {
         "模糊搜索不该去下载图片"
     );
 }
+
+/// A2 区间记法：`.r 5 10` 取 [5,10] 内的整数，两数自动排序。
+#[tokio::test]
+async fn dice_range_form_stays_within_bounds() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    // 故意把大数写前面，验证自动排序。
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DICE_R1","author":{"member_openid":"U1"},"content":".r 10 5","group_openid":"GD"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GD/messages")
+        .expect("应当回复骰子");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("范围：[5-10]"), "两数应当自动排序: {text}");
+    let value: i64 = text
+        .rsplit("结果：")
+        .next()
+        .and_then(|s| s.trim().parse().ok())
+        .expect("应当给出结果");
+    assert!((5..=10).contains(&value), "结果必须落在区间内: {text}");
+}
+
+/// `。` 是句末标点，`。roll` 这类正常句子不能被骰子吞掉。
+#[tokio::test]
+async fn dice_range_form_ignores_ordinary_sentences() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DICE_R2","author":{"member_openid":"U1"},"content":"。roll点吧","group_openid":"GD2"}"#,
+    )
+    .await;
+
+    assert!(
+        mock.find(|h| h.path == "/v2/groups/GD2/messages").is_none(),
+        "普通句子不该触发骰子"
+    );
+}

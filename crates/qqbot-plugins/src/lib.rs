@@ -70,6 +70,12 @@ pub async fn register(
     router.on_any(Matcher::Command("骰子".into()), DicePlugin);
     router.on_any(Matcher::Command("roll".into()), DicePlugin);
     router.on_any(Matcher::Command("r".into()), DicePlugin);
+    // `.r 100` / `。r 5 10`：区间记法。两种句点都认 ——
+    // 中文输入法下 `.` 很容易打成 `。`。
+    router.on_any(
+        Matcher::Regex(regex::Regex::new(r"^[.。][rR]($|[\s\d-])").expect("骰子区间正则字面量")),
+        DicePlugin,
+    );
 
     // 日报：精确匹配。全量模式下群消息都会到达，宽匹配会频繁误触发。
     if let Some(daily) = &cfg.daily {

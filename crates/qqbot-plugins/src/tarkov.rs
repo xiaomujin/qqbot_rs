@@ -4,6 +4,7 @@
 //! 文件里（时间/子弹在 `BulletPlugin`，BOSS/任务在 `TkfPlugin`），这里合并，
 //! 免得每加一个命令就多一个只含几十行的文件。
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,17 +25,18 @@ const GAME_SPEED: i64 = 7;
 /// 两个可选出发时间相差的小时数。
 const CLOCK_SPLIT_SECS: i64 = 12 * 3600;
 
-/// BOSS 刷新率查询。
-///
-/// `lang: zh` 让接口直接返回中文名，省掉一份本地译名表。
-const QUERY_BOSS_CHANCE: &str =
-    "{ maps(gameMode: regular, lang: zh) { name bosses { boss { name } spawnChance } } }";
 
 /// 塔科夫插件配置。
 #[derive(Debug, Clone)]
 pub struct TarkovConfig {
     /// GraphQL 端点。
+    ///
+    /// ⚠️ 目前**没有用到**：它的后端自 2026-09 起对所有查询返回 422，
+    /// BOSS 刷新率已改走 `maps_url` 的静态 JSON。保留字段是为了它恢复后
+    /// 能拿回中文名 —— 静态 JSON 的名字是 slug。
     pub graphql_url: String,
+    /// BOSS 刷新率的静态 JSON。
+    pub maps_url: String,
     /// BOSS 刷新率缓存时长。
     ///
     /// 刷新率是**静态数据**，缓存纯粹是为了防刷 —— 源项目也是 10 分钟。
@@ -49,6 +51,7 @@ impl Default for TarkovConfig {
     fn default() -> Self {
         Self {
             graphql_url: "https://api.tarkov.dev/graphql".into(),
+            maps_url: "https://json.tarkov.dev/regular/maps".into(),
             boss_cache: Duration::from_secs(600),
             status_base: "https://status.escapefromtarkov.com".into(),
             status_cache: Duration::from_secs(1200),
@@ -83,7 +86,26 @@ fn format_clock(secs: i64) -> String {
 // ---- BOSS 刷新率 ----
 
 #[derive(Debug, Deserialize)]
-struct GraphQlResponse {
+pub struct MapEntry {
+    /// 可读 slug（`factory` / `customs`）。静态 JSON 的 `name` 是翻译键。
+    #[serde(default, rename = "normalizedName")]
+    pub normalized_name: String,
+    #[serde(default)]
+    pub bosses: Vec<BossEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BossEntry {
+    /// 形如 `bossTagilla` —— 静态 JSON 里它已经是可读的标识，不是翻译键。
+    #[serde(default)]
+    pub mob: String,
+    /// 0.0 ~ 1.0 的比例，不是百分数。
+    #[serde(default, rename = "spawnChance")]
+    pub spawn_chance: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MapsResponse {
     #[serde(default)]
     data: Option<MapsData>,
 }
@@ -91,37 +113,32 @@ struct GraphQlResponse {
 #[derive(Debug, Deserialize)]
 struct MapsData {
     #[serde(default)]
-    maps: Vec<MapEntry>,
+    maps: HashMap<String, MapEntry>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct MapEntry {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub bosses: Vec<BossEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BossEntry {
-    #[serde(default)]
-    pub boss: Option<BossName>,
-    /// 0.0 ~ 1.0 的比例，不是百分数。
-    #[serde(default, rename = "spawnChance")]
-    pub spawn_chance: f64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BossName {
-    #[serde(default)]
-    pub name: String,
+/// 把静态 JSON 解析成按名称排序的地图列表。
+///
+/// 上游的 `maps` 是**按 id 键控的对象**，迭代顺序不保证；
+/// 排序让同一份数据每次输出的排列一致。
+pub fn parse_maps(body: &str) -> Result<Vec<MapEntry>, String> {
+    let parsed: MapsResponse =
+        serde_json::from_str(body).map_err(|err| format!("解析地图数据失败：{err}"))?;
+    let mut maps: Vec<MapEntry> = parsed
+        .data
+        .ok_or("地图响应缺少 data")?
+        .maps
+        .into_values()
+        .filter(|m| !m.normalized_name.is_empty())
+        .collect();
+    maps.sort_by(|a, b| a.normalized_name.cmp(&b.normalized_name));
+    Ok(maps)
 }
 
 /// 整理成「地图 → BOSS 平均刷新率」的文本，末尾附查询时间。
 ///
 /// 同一张图上同一个 BOSS 可能有多个刷新点，取**平均值**（与源项目一致）。
 ///
-/// 地图与 BOSS 都按**接口返回顺序**输出。源项目用的是 Java `HashMap`，
+/// 地图按 `normalizedName` 排序后输出。源项目用的是 Java `HashMap`，
 /// 迭代顺序随机，同一份数据每次刷新出来的排列都不一样；保序是刻意的改进。
 pub fn format_boss_chance(maps: &[MapEntry], now: i64) -> String {
     let mut out = String::new();
@@ -129,9 +146,10 @@ pub fn format_boss_chance(maps: &[MapEntry], now: i64) -> String {
         // 保序聚合：同一个 BOSS 的多个刷新点收集到一起。
         let mut per_boss: Vec<(&str, Vec<f64>)> = Vec::new();
         for entry in &map.bosses {
-            let Some(name) = entry.boss.as_ref().map(|b| b.name.as_str()) else {
+            let name = entry.mob.trim();
+            if name.is_empty() {
                 continue;
-            };
+            }
             match per_boss.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, chances)) => chances.push(entry.spawn_chance),
                 None => per_boss.push((name, vec![entry.spawn_chance])),
@@ -141,7 +159,7 @@ pub fn format_boss_chance(maps: &[MapEntry], now: i64) -> String {
             // 源项目会把没有 BOSS 的地图也打出一行空标题，这里跳过。
             continue;
         }
-        out.push_str(&map.name);
+        out.push_str(&map.normalized_name);
         out.push('\n');
         for (name, chances) in per_boss {
             let avg = chances.iter().sum::<f64>() / chances.len() as f64;
@@ -342,27 +360,40 @@ impl TarkovPlugin {
         serde_json::from_str(&body).with_context(|| format!("解析 {url} 响应失败"))
     }
 
+    /// 取 BOSS 刷新率。
+    ///
+    /// 走**静态 JSON**而不是 GraphQL：两者是同一份数据，但 GraphQL 后端
+    /// 自 2026-09 起对所有查询返回 422，而静态 JSON 一直可用。
+    /// 代价是名字从中文变成 slug（`bossTagilla`）。
     async fn fetch_boss_chance(&self) -> anyhow::Result<String> {
+        let body = self
+            .get_text(&self.config.maps_url)
+            .await
+            .context("下载地图数据失败")?;
+        let maps = parse_maps(&body).map_err(anyhow::Error::msg)?;
+        if maps.is_empty() {
+            anyhow::bail!("地图数据里没有可用条目，上游格式可能变了");
+        }
+        Ok(format_boss_chance(&maps, now_unix()))
+    }
+
+    /// GET 一段文本。
+    async fn get_text(&self, url: &str) -> anyhow::Result<String> {
         let res = self
             .http
-            .post(&self.config.graphql_url)
+            .get(url)
             .header("Accept", "application/json")
-            .json(&serde_json::json!({ "query": QUERY_BOSS_CHANCE }))
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
             .send()
             .await
-            .context("请求塔科夫 GraphQL 失败")?;
+            .with_context(|| format!("请求 {url} 失败"))?;
         let status = res.status();
-        let body = res.text().await.context("读取塔科夫 GraphQL 响应失败")?;
+        let body = res.text().await.with_context(|| format!("读取 {url} 响应失败"))?;
         if !status.is_success() {
-            // 后端故障时返回 422 + {"errors":["GraphQL server unavailable..."]}。
-            // 把原文带进错误里，否则排查时只看得到一个状态码。
             let snippet: String = body.chars().take(200).collect();
-            anyhow::bail!("塔科夫 GraphQL 返回 {status}：{snippet}");
+            anyhow::bail!("{url} 返回 {status}：{snippet}");
         }
-        let parsed: GraphQlResponse =
-            serde_json::from_str(&body).context("解析塔科夫 GraphQL 响应失败")?;
-        let data = parsed.data.context("塔科夫 GraphQL 响应缺少 data")?;
-        Ok(format_boss_chance(&data.maps, now_unix()))
+        Ok(body)
     }
 }
 
@@ -434,45 +465,49 @@ mod tests {
         assert_eq!(format_clock(DAY - 1), "23:59:59");
     }
 
-    fn entry(boss: &str, chance: f64) -> BossEntry {
-        BossEntry { boss: Some(BossName { name: boss.into() }), spawn_chance: chance }
+    fn entry(mob: &str, chance: f64) -> BossEntry {
+        BossEntry { mob: mob.into(), spawn_chance: chance }
     }
 
     #[test]
     fn averages_multiple_spawn_points_of_one_boss() {
         // 同一张图上同一个 BOSS 的两个刷新点，取平均。
         let maps = vec![MapEntry {
-            name: "海关".into(),
-            bosses: vec![entry("Reshala", 0.4), entry("Reshala", 0.6)],
+            normalized_name: "customs".into(),
+            bosses: vec![entry("bossReshala", 0.4), entry("bossReshala", 0.6)],
         }];
         let text = format_boss_chance(&maps, 0);
-        assert!(text.contains("海关\n"), "地图名独占一行: {text}");
-        assert!(text.contains("    Reshala: 50%"), "(0.4+0.6)/2 = 50%: {text}");
+        assert!(text.contains("customs\n"), "地图名独占一行: {text}");
+        assert!(text.contains("    bossReshala: 50%"), "(0.4+0.6)/2 = 50%: {text}");
     }
 
     #[test]
-    fn keeps_the_api_order() {
-        // 源项目用 HashMap，顺序随机；这里必须是接口给的顺序。
+    fn preserves_the_given_map_order() {
+        // 源项目用 HashMap，顺序随机；这里至少要保持调用方给的顺序，
+        // 这样 `parse_maps` 的排序才是唯一的不确定来源。
         let maps = vec![
-            MapEntry { name: "A".into(), bosses: vec![entry("二", 0.1), entry("一", 0.2)] },
-            MapEntry { name: "B".into(), bosses: vec![entry("三", 0.3)] },
+            MapEntry {
+                normalized_name: "a".into(),
+                bosses: vec![entry("二", 0.1), entry("一", 0.2)],
+            },
+            MapEntry { normalized_name: "b".into(), bosses: vec![entry("三", 0.3)] },
         ];
         let text = format_boss_chance(&maps, 0);
         let a = text.find("二").unwrap();
         let b = text.find("一").unwrap();
         let c = text.find("三").unwrap();
-        assert!(a < b && b < c, "应当保持接口顺序: {text}");
+        assert!(a < b && b < c, "应当保持给定顺序: {text}");
     }
 
     #[test]
     fn skips_maps_without_bosses_and_ends_with_the_timestamp() {
         let maps = vec![
-            MapEntry { name: "空图".into(), bosses: vec![] },
-            MapEntry { name: "有图".into(), bosses: vec![entry("Killa", 1.0)] },
+            MapEntry { normalized_name: "empty".into(), bosses: vec![] },
+            MapEntry { normalized_name: "woods".into(), bosses: vec![entry("bossKilla", 1.0)] },
         ];
         let text = format_boss_chance(&maps, 0);
-        assert!(!text.contains("空图"), "没有 BOSS 的地图不该出现: {text}");
-        assert!(text.contains("    Killa: 100%"), "1.0 是比例不是百分数: {text}");
+        assert!(!text.contains("empty"), "没有 BOSS 的地图不该出现: {text}");
+        assert!(text.contains("    bossKilla: 100%"), "1.0 是比例不是百分数: {text}");
         assert!(
             text.ends_with("1970-01-01 08:00:00"),
             "末尾应当是北京时间戳: {text}"
@@ -482,11 +517,67 @@ mod tests {
     #[test]
     fn entries_without_a_boss_name_are_ignored() {
         let maps = vec![MapEntry {
-            name: "图".into(),
-            bosses: vec![BossEntry { boss: None, spawn_chance: 0.5 }],
+            normalized_name: "map".into(),
+            bosses: vec![BossEntry { mob: String::new(), spawn_chance: 0.5 }],
         }];
         let text = format_boss_chance(&maps, 0);
-        assert!(!text.contains("图\n"), "没有名字的条目不该产生标题: {text}");
+        assert!(!text.contains("map\n"), "没有名字的条目不该产生标题: {text}");
+    }
+
+    #[test]
+    fn parses_maps_from_the_static_json() {
+        // 形状照实测的 `json.tarkov.dev/regular/maps`：`maps` 是**按 id 键控的对象**。
+        let body = concat!(
+            r#"{"data":{"maps":{"#,
+            r#""m2":{"normalizedName":"woods","bosses":[{"mob":"bossShturman","spawnChance":0.6}]},"#,
+            r#""m1":{"normalizedName":"customs","bosses":[{"mob":"bossReshala","spawnChance":0.35}]},"#,
+            r#""m3":{"normalizedName":"","bosses":[]}"#,
+            r#"}}}"#,
+        );
+        let maps = parse_maps(body).unwrap();
+        assert_eq!(maps.len(), 2, "没有 slug 的地图要被丢掉: {maps:?}");
+        assert_eq!(maps[0].normalized_name, "customs", "应当按名称排序，不依赖 HashMap 顺序");
+        assert_eq!(maps[1].normalized_name, "woods");
+        assert_eq!(maps[0].bosses[0].mob, "bossReshala");
+        assert!((maps[0].bosses[0].spawn_chance - 0.35).abs() < f64::EPSILON);
+    }
+
+    /// 实跑验证：打**真实**接口。默认 `#[ignore]`，手动跑：
+    ///
+    /// ```text
+    /// cargo test -p qqbot-plugins --lib -- --ignored live_maps
+    /// ```
+    ///
+    /// 存在的意义：mock 只能证明「按我理解的形状能解析」，
+    /// 证明不了「上游真的是这个形状」。
+    #[tokio::test]
+    #[ignore = "需要网络"]
+    async fn live_maps_endpoint_parses() {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let body = http
+            .get("https://json.tarkov.dev/regular/maps")
+            .header("User-Agent", "Mozilla/5.0 qqbot-rs")
+            .send()
+            .await
+            .expect("请求失败")
+            .text()
+            .await
+            .expect("读取失败");
+        let maps = parse_maps(&body).expect("解析失败");
+        assert!(maps.len() >= 10, "应当解析出十几张地图，实际 {}", maps.len());
+        let with_boss = maps.iter().filter(|m| !m.bosses.is_empty()).count();
+        assert!(with_boss >= 5, "应当有若干张图带 BOSS，实际 {with_boss}");
+        let text = format_boss_chance(&maps, 0);
+        assert!(text.contains("customs"), "输出里应当有 customs: {text}");
+    }
+
+    #[test]
+    fn parse_maps_rejects_broken_input() {
+        assert!(parse_maps("不是 JSON").is_err());
+        assert!(parse_maps(r#"{"data":null}"#).is_err());
     }
 
     fn service(name: &str, status: i64) -> ServiceStatus {

@@ -37,8 +37,8 @@ struct MockInner {
     sends: AtomicUsize,
     /// 前多少次发消息请求返回 err_code 40034005（被动窗口已过期）。
     fail_first_sends: usize,
-    /// `/graphql` 是否返回上游故障（模拟 tarkov.dev 后端不可用）。
-    fail_graphql: AtomicBool,
+    /// `/regular/maps` 是否返回上游故障。
+    fail_maps: AtomicBool,
     /// BA 图片接口是否返回「模糊搜索」（code 101）。
     ba_fuzzy: AtomicBool,
     /// 番剧更新页是否返回一个解析不出条目的页面（模拟站点改版）。
@@ -57,7 +57,7 @@ impl MockServer {
     }
 
     fn builder() -> MockBuilder {
-        MockBuilder { fail_first_sends: 0, fail_graphql: false, ba_fuzzy: false, bangumi_empty: false }
+        MockBuilder { fail_first_sends: 0, fail_maps: false, ba_fuzzy: false, bangumi_empty: false }
     }
 
     fn base_url(&self) -> String {
@@ -79,7 +79,7 @@ impl MockServer {
 
 struct MockBuilder {
     fail_first_sends: usize,
-    fail_graphql: bool,
+    fail_maps: bool,
     ba_fuzzy: bool,
     bangumi_empty: bool,
 }
@@ -90,8 +90,8 @@ impl MockBuilder {
         self
     }
 
-    fn fail_graphql(mut self, on: bool) -> Self {
-        self.fail_graphql = on;
+    fn fail_maps(mut self, on: bool) -> Self {
+        self.fail_maps = on;
         self
     }
 
@@ -112,7 +112,7 @@ impl MockBuilder {
             hits: Mutex::new(Vec::new()),
             sends: AtomicUsize::new(0),
             fail_first_sends: self.fail_first_sends,
-            fail_graphql: AtomicBool::new(self.fail_graphql),
+            fail_maps: AtomicBool::new(self.fail_maps),
             ba_fuzzy: AtomicBool::new(self.ba_fuzzy),
             bangumi_empty: AtomicBool::new(self.bangumi_empty),
         });
@@ -355,22 +355,19 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/image/s/") {
         return ("200 OK", "FAKE-BA-IMAGE".to_string());
     }
-    // 塔科夫 BOSS 刷新率：形状照 tarkov.dev 的 GraphQL 响应。
-    if path.starts_with("/graphql") {
-        if inner.fail_graphql.load(Ordering::Relaxed) {
-            // 后端故障时 tarkov.dev 真实返回的就是 422 + 这段 errors。
-            return (
-                "422 Unprocessable Entity",
-                json!({"errors": ["GraphQL server unavailable. Try again later."]}).to_string(),
-            );
+    // 塔科夫 BOSS 刷新率：形状照 `json.tarkov.dev/regular/maps`。
+    // `maps` 是**按 id 键控的对象**，不是数组。
+    if path.starts_with("/regular/maps") {
+        if inner.fail_maps.load(Ordering::Relaxed) {
+            return ("503 Service Unavailable", json!({"error": "down"}).to_string());
         }
         return (
             "200 OK",
             concat!(
-                r#"{"data":{"maps":["#,
-                r#"{"name":"海关","bosses":[{"boss":{"name":"Reshala"},"spawnChance":0.4},{"boss":{"name":"Reshala"},"spawnChance":0.6}]},"#,
-                r#"{"name":"储备站","bosses":[{"boss":{"name":"Glukhar"},"spawnChance":1.0}]}"#,
-                r#"]}}"#,
+                r#"{"data":{"maps":{"#,
+                r#""m1":{"normalizedName":"customs","bosses":[{"mob":"bossReshala","spawnChance":0.4},{"mob":"bossReshala","spawnChance":0.6}]},"#,
+                r#""m2":{"normalizedName":"reserve","bosses":[{"mob":"bossGlukhar","spawnChance":1.0}]}"#,
+                r#"}}}"#,
             )
             .to_string(),
         );
@@ -439,7 +436,8 @@ async fn build_stack_with(
             resources,
             // 指向 mock，否则塔科夫的 GraphQL 会真的打出去。
             tarkov: qqbot_plugins::TarkovConfig {
-                graphql_url: format!("{}/graphql", mock.base_url()),
+                graphql_url: String::new(),
+                maps_url: format!("{}/regular/maps", mock.base_url()),
                 status_base: mock.base_url(),
                 ..Default::default()
             },
@@ -1313,15 +1311,15 @@ async fn boss_chance_aggregates_by_map_and_averages() {
         .expect("应当回复 BOSS 刷新率");
     let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
     let text = body["content"].as_str().unwrap_or_default();
-    assert!(text.contains("海关"), "应当列出地图名: {text}");
-    assert!(text.contains("Reshala: 50%"), "(0.4+0.6)/2 = 50%: {text}");
-    assert!(text.contains("Glukhar: 100%"), "1.0 是比例不是百分数: {text}");
+    assert!(text.contains("customs"), "应当列出地图名: {text}");
+    assert!(text.contains("bossReshala: 50%"), "(0.4+0.6)/2 = 50%: {text}");
+    assert!(text.contains("bossGlukhar: 100%"), "1.0 是比例不是百分数: {text}");
 }
 
 /// 上游故障时要给出可读提示，而不是把 422 原文丢给用户。
 #[tokio::test]
 async fn boss_chance_reports_upstream_failure_gracefully() {
-    let mock = MockServer::builder().fail_graphql(true).start().await;
+    let mock = MockServer::builder().fail_maps(true).start().await;
     let dispatcher = build_stack(&mock).await;
 
     feed(

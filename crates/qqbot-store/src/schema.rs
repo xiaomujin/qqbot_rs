@@ -11,7 +11,8 @@ use rusqlite::Connection;
 /// v3 给 `messages` 增加 `raw` 列，保存**原始事件 JSON**。
 /// v4 增加 `bili_subscriptions`（B 站订阅）。
 /// v5 增加 `pending_captions`（图语：等下一张图配字）。
-pub const SCHEMA_VERSION: i64 = 5;
+/// v6 增加 `ammo`（塔科夫弹药数据，从 tarkov.dev 静态 JSON 导入）。
+pub const SCHEMA_VERSION: i64 = 6;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -103,6 +104,26 @@ CREATE TABLE IF NOT EXISTS pending_captions (
     created_at INTEGER NOT NULL,
     PRIMARY KEY (target_id, sender_id)
 );
+
+-- 塔科夫弹药。字段对齐 cq-bot 的 `bullet` 表（MIT），但只保留
+-- 静态 JSON 里真实存在、且玩家真正会看的那几项。
+CREATE TABLE IF NOT EXISTS ammo (
+    id                  TEXT PRIMARY KEY,
+    -- 可读的 slug（`556x45mm-m855`）。静态 JSON 里的 `name` 是**翻译键**，
+    -- 只有 GraphQL 的 `lang: zh` 能解析它，所以这里用 normalizedName 做检索与显示。
+    normalized_name     TEXT NOT NULL,
+    caliber             TEXT NOT NULL DEFAULT '',
+    damage              INTEGER NOT NULL DEFAULT 0,
+    penetration_power   INTEGER NOT NULL DEFAULT 0,
+    armor_damage        INTEGER NOT NULL DEFAULT 0,
+    fragmentation_chance REAL NOT NULL DEFAULT 0,
+    initial_speed       INTEGER NOT NULL DEFAULT 0,
+    projectile_count    INTEGER NOT NULL DEFAULT 1,
+    tracer              INTEGER NOT NULL DEFAULT 0,
+    base_price          INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_ammo_normalized_name ON ammo(normalized_name);
 "#;
 
 /// 打开（必要时创建）数据库并应用 PRAGMA。

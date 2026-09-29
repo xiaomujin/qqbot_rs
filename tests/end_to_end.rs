@@ -227,6 +227,20 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/test-image") {
         return ("200 OK", "FAKE-IMAGE-BYTES".to_string());
     }
+    // 塔科夫静态 JSON：弹药数据。
+    if path.starts_with("/regular/items") {
+        return (
+            "200 OK",
+            concat!(
+                r#"{"data":{"items":{"#,
+                r#""a1":{"normalizedName":"556x45mm-m855","basePrice":180,"properties":{"propertiesType":"ItemPropertiesAmmo","caliber":"Caliber556x45NATO","damage":54,"penetrationPower":31,"armorDamage":37,"initialSpeed":922,"projectileCount":1,"tracer":false}},"#,
+                r#""a2":{"normalizedName":"545x39mm-bp","basePrice":110,"properties":{"propertiesType":"ItemPropertiesAmmo","caliber":"Caliber545x39","damage":51,"penetrationPower":37,"armorDamage":42,"initialSpeed":890,"projectileCount":1,"tracer":false}},"#,
+                r#""a3":{"normalizedName":"f-1-grenade","basePrice":100,"properties":{"propertiesType":"ItemPropertiesGrenade","damage":80}}"#,
+                r#"}}}"#,
+            )
+            .to_string(),
+        );
+    }
     // B 站稿件信息 + 封面。
     if path.starts_with("/x/web-interface/view") {
         return (
@@ -420,6 +434,10 @@ async fn build_stack_with(
             },
             bangumi: qqbot_plugins::BangumiConfig {
                 update_url: format!("{}/update", mock.base_url()),
+            },
+            ammo: qqbot_plugins::AmmoConfig {
+                items_url: format!("{}/regular/items", mock.base_url()),
+                store: None,
             },
         },
     )
@@ -1714,5 +1732,82 @@ async fn caption_is_consumed_by_the_first_image_only() {
         .count();
     assert_eq!(cards, 1, "只有第一张图该被配字");
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B6：管理员导入弹药 → 检索 → 出卡片。
+#[tokio::test]
+async fn ammo_import_then_search_renders_a_card() {
+    let mock = MockServer::start().await;
+    let (dispatcher, store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"AM_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新子弹","group_openid":"GAM"}"#,
+    )
+    .await;
+
+    // 手雷的 propertiesType 不是弹药，必须被过滤掉。
+    assert_eq!(store.ammo_count().await.unwrap(), 2, "应当只导入两条真弹药");
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"AM_2","author":{"member_openid":"U1"},"content":"查子弹 5.45 bp","group_openid":"GAM"}"#,
+    )
+    .await;
+
+    let card = mock
+        .all(|h| h.path == "/v2/groups/GAM/messages")
+        .into_iter()
+        .find(|h| {
+            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            body["msg_type"] == 7
+        })
+        .expect("应当回一张卡片");
+    let body: serde_json::Value = serde_json::from_str(&card.body).unwrap();
+    assert!(body["media"]["file_info"].is_string(), "应当走富媒体上传: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 没导入过时要给可操作的提示，而不是「没有匹配」。
+#[tokio::test]
+async fn ammo_search_before_import_says_so() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"AM_3","author":{"member_openid":"U1"},"content":"查子弹 m855","group_openid":"GAM2"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GAM2/messages")
+        .expect("应当回复提示");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("更新子弹"), "要告诉用户怎么解决: {text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 导入是管理员操作。
+#[tokio::test]
+async fn ammo_import_requires_admin() {
+    let mock = MockServer::start().await;
+    let (dispatcher, store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"AM_4","author":{"member_openid":"U9"},"content":"更新子弹","group_openid":"GAM3"}"#,
+    )
+    .await;
+
+    assert_eq!(store.ammo_count().await.unwrap(), 0, "非管理员不该触发导入");
     let _ = std::fs::remove_dir_all(&dir);
 }

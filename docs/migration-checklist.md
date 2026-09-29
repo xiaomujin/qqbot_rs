@@ -6,7 +6,7 @@
 > 完整功能盘点见 [cq-bot-feature-catalog.md](cq-bot-feature-catalog.md)，
 > 优先级论证见 [cq-bot-migration-plan.md](cq-bot-migration-plan.md)。
 
-**进度：15 / 36 完成**
+**进度：16 / 36 完成**
 
 > 勾选框计数说明：阶段 1 的「B9–B15 静态图」一条含 **7 项**功能，
 > 所以勾选框总数（4 + 26）会小于功能总数（36）。
@@ -78,7 +78,7 @@
 - ✅ **引用消息解析** —— 从 `msg_elements` 的 `message_type = 103` 取被引用附件
 - ✅ **资源管理** —— 关键词 → 素材，群/系统两级作用域，
       **B9–B15 的静态图直接用它收录，不需要写代码**
-- ✅ **测试基线** —— 362 项，clippy 零警告
+- ✅ **测试基线** —— 375 项，clippy 零警告
 
 ---
 
@@ -86,7 +86,7 @@
 
 成本口径：🟢 直接 ｜ 🔵 接口 ｜ 🟡 需写模板 ｜ 🟠 外部依赖 ｜ 🔴 阻塞
 
-### 已完成（15 / 36）
+### 已完成（16 / 36）
 
 - [x] **A1 帮助** —— `帮助` ｜ 已有，且是**自动生成**的（读路由表），比源项目的硬编码列表好
 - [x] **A4 群消息记录** —— 无命令，`messages` 表全量落库（v3 起连原始 JSON 一起存）
@@ -125,6 +125,13 @@
 - [x] **F3 图语** —— `图语 <文字>` ｜ 新表 `pending_captions`（schema v5），一次性、5 分钟有效
       ｜ 源项目用 OneBot 的图片 `summary` 字段，**官方 v2 没有这个字段**，
       改用 `media_with_text`（图与文字同条消息），是能力上最接近的替代
+- [x] **B6 查子弹** —— `查子弹 <片段>` + `更新子弹`（管理员）｜ 新表 `ammo`（schema v6）
+      ｜ **数据源改成了静态 JSON**（`json.tarkov.dev/regular/items`）而不是 GraphQL ——
+      两者是同一份数据，但 GraphQL 后端挂着时静态 JSON 照样能用。
+      只认 `propertiesType == ItemPropertiesAmmo`：`types` 含 `ammo` 的**还包括手雷**
+      ｜ ⚠️ **名字是英文 slug 而不是中文**：静态 JSON 的 `name` 是翻译键，
+      只有 GraphQL 的 `lang: zh` 会解析它。用 `normalizedName`（`556x45mm-m855`）
+      做检索与显示，`5.45 bp` / `m855` 都能命中。**拿到语言包后只需改一处名称来源**
 
 ### 阶段 1 · 零成本批次 🟢
 
@@ -155,7 +162,6 @@
       解密需要逆向其前端 JS，成本高且随时失效 —— **不做**，除非找到官方接口
 - [ ] **B3 跳蚤精确版** —— `@bot 跳蚤 <名\|24位id>` ｜ `api.tarkov.dev` GraphQL
 - [ ] **B4 查任务** —— `查任务 <名>` ｜ 表 `tkf_task` + `tkf_task_target`
-- [ ] **B6 查子弹** —— `查子弹 <名>` ｜ 表 `bullet`（2629 行）
 - [ ] **C2 B 站动态 / 专栏** —— 消息含 `t.bilibili.com` / `opus` / `read`
       ｜ ⛔ **需要真实登录会话（2026-09-29 实测）**：
       `x/polymer/web-dynamic/v1/feed/space` 对**四个不同的 UID** 全部返回

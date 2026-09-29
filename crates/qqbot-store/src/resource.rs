@@ -6,6 +6,7 @@
 //! 资源分两种作用域：群自建的只在该群可见，系统级的全局可见。
 //! 触发时**群优先、系统兜底**（见 `qqbot-plugins` 的 `ResourcePlugin`）。
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -105,6 +106,28 @@ pub struct BiliSubscription {
     /// UP 主昵称（订阅时抓的快照）。
     pub name: String,
     pub created_at: i64,
+}
+
+/// 一发弹药。
+///
+/// 字段对齐 cq-bot 的 `bullet` 表（MIT），但只保留静态 JSON 里真实存在、
+/// 且玩家真正会看的那几项。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ammo {
+    /// 游戏内物品 id。
+    pub id: String,
+    /// 可读 slug，如 `556x45mm-m855`。检索与显示都用它。
+    pub normalized_name: String,
+    pub caliber: String,
+    pub damage: i64,
+    pub penetration_power: i64,
+    pub armor_damage: i64,
+    /// 0.0 ~ 1.0 的比例。
+    pub fragmentation_chance: f64,
+    pub initial_speed: i64,
+    pub projectile_count: i64,
+    pub tracer: bool,
+    pub base_price: i64,
 }
 
 /// 资源库句柄。
@@ -387,6 +410,103 @@ impl ResourceStore {
         .await
     }
 
+    // ---- 塔科夫弹药 ----
+
+    /// 整表替换弹药数据。返回写入行数。
+    ///
+    /// 用「先清空再写入」而不是增量合并：上游是一份完整快照，
+    /// 增量合并会留下一批上游已经删掉的条目。整表替换在**同一个事务**里，
+    /// 中途失败不会留下空表。
+    pub async fn replace_ammo(&self, items: Vec<Ammo>) -> Result<usize> {
+        self.with(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM ammo", [])?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO ammo(id, normalized_name, caliber, damage, \
+                     penetration_power, armor_damage, fragmentation_chance, initial_speed, \
+                     projectile_count, tracer, base_price) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )?;
+                for a in &items {
+                    stmt.execute(rusqlite::params![
+                        a.id,
+                        a.normalized_name,
+                        a.caliber,
+                        a.damage,
+                        a.penetration_power,
+                        a.armor_damage,
+                        a.fragmentation_chance,
+                        a.initial_speed,
+                        a.projectile_count,
+                        a.tracer,
+                        a.base_price,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(items.len())
+        })
+        .await
+    }
+
+    /// 按关键词检索弹药。
+    ///
+    /// `tokens` 是**已经归一化**的片段（小写、去点、去空格），
+    /// 要求全部命中 `normalized_name` —— 于是 `5.45 bp` 会变成
+    /// `["545", "bp"]`，而 `545x39mm-bp` 两个都含。
+    pub async fn search_ammo(&self, tokens: Vec<String>, limit: usize) -> Result<Vec<Ammo>> {
+        self.with(move |conn| {
+            let mut sql = String::from(
+                "SELECT id, normalized_name, caliber, damage, penetration_power, armor_damage, \
+                 fragmentation_chance, initial_speed, projectile_count, tracer, base_price \
+                 FROM ammo WHERE 1 = 1",
+            );
+            for i in 0..tokens.len() {
+                let _ = write!(sql, " AND normalized_name LIKE ?{}", i + 1);
+            }
+            let _ = write!(sql, " ORDER BY normalized_name LIMIT ?{}", tokens.len() + 1);
+
+            let mut params: Vec<rusqlite::types::Value> = tokens
+                .iter()
+                .map(|t| rusqlite::types::Value::Text(format!("%{t}%")))
+                .collect();
+            params.push(rusqlite::types::Value::Integer(limit as i64));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                Ok(Ammo {
+                    id: r.get(0)?,
+                    normalized_name: r.get(1)?,
+                    caliber: r.get(2)?,
+                    damage: r.get(3)?,
+                    penetration_power: r.get(4)?,
+                    armor_damage: r.get(5)?,
+                    fragmentation_chance: r.get(6)?,
+                    initial_speed: r.get(7)?,
+                    projectile_count: r.get(8)?,
+                    tracer: r.get(9)?,
+                    base_price: r.get(10)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// 弹药表当前行数。为 0 表示还没导入过。
+    pub async fn ammo_count(&self) -> Result<i64> {
+        self.with(|conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM ammo", [], |r| r.get(0))?;
+            Ok(n)
+        })
+        .await
+    }
+
     // ---- 图语 ----
 
     /// 记下待用的图语。同一个人重复设置时覆盖上一条。
@@ -641,6 +761,70 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         assert_eq!(s.purge_captions(0).await.unwrap(), 1);
         assert!(s.take_caption("G1", "U1", 300).await.unwrap().is_none());
+    }
+
+    fn ammo(id: &str, slug: &str, pen: i64) -> Ammo {
+        Ammo {
+            id: id.into(),
+            normalized_name: slug.into(),
+            caliber: "Caliber545x39".into(),
+            damage: 50,
+            penetration_power: pen,
+            armor_damage: 40,
+            fragmentation_chance: 0.16,
+            initial_speed: 890,
+            projectile_count: 1,
+            tracer: false,
+            base_price: 110,
+        }
+    }
+
+    #[tokio::test]
+    async fn ammo_replace_is_a_full_snapshot() {
+        let s = store();
+        assert_eq!(s.ammo_count().await.unwrap(), 0, "一开始是空的");
+
+        s.replace_ammo(vec![ammo("a1", "545x39mm-bp", 37), ammo("a2", "556x45mm-m855", 31)])
+            .await
+            .unwrap();
+        assert_eq!(s.ammo_count().await.unwrap(), 2);
+
+        // 第二次导入只有一条：旧的两条必须消失，不能留下上游已删的条目。
+        s.replace_ammo(vec![ammo("a3", "762x39mm-ps", 26)]).await.unwrap();
+        assert_eq!(s.ammo_count().await.unwrap(), 1);
+        let all = s.search_ammo(vec![], 10).await.unwrap();
+        assert_eq!(all[0].normalized_name, "762x39mm-ps");
+    }
+
+    #[tokio::test]
+    async fn ammo_search_requires_every_token() {
+        let s = store();
+        s.replace_ammo(vec![
+            ammo("a1", "545x39mm-bp", 37),
+            ammo("a2", "545x39mm-ps", 20),
+            ammo("a3", "556x45mm-m855", 31),
+        ])
+        .await
+        .unwrap();
+
+        // 单片段命中两条
+        assert_eq!(s.search_ammo(vec!["545".into()], 10).await.unwrap().len(), 2);
+        // 加一个片段就精确到一条 —— 这正是「全部命中」的意义
+        let bp = s.search_ammo(vec!["545".into(), "bp".into()], 10).await.unwrap();
+        assert_eq!(bp.len(), 1, "{bp:?}");
+        assert_eq!(bp[0].normalized_name, "545x39mm-bp");
+        assert_eq!(bp[0].penetration_power, 37, "数值字段要完整取回");
+
+        // 查不到就是空，不是全表
+        assert!(s.search_ammo(vec!["不存在".into()], 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ammo_search_honours_the_limit() {
+        let s = store();
+        let items: Vec<Ammo> = (0..20).map(|i| ammo(&format!("a{i}"), &format!("545x39mm-{i:02}"), i)).collect();
+        s.replace_ammo(items).await.unwrap();
+        assert_eq!(s.search_ammo(vec!["545".into()], 5).await.unwrap().len(), 5);
     }
 
     #[tokio::test]

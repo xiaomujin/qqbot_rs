@@ -6,6 +6,7 @@ pub mod daily;
 pub mod dice;
 pub mod help;
 pub mod http;
+pub mod ammo;
 pub mod ba;
 pub mod bangumi;
 pub mod bili;
@@ -19,6 +20,7 @@ pub use daily::{DailyConfig, DailyPlugin};
 pub use dice::{parse_spec, DicePlugin};
 pub use help::HelpPlugin;
 pub use resource::{register_resources, ResourcesConfig};
+pub use ammo::AmmoConfig;
 pub use ba::BaConfig;
 pub use bangumi::BangumiConfig;
 pub use bili::BiliConfig;
@@ -52,6 +54,8 @@ pub struct PluginsConfig {
     pub bili: BiliConfig,
     /// 番剧日历的配置。
     pub bangumi: BangumiConfig,
+    /// 塔科夫弹药的配置。
+    pub ammo: AmmoConfig,
 }
 
 /// 把所有内置插件注册到路由表。
@@ -120,6 +124,15 @@ pub async fn register(
     ] {
         router.on_any(Matcher::Exact(keyword.into()), wordcloud.clone());
     }
+    // 塔科夫弹药：数据来自静态 JSON，与资源库共用连接。
+    let mut ammo_cfg = cfg.ammo.clone();
+    if ammo_cfg.store.is_none() {
+        ammo_cfg.store = cfg.resources.as_ref().map(|res| Arc::clone(&res.store));
+    }
+    let ammo = ammo::AmmoPlugin::new(ammo_cfg, http.clone());
+    router.on_any(Matcher::Command("查子弹".into()), ammo.clone());
+    router.on_any(Matcher::Command("更新子弹".into()), ammo.clone());
+
     // 番剧更新：三个写法整串匹配。
     let bangumi = bangumi::BangumiPlugin::new(cfg.bangumi.clone(), http.clone());
     for keyword in ["今日番剧", "每日番剧", "最新番剧"] {

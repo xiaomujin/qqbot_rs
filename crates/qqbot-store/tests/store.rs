@@ -70,14 +70,14 @@ async fn persists_and_isolates_scopes() {
 
     assert_eq!(wait_for_rows(&store, 3).await, 3);
 
-    let group_a = store.recent_texts(Scope::Group, "GROUP_A", 0, 100).await.unwrap();
+    let group_a = store.recent_texts(Scope::Group, "GROUP_A", None, 0, 100).await.unwrap();
     assert_eq!(group_a, vec!["群里的消息"]);
 
-    let c2c = store.recent_texts(Scope::C2c, "USER_A", 0, 100).await.unwrap();
+    let c2c = store.recent_texts(Scope::C2c, "USER_A", None, 0, 100).await.unwrap();
     assert_eq!(c2c, vec!["私聊消息"]);
 
     // 群与私聊互不串台
-    let cross = store.recent_texts(Scope::C2c, "GROUP_A", 0, 100).await.unwrap();
+    let cross = store.recent_texts(Scope::C2c, "GROUP_A", None, 0, 100).await.unwrap();
     assert!(cross.is_empty(), "C2C 查询不应命中群消息: {cross:?}");
 }
 
@@ -105,7 +105,7 @@ async fn purge_removes_only_messages_older_than_cutoff() {
     let deleted = store.purge_before(cutoff).await.unwrap();
     assert_eq!(deleted, 1, "只有严格早于 cutoff 的才该被删");
 
-    let texts = store.recent_texts(Scope::Group, "G", 0, 100).await.unwrap();
+    let texts = store.recent_texts(Scope::Group, "G", None, 0, 100).await.unwrap();
     assert!(texts.contains(&"恰好一年".to_string()), "边界上的消息必须保留: {texts:?}");
     assert!(texts.contains(&"昨天".to_string()));
     assert!(!texts.contains(&"两年前".to_string()));
@@ -121,7 +121,7 @@ async fn recent_texts_respects_time_window() {
     wait_for_rows(&store, 2).await;
 
     let texts = store
-        .recent_texts(Scope::Group, "G", now - 30 * DAY_SECS as i64, 100)
+        .recent_texts(Scope::Group, "G", None, now - 30 * DAY_SECS as i64, 100)
         .await
         .unwrap();
     assert_eq!(texts, vec!["最近"], "窗口外的消息不应进入语料");
@@ -134,7 +134,7 @@ async fn empty_content_is_excluded_from_corpus() {
     store.record(msg("T", Scope::Group, "G", "有内容", 1001));
     wait_for_rows(&store, 2).await;
 
-    let texts = store.recent_texts(Scope::Group, "G", 0, 100).await.unwrap();
+    let texts = store.recent_texts(Scope::Group, "G", None, 0, 100).await.unwrap();
     assert_eq!(texts, vec!["有内容"], "空正文不参与词云，但消息本身要入库");
 }
 
@@ -145,7 +145,7 @@ async fn long_content_is_truncated_before_storage() {
     store.record(msg("L", Scope::Group, "G", &huge, 1000));
     wait_for_rows(&store, 1).await;
 
-    let texts = store.recent_texts(Scope::Group, "G", 0, 10).await.unwrap();
+    let texts = store.recent_texts(Scope::Group, "G", None, 0, 10).await.unwrap();
     assert_eq!(texts.len(), 1);
     assert_eq!(
         texts[0].chars().count(),
@@ -229,7 +229,7 @@ async fn data_survives_reopen() {
 
     let store = MessageStore::open(cfg(path)).unwrap();
     assert_eq!(wait_for_rows(&store, 1).await, 1, "数据必须持久化到磁盘");
-    let texts = store.recent_texts(Scope::Group, "G", 0, 10).await.unwrap();
+    let texts = store.recent_texts(Scope::Group, "G", None, 0, 10).await.unwrap();
     assert_eq!(texts, vec!["重启前"]);
 }
 
@@ -257,7 +257,7 @@ async fn sweeper_task_runs_and_purges_expired_rows() {
     handle.abort();
 
     assert_eq!(store.count().await.unwrap(), 1, "超过保留期的消息应被定时任务删除");
-    let texts = store.recent_texts(Scope::Group, "G", 0, 10).await.unwrap();
+    let texts = store.recent_texts(Scope::Group, "G", None, 0, 10).await.unwrap();
     assert_eq!(texts, vec!["刚刚"]);
 }
 
@@ -287,4 +287,40 @@ async fn raw_payload_is_persisted_and_queryable() {
     // 会话与场景都要隔离，否则会捞到别的群的图。
     assert!(store.recent_raw(Scope::Group, "G2", 0, 10).await.unwrap().is_empty());
     assert!(store.recent_raw(Scope::C2c, "G1", 0, 10).await.unwrap().is_empty());
+}
+
+/// 「我的词云」靠发送者过滤：同一会话里只取某个人说的话。
+#[tokio::test]
+async fn recent_texts_can_filter_by_sender() {
+    let store = MessageStore::open(cfg(temp_db())).unwrap();
+
+    let mut from_a = msg("M_A", Scope::Group, "G1", "甲说的话", now_unix());
+    from_a.sender_id = Some("UA".into());
+    let mut from_b = msg("M_B", Scope::Group, "G1", "乙说的话", now_unix());
+    from_b.sender_id = Some("UB".into());
+    store.record(from_a);
+    store.record(from_b);
+    assert_eq!(wait_for_rows(&store, 2).await, 2);
+
+    // `None` = 不限发送者（本群词云）
+    let all = store.recent_texts(Scope::Group, "G1", None, 0, 10).await.unwrap();
+    assert_eq!(all.len(), 2, "本群词云应当拿到两个人的话：{all:?}");
+
+    // `Some` = 只看这个人（我的词云）
+    let mine = store.recent_texts(Scope::Group, "G1", Some("UA"), 0, 10).await.unwrap();
+    assert_eq!(mine, vec!["甲说的话"], "我的词云只该有自己说的");
+
+    // 发送者过滤与时间窗要能叠加，不能互相覆盖。
+    let future = store
+        .recent_texts(Scope::Group, "G1", Some("UA"), i64::MAX, 10)
+        .await
+        .unwrap();
+    assert!(future.is_empty(), "时间窗应当仍然生效");
+
+    // 没说过话的人拿到空，而不是别人的话。
+    let stranger = store
+        .recent_texts(Scope::Group, "G1", Some("UC"), 0, 10)
+        .await
+        .unwrap();
+    assert!(stranger.is_empty(), "不该把别人的话算成他的");
 }

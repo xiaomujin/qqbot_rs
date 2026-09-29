@@ -19,6 +19,8 @@ pub enum ReadReq {
     RecentTexts {
         scope: String,
         target_id: String,
+        /// `None` 表示不限发送者（本群词云）；`Some` 只看这个人（我的词云）。
+        sender_id: Option<String>,
         since: i64,
         limit: usize,
         reply: oneshot::Sender<Result<Vec<String>>>,
@@ -65,6 +67,7 @@ impl ReadHandle {
         &self,
         scope: &str,
         target_id: &str,
+        sender_id: Option<&str>,
         since: i64,
         limit: usize,
     ) -> Result<Vec<String>> {
@@ -72,6 +75,7 @@ impl ReadHandle {
         self.dispatch(ReadReq::RecentTexts {
             scope: scope.to_string(),
             target_id: target_id.to_string(),
+            sender_id: sender_id.map(str::to_string),
             since,
             limit,
             reply,
@@ -113,8 +117,15 @@ impl ReadHandle {
 fn reader_loop(conn: Connection, rx: Receiver<ReadReq>) {
     while let Ok(req) = rx.recv() {
         match req {
-            ReadReq::RecentTexts { scope, target_id, since, limit, reply } => {
-                let _ = reply.send(recent_texts(&conn, &scope, &target_id, since, limit));
+            ReadReq::RecentTexts { scope, target_id, sender_id, since, limit, reply } => {
+                let _ = reply.send(recent_texts(
+                    &conn,
+                    &scope,
+                    &target_id,
+                    sender_id.as_deref(),
+                    since,
+                    limit,
+                ));
             }
             ReadReq::RecentRaw { scope, target_id, since, limit, reply } => {
                 let _ = reply.send(recent_raw(&conn, &scope, &target_id, since, limit));
@@ -137,20 +148,25 @@ fn recent_texts(
     conn: &Connection,
     scope: &str,
     target_id: &str,
+    sender_id: Option<&str>,
     since: i64,
     limit: usize,
 ) -> Result<Vec<String>> {
     let limit = limit.min(MAX_TEXT_ROWS) as i64;
+    // `?4 IS NULL OR sender_id = ?4`：同一个参数既表达「不限发送者」（本群词云）
+    // 又表达「只看某人」（我的词云），不必维护两条几乎相同的 SQL。
     let mut stmt = conn.prepare_cached(
         "SELECT content FROM messages
           WHERE scope = ?1 AND target_id = ?2 AND created_at >= ?3 AND content <> ''
+            AND (?4 IS NULL OR sender_id = ?4)
           ORDER BY created_at DESC
-          LIMIT ?4",
+          LIMIT ?5",
     )?;
 
-    let rows = stmt.query_map(rusqlite::params![scope, target_id, since, limit], |r| {
-        r.get::<_, String>(0)
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![scope, target_id, since, sender_id, limit],
+        |r| r.get::<_, String>(0),
+    )?;
 
     let mut out = Vec::new();
     let mut chars = 0usize;

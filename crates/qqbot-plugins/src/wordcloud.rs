@@ -8,6 +8,8 @@ use qqbot_core::{Ctx, Handled, Handler};
 use qqbot_render::{build_wordcloud_svg, WordItem};
 use qqbot_store::{now_unix, MessageStore, Scope, MAX_TEXT_ROWS};
 
+use crate::timewin::{Window, SHANGHAI_OFFSET};
+
 /// 每个会话保留的最近消息条数。
 const HISTORY_LIMIT: usize = 500;
 /// 进入词云的最少不同词数。
@@ -91,6 +93,49 @@ pub struct WordCloudPlugin {
 /// 默认统计窗口。
 pub const DEFAULT_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
 
+/// 词云命令的解析结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Command {
+    /// 只看发送者自己发的消息（「我的」）。
+    pub mine: bool,
+    /// `None` 表示用配置的默认窗口（裸 `词云`）。
+    pub window: Option<Window>,
+}
+
+/// 解析词云命令。
+///
+/// 两种形式：
+/// - `词云` —— 本群 + 配置的默认窗口；
+/// - `(我的|本群)(今日|本周|本月|本年)词云` —— cq-bot 的 8 种组合。
+///
+/// 逐段取字而不用正则：全量模式下机器人能看到**所有**群消息，
+/// 正则一旦写宽，`本群今日词云好看吗` 这类闲聊也会触发一次渲染。
+pub fn parse_command(content: &str) -> Option<Command> {
+    let text = content.trim();
+    if text == "词云" {
+        return Some(Command { mine: false, window: None });
+    }
+    let body = text.strip_suffix("词云")?;
+    let mut chars = body.chars();
+    let whose: String = chars.by_ref().take(2).collect();
+    let when: String = chars.collect();
+    let mine = match whose.as_str() {
+        "我的" => true,
+        "本群" => false,
+        _ => return None,
+    };
+    Some(Command { mine, window: Some(Window::parse(&when)?) })
+}
+
+/// 词云标题，也用于「样本不足」提示。
+fn command_title(cmd: Command, sender_name: &str) -> String {
+    let when = match cmd.window {
+        Some(window) => window.label(),
+        None => "近期",
+    };
+    if cmd.mine { format!("{sender_name} 的{when}词云") } else { format!("本群{when}词云") }
+}
+
 impl WordCloudPlugin {
     pub fn new() -> Self {
         Self::with_limit(HISTORY_LIMIT)
@@ -161,16 +206,31 @@ impl WordCloudPlugin {
     ///
     /// 优先走持久化存储（跨重启、可回溯整个窗口）；未启用存储或读取失败时，
     /// 回退到内存语料 —— 存储故障不该让功能完全不可用。
-    async fn gather(&self, ctx: &Ctx) -> Vec<String> {
+    async fn gather(&self, ctx: &Ctx, cmd: Command) -> Vec<String> {
         let key = ctx.target.key();
+
+        // 「我的」但拿不到发送者 openid 时**不能退化成不限发送者** ——
+        // 那会把整个群的话当成「我的」，比报错更难发现。
+        let sender = if cmd.mine { ctx.sender_openid() } else { None };
+        if cmd.mine && sender.is_none() {
+            return Vec::new();
+        }
+
         let Some(store) = &self.store else {
+            // 内存语料没有时间戳，「今日 / 本周」这类窗口只能退化成「全部内存语料」。
             return self.memory_texts(&key);
         };
         let scope = if ctx.target.is_group() { Scope::Group } else { Scope::C2c };
-        // 同 store 的 cutoff：避免未检查减法在 release 下回绕。
-        let window_secs = i64::try_from(self.window.as_secs()).unwrap_or(i64::MAX);
-        let since = now_unix().saturating_sub(window_secs);
-        match store.recent_texts(scope, ctx.target.id(), since, MAX_TEXT_ROWS).await {
+        let now = now_unix();
+        let since = match cmd.window {
+            Some(window) => window.since(now, SHANGHAI_OFFSET),
+            // 同 store 的 cutoff：避免未检查减法在 release 下回绕。
+            None => {
+                let window_secs = i64::try_from(self.window.as_secs()).unwrap_or(i64::MAX);
+                now.saturating_sub(window_secs)
+            }
+        };
+        match store.recent_texts(scope, ctx.target.id(), sender, since, MAX_TEXT_ROWS).await {
             Ok(texts) => self.filter_corpus(texts),
             Err(err) => {
                 tracing::warn!(error = %err, "读取消息存储失败，回退到内存语料");
@@ -180,8 +240,8 @@ impl WordCloudPlugin {
     }
 
     /// 统计该会话的词频。返回 (词表, 语料条数)。
-    pub async fn collect(&self, ctx: &Ctx) -> (Vec<WordItem>, usize) {
-        let texts = self.gather(ctx).await;
+    pub async fn collect(&self, ctx: &Ctx, cmd: Command) -> (Vec<WordItem>, usize) {
+        let texts = self.gather(ctx, cmd).await;
         let samples = texts.len();
 
         // 分词是纯 CPU 活，扔到 blocking 线程池，别占住异步运行时。
@@ -247,18 +307,20 @@ impl Handler for WordCloudPlugin {
         let key = ctx.target.key();
 
         // 分支一：词云命令
-        if ctx.content().split_whitespace().next() == Some("词云") {
-            let (words, samples) = self.collect(ctx).await;
+        if let Some(cmd) = parse_command(ctx.content()) {
+            let title = command_title(cmd, ctx.sender_name());
+            let (words, samples) = self.collect(ctx, cmd).await;
             if words.len() < MIN_DISTINCT {
                 // 默认机器人只能收到 **@ 它** 的消息；群主开启「接收所有消息」后
                 // 会额外推送 GROUP_MESSAGE_CREATE（全量模式），语料随日常聊天累积。
                 // 两种情况都要给出可操作的指引。
-                let msg = format!("样本还太少（已收集 {samples} 条，需要至少 {MIN_DISTINCT} 个不同的词）。\n\n群里多聊几句即可；若群主没有开启「接收所有消息」，则需要 **@ 我** 说几句自然语言。");
+                let msg = format!(
+                    "「{title}」的样本还太少（已收集 {samples} 条，需要至少 {MIN_DISTINCT} 个不同的词）。\n\n群里多聊几句即可；若群主没有开启「接收所有消息」，则需要 **@ 我** 说几句自然语言。"
+                );
                 let _ = ctx.reply_markdown(msg).await;
                 return Handled::Consumed;
             }
 
-            let title = format!("{} 的群聊词云", ctx.sender_name());
             let svg = build_wordcloud_svg(&words, 900, 640, &title);
             tracing::info!(words = words.len(), "渲染词云");
             if let Err(err) = ctx.reply_svg(svg).await {
@@ -361,6 +423,51 @@ fn is_stopword(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_the_eight_variants() {
+        assert_eq!(parse_command("词云"), Some(Command { mine: false, window: None }));
+        for (text, mine, window) in [
+            ("我的今日词云", true, Window::Today),
+            ("我的本周词云", true, Window::ThisWeek),
+            ("我的本月词云", true, Window::ThisMonth),
+            ("我的本年词云", true, Window::ThisYear),
+            ("本群今日词云", false, Window::Today),
+            ("本群本周词云", false, Window::ThisWeek),
+            ("本群本月词云", false, Window::ThisMonth),
+            ("本群本年词云", false, Window::ThisYear),
+        ] {
+            assert_eq!(
+                parse_command(text),
+                Some(Command { mine, window: Some(window) }),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_lookalikes() {
+        // 全量模式下机器人能看到所有群消息，这类闲聊不能触发渲染。
+        for text in [
+            "本群今日词云好看吗",
+            "我的词云",
+            "今日词云",
+            "大家今日词云",
+            "本群昨日词云",
+            "词云 今日",
+            "",
+        ] {
+            assert_eq!(parse_command(text), None, "不该匹配：{text}");
+        }
+    }
+
+    #[test]
+    fn titles_name_the_window() {
+        let cmd = |mine, window| Command { mine, window };
+        assert_eq!(command_title(cmd(true, Some(Window::Today)), "小明"), "小明 的今日词云");
+        assert_eq!(command_title(cmd(false, Some(Window::ThisWeek)), "小明"), "本群本周词云");
+        assert_eq!(command_title(cmd(false, None), "小明"), "本群近期词云");
+    }
 
     #[test]
     fn segments_chinese_into_real_words() {

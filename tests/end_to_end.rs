@@ -319,15 +319,15 @@ async fn inbound_messages_are_persisted_for_both_scopes() {
     }
 
     assert_eq!(
-        store.recent_texts(Scope::Group, "GP", 0, 10).await.unwrap(),
+        store.recent_texts(Scope::Group, "GP", None, 0, 10).await.unwrap(),
         vec!["群里说的话"]
     );
     assert_eq!(
-        store.recent_texts(Scope::C2c, "U2", 0, 10).await.unwrap(),
+        store.recent_texts(Scope::C2c, "U2", None, 0, 10).await.unwrap(),
         vec!["私聊说的话"]
     );
     // 群与私聊不能串台
-    assert!(store.recent_texts(Scope::C2c, "GP", 0, 10).await.unwrap().is_empty());
+    assert!(store.recent_texts(Scope::C2c, "GP", None, 0, 10).await.unwrap().is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1025,4 +1025,44 @@ async fn collect_reads_the_quoted_message_attachment() {
     assert_eq!(saved, b"FAKE-IMAGE-BYTES");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 词云的 8 种组合要能路由，且标题带上窗口 —— 否则用户分不清看的是哪一段。
+#[tokio::test]
+async fn wordcloud_window_variant_routes_and_names_the_window() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"WC_1","author":{"member_openid":"U1","username":"小明"},"content":"本群今日词云","group_openid":"GW"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GW/messages")
+        .expect("应当回复（语料不足提示）");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.contains("本群今日词云"), "标题要指明窗口，否则分不清看的是哪段: {md}");
+}
+
+/// 全量模式下机器人能看到**所有**群消息，所以近似说法不能触发渲染。
+#[tokio::test]
+async fn wordcloud_lookalike_does_not_trigger() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"WC_2","author":{"member_openid":"U1"},"content":"本群今日词云好看吗","group_openid":"GW2"}"#,
+    )
+    .await;
+
+    assert!(
+        mock.find(|h| h.path == "/v2/groups/GW2/messages").is_none(),
+        "近似说法不该触发词云渲染"
+    );
 }

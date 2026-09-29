@@ -7,6 +7,7 @@ pub mod dice;
 pub mod help;
 pub mod http;
 pub mod resource;
+pub mod timewin;
 pub mod wordcloud;
 
 pub use daily::{DailyConfig, DailyPlugin};
@@ -75,6 +76,20 @@ pub async fn register(
     // 词云：同一个实例既负责渲染命令，也负责静默累积语料。
     let wordcloud = WordCloudPlugin::with_store(store, cfg.wordcloud_window);
     router.on_any(Matcher::Command("词云".into()), wordcloud.clone());
+    // cq-bot 的 8 种组合。**整串精确匹配** —— 全量模式下机器人能看到所有群消息，
+    // 用前缀匹配会让「本群今日词云好看吗」这类闲聊也触发一次渲染。
+    for keyword in [
+        "我的今日词云",
+        "我的本周词云",
+        "我的本月词云",
+        "我的本年词云",
+        "本群今日词云",
+        "本群本周词云",
+        "本群本月词云",
+        "本群本年词云",
+    ] {
+        router.on_any(Matcher::Exact(keyword.into()), wordcloud.clone());
+    }
     // 通配监听器：只用于累积语料，不作为用户可见命令出现在帮助里。
     router.on_listener(Matcher::Any, wordcloud.clone());
 

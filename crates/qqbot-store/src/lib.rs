@@ -161,15 +161,17 @@ impl MessageStore {
     }
 
     /// 某会话在时间窗口内的正文（按时间倒序）。
+    /// `sender_id` 为 `None` 表示不限发送者；`Some` 只看这个人（「我的词云」）。
     pub async fn recent_texts(
         &self,
         scope: Scope,
         target_id: &str,
+        sender_id: Option<&str>,
         since: i64,
         limit: usize,
     ) -> Result<Vec<String>> {
         self.reader
-            .recent_texts(scope.as_str(), target_id, since, limit)
+            .recent_texts(scope.as_str(), target_id, sender_id, since, limit)
             .await
     }
 

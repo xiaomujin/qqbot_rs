@@ -91,6 +91,13 @@ pub async fn register(
         register_resources(router, res.clone(), http.clone()).await?;
     }
 
+    // B 站订阅与资源库共用一条连接：订阅和 `settings` 一样是业务配置，
+    // 为它再开第三条连接没有收益。
+    let mut bili_cfg = cfg.bili.clone();
+    if bili_cfg.store.is_none() {
+        bili_cfg.store = cfg.resources.as_ref().map(|res| Arc::clone(&res.store));
+    }
+
     // 词云：同一个实例既负责渲染命令，也负责静默累积语料。
     let wordcloud = WordCloudPlugin::with_store(store, cfg.wordcloud_window);
     router.on_any(Matcher::Command("词云".into()), wordcloud.clone());
@@ -114,7 +121,11 @@ pub async fn register(
     // B 站链接：不是命令，是「看到链接就展开」。
     // 用监听器而不是命令路由 —— 帮助里列一条正则没有意义，
     // 而它本来就不需要用户主动输入。
-    router.on_listener(Matcher::Any, bili::BiliPlugin::new(cfg.bili.clone(), http.clone()));
+    let bili = bili::BiliPlugin::new(bili_cfg, http.clone());
+    router.on_listener(Matcher::Any, bili.clone());
+    // 订阅管理是显式命令，注册成可见路由。
+    router.on_any(Matcher::Command("哔哩订阅".into()), bili.clone());
+    router.on_any(Matcher::Command("哔哩退订".into()), bili.clone());
 
     // `ba <名>`：正则路由，真正的判定在插件里（`parse_query`），两者保持一致。
     router.on_any(

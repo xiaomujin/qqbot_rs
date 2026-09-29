@@ -241,6 +241,16 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/cover.jpg") {
         return ("200 OK", "FAKE-COVER".to_string());
     }
+    // UP 主信息：订阅时用它校验 UID。
+    if path.starts_with("/x/web-interface/card") {
+        if path.contains("mid=999") {
+            return ("200 OK", json!({"code": -404, "message": "啥都木有"}).to_string());
+        }
+        return (
+            "200 OK",
+            json!({"code": 0, "message": "OK", "data": {"card": {"name": "测试UP主"}}}).to_string(),
+        );
+    }
     // 塔科夫服务器状态：形状照 status.escapefromtarkov.com 的响应。
     if path.starts_with("/api/services") {
         return (
@@ -380,6 +390,8 @@ async fn build_stack_with(
             },
             bili: qqbot_plugins::BiliConfig {
                 view_api: format!("{}/x/web-interface/view?bvid=", mock.base_url()),
+                card_api: format!("{}/x/web-interface/card?mid=", mock.base_url()),
+                store: None,
             },
         },
     )
@@ -1426,4 +1438,134 @@ async fn bilibili_link_is_not_expanded_twice_in_a_row() {
         1,
         "同一条链接短时间内不该重复展开"
     );
+}
+
+/// 订阅测试用的栈：订阅表与资源表**共用一个** `ResourceStore`。
+static BILI_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+async fn bili_stack(
+    mock: &MockServer,
+) -> (Arc<Dispatcher>, Arc<qqbot_store::ResourceStore>, std::path::PathBuf) {
+    let n = BILI_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("qqbot-bili-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+
+    let store = Arc::new(
+        qqbot_store::open_resource_store(dir.join("res.db"))
+            .await
+            .expect("打开资源库"),
+    );
+    let messages = MessageStore::open_async(StoreConfig {
+        path: dir.join("msg.db"),
+        flush_interval: Duration::from_millis(10),
+        sweep_interval: Duration::from_secs(3600),
+        ..StoreConfig::default()
+    })
+    .await
+    .expect("打开消息库");
+
+    let cfg = qqbot_plugins::ResourcesConfig {
+        store: Arc::clone(&store),
+        messages: Arc::clone(&messages),
+        basepath: dir.join("collected"),
+        controllers: None,
+    };
+    let dispatcher = build_stack_with(mock, Some(messages), Some(cfg)).await;
+    (dispatcher, store, dir)
+}
+
+/// C4/C5：管理员订阅 → 落库 → 退订 → 清空。
+#[tokio::test]
+async fn bili_subscribe_then_unsubscribe() {
+    let mock = MockServer::start().await;
+    let (dispatcher, store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"SUB_1","author":{"member_openid":"U1","member_role":"admin"},"content":"哔哩订阅 12345","group_openid":"GSB"}"#,
+    )
+    .await;
+
+    let subs = store.bili_subscriptions("GSB").await.unwrap();
+    assert_eq!(subs.len(), 1, "应当落库一条订阅: {subs:?}");
+    assert_eq!(subs[0].uid, "12345");
+    assert_eq!(subs[0].name, "测试UP主", "昵称应当来自接口");
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GSB/messages")
+        .expect("应当回复订阅结果");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("订阅成功"), "{text}");
+    assert!(text.contains("测试UP主"), "{text}");
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"SUB_2","author":{"member_openid":"U1","member_role":"admin"},"content":"哔哩退订 12345","group_openid":"GSB"}"#,
+    )
+    .await;
+    assert!(
+        store.bili_subscriptions("GSB").await.unwrap().is_empty(),
+        "退订后不该还有记录"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 订阅与退订都要求群管理员 —— 源项目只给订阅加了检查，
+/// 那意味着任何人都能悄悄拆掉别人配好的订阅。
+#[tokio::test]
+async fn bili_subscribe_requires_group_admin() {
+    let mock = MockServer::start().await;
+    let (dispatcher, store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"SUB_3","author":{"member_openid":"U9"},"content":"哔哩订阅 12345","group_openid":"GSB2"}"#,
+    )
+    .await;
+
+    assert!(
+        store.bili_subscriptions("GSB2").await.unwrap().is_empty(),
+        "非管理员不该订阅成功"
+    );
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GSB2/messages")
+        .expect("应当说明原因，而不是静默无视");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("群管理员"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// UID 不存在时要说清楚，而不是写进一条永远推不出东西的订阅。
+#[tokio::test]
+async fn bili_subscribe_rejects_unknown_uid() {
+    let mock = MockServer::start().await;
+    let (dispatcher, store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"SUB_4","author":{"member_openid":"U1","member_role":"owner"},"content":"哔哩订阅 999","group_openid":"GSB3"}"#,
+    )
+    .await;
+
+    assert!(
+        store.bili_subscriptions("GSB3").await.unwrap().is_empty(),
+        "UID 不存在时不该落库"
+    );
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GSB3/messages")
+        .expect("应当回复失败原因");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("订阅失败"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

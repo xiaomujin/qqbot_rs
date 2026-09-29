@@ -9,7 +9,8 @@ use rusqlite::Connection;
 ///
 /// v2 增加了资源映射（`resources` / `resource_keywords`）与系统设置（`settings`）。
 /// v3 给 `messages` 增加 `raw` 列，保存**原始事件 JSON**。
-pub const SCHEMA_VERSION: i64 = 3;
+/// v4 增加 `bili_subscriptions`（B 站订阅）。
+pub const SCHEMA_VERSION: i64 = 4;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -80,6 +81,16 @@ CREATE TABLE IF NOT EXISTS settings (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
     updated_at INTEGER NOT NULL
+);
+
+-- B 站订阅。按**群**订阅 UP 主，与源项目一致。
+CREATE TABLE IF NOT EXISTS bili_subscriptions (
+    uid        TEXT NOT NULL,
+    group_id   TEXT NOT NULL,
+    -- UP 主昵称。订阅时查过一次接口，顺手存下来，推送时不必再查。
+    name       TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (uid, group_id)
 );
 "#;
 

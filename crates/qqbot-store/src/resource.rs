@@ -97,6 +97,16 @@ pub struct ResourceSpec {
 const RESOURCE_COLUMNS: &str =
     "id, scope, owner_id, name, path, file_name, file_type, description";
 
+/// 一条 B 站订阅。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BiliSubscription {
+    /// UP 主的 UID。
+    pub uid: String,
+    /// UP 主昵称（订阅时抓的快照）。
+    pub name: String,
+    pub created_at: i64,
+}
+
 /// 资源库句柄。
 #[derive(Clone)]
 pub struct ResourceStore {
@@ -289,6 +299,94 @@ impl ResourceStore {
         .await
     }
 
+    // ---- B 站订阅 ----
+    //
+    // 放在这个 store 而不是另开一条连接：订阅和 `settings` 一样属于
+    // 「业务配置」，同一个 SQLite 文件再开第三条连接没有收益。
+
+    /// 新增或更新一条订阅。返回**是否新增**（已存在时只刷新昵称）。
+    ///
+    /// 重复点订阅是很自然的操作，不该报错。
+    pub async fn bili_subscribe(&self, uid: &str, group_id: &str, name: &str) -> Result<bool> {
+        let uid = uid.to_string();
+        let group_id = group_id.to_string();
+        let name = name.to_string();
+        self.with(move |conn| {
+            let existed = conn
+                .query_row(
+                    "SELECT 1 FROM bili_subscriptions WHERE uid = ?1 AND group_id = ?2",
+                    rusqlite::params![uid, group_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            conn.execute(
+                "INSERT INTO bili_subscriptions(uid, group_id, name, created_at) \
+                 VALUES(?1, ?2, ?3, ?4) \
+                 ON CONFLICT(uid, group_id) DO UPDATE SET name = excluded.name",
+                rusqlite::params![uid, group_id, name, now_unix()],
+            )?;
+            Ok(!existed)
+        })
+        .await
+    }
+
+    /// 删除一条订阅。返回**是否确实删掉了**（用来区分「退订成功」与「本来就没订」）。
+    pub async fn bili_unsubscribe(&self, uid: &str, group_id: &str) -> Result<bool> {
+        let uid = uid.to_string();
+        let group_id = group_id.to_string();
+        self.with(move |conn| {
+            let removed = conn.execute(
+                "DELETE FROM bili_subscriptions WHERE uid = ?1 AND group_id = ?2",
+                rusqlite::params![uid, group_id],
+            )?;
+            Ok(removed > 0)
+        })
+        .await
+    }
+
+    /// 某个群的订阅列表，按订阅时间排序。
+    pub async fn bili_subscriptions(&self, group_id: &str) -> Result<Vec<BiliSubscription>> {
+        let group_id = group_id.to_string();
+        self.with(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT uid, name, created_at FROM bili_subscriptions \
+                 WHERE group_id = ?1 ORDER BY created_at, uid",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![group_id], |r| {
+                Ok(BiliSubscription { uid: r.get(0)?, name: r.get(1)?, created_at: r.get(2)? })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// 全部订阅（供将来的推送任务遍历）。
+    pub async fn all_bili_subscriptions(&self) -> Result<Vec<(String, BiliSubscription)>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT group_id, uid, name, created_at FROM bili_subscriptions \
+                 ORDER BY group_id, created_at, uid",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    BiliSubscription { uid: r.get(1)?, name: r.get(2)?, created_at: r.get(3)? },
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// 读一条系统设置。
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let key = key.to_string();
@@ -378,6 +476,55 @@ mod tests {
             file_type: 1,
             description: None,
         }
+    }
+
+    #[tokio::test]
+    async fn subscribe_is_idempotent_and_refreshes_the_name() {
+        let s = store();
+        assert!(s.bili_subscribe("123", "G1", "旧名字").await.unwrap(), "首次订阅应当是新增");
+        assert!(!s.bili_subscribe("123", "G1", "新名字").await.unwrap(), "重复订阅不该算新增");
+
+        let list = s.bili_subscriptions("G1").await.unwrap();
+        assert_eq!(list.len(), 1, "重复订阅不该产生第二行: {list:?}");
+        assert_eq!(list[0].name, "新名字", "昵称应当被刷新");
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_reports_whether_anything_was_removed() {
+        let s = store();
+        s.bili_subscribe("123", "G1", "甲").await.unwrap();
+        assert!(s.bili_unsubscribe("123", "G1").await.unwrap(), "删掉了一条应当返回 true");
+        assert!(!s.bili_unsubscribe("123", "G1").await.unwrap(), "本来就没有应当返回 false");
+        assert!(s.bili_subscriptions("G1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscriptions_are_scoped_to_the_group() {
+        let s = store();
+        s.bili_subscribe("123", "G1", "甲").await.unwrap();
+        s.bili_subscribe("123", "G2", "甲").await.unwrap();
+        s.bili_subscribe("456", "G1", "乙").await.unwrap();
+
+        // 同一个 UP 可以被多个群订阅；同一个群可以订阅多个 UP。
+        assert_eq!(s.bili_subscriptions("G1").await.unwrap().len(), 2);
+        assert_eq!(s.bili_subscriptions("G2").await.unwrap().len(), 1);
+        assert!(s.bili_subscriptions("G3").await.unwrap().is_empty());
+
+        // 退订只影响本群。
+        s.bili_unsubscribe("123", "G1").await.unwrap();
+        assert_eq!(s.bili_subscriptions("G1").await.unwrap().len(), 1);
+        assert_eq!(s.bili_subscriptions("G2").await.unwrap().len(), 1, "别的群不该被影响");
+    }
+
+    #[tokio::test]
+    async fn all_subscriptions_carry_the_group() {
+        let s = store();
+        s.bili_subscribe("123", "G1", "甲").await.unwrap();
+        s.bili_subscribe("456", "G2", "乙").await.unwrap();
+        let all = s.all_bili_subscriptions().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, "G1", "应当按群排序，供推送任务按群聚合");
+        assert_eq!(all[1].0, "G2");
     }
 
     #[tokio::test]

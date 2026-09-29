@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use qqbot_core::{Ctx, Handled, Handler};
+use qqbot_store::ResourceStore;
 use serde::Deserialize;
 
 use crate::timewin::{format_datetime, SHANGHAI_OFFSET};
@@ -24,16 +25,55 @@ const DEDUP_MAX_TARGETS: usize = 2048;
 const MAX_COVER_BYTES: usize = 32 * 1024 * 1024;
 
 /// B 站插件配置。
-#[derive(Debug, Clone)]
+// 不派生 Debug：里面的 ResourceStore 没有有意义的 Debug 表示。
+#[derive(Clone)]
 pub struct BiliConfig {
     /// 稿件信息接口（`bvid` 直接拼在后面）。
     pub view_api: String,
+    /// UP 主信息接口（`uid` 直接拼在后面），用于订阅时校验 UID。
+    pub card_api: String,
+    /// 订阅表。`None` 表示未启用持久化，订阅命令会给出提示而不是静默失败。
+    pub store: Option<Arc<ResourceStore>>,
 }
 
 impl Default for BiliConfig {
     fn default() -> Self {
-        Self { view_api: "https://api.bilibili.com/x/web-interface/view?bvid=".into() }
+        Self {
+            view_api: "https://api.bilibili.com/x/web-interface/view?bvid=".into(),
+            card_api: "https://api.bilibili.com/x/web-interface/card?mid=".into(),
+            store: None,
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CardResponse {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: Option<CardData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardData {
+    #[serde(default)]
+    card: Option<CardInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CardInfo {
+    #[serde(default)]
+    name: String,
+}
+
+/// UID 必须是纯数字。
+///
+/// 先本地挡一道：明显不合法的输入没必要打一次必然失败的请求，
+/// 而 B 站对异常请求会返回风控页（HTTP 412），错误信息很难看。
+pub fn valid_uid(raw: &str) -> bool {
+    !raw.is_empty() && raw.len() <= 20 && raw.chars().all(|c| c.is_ascii_digit())
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +241,10 @@ fn cover_name(url: &str) -> String {
     if base.is_empty() || !base.contains('.') { "cover.jpg".to_string() } else { base.to_string() }
 }
 
+/// B 站插件：链接展开 + 订阅管理。
+///
+/// `Clone` 是必需的：同一个实例要挂到监听器与两条命令路由上。
+#[derive(Clone)]
 pub struct BiliPlugin {
     config: BiliConfig,
     http: reqwest::Client,
@@ -229,6 +273,136 @@ impl BiliPlugin {
         }
         seen.insert(target.to_string(), (bvid.to_string(), now));
         false
+    }
+
+    /// `哔哩订阅 <uid>`。
+    ///
+    /// 与源项目的一处差异：**订阅与退订都要求群管理员**。
+    /// 源项目只给订阅加了权限检查，退订谁都能点 —— 那意味着任何人都能
+    /// 悄悄拆掉群里其他人配好的订阅。订阅是群级配置，两头都该由管理员管。
+    async fn subscribe(&self, ctx: &Ctx) -> Handled {
+        if !self.permit(ctx).await {
+            return Handled::Consumed;
+        }
+        let Some(uid) = ctx.arg(0) else {
+            let _ = ctx.reply_text("用法：哔哩订阅 <UID>").await;
+            return Handled::Consumed;
+        };
+        if !valid_uid(uid) {
+            let _ = ctx.reply_text("UID 必须是纯数字").await;
+            return Handled::Consumed;
+        }
+        let Some(store) = &self.config.store else {
+            let _ = ctx.reply_text("未启用持久化，订阅功能不可用").await;
+            return Handled::Consumed;
+        };
+
+        let name = match self.fetch_up_name(uid).await {
+            Ok(name) => name,
+            Err(reason) => {
+                tracing::warn!(error = %reason, uid, "校验 UID 失败");
+                let _ = ctx.reply_text(format!("订阅失败：{reason}")).await;
+                return Handled::Consumed;
+            }
+        };
+
+        let group = ctx.target.id().to_string();
+        match store.bili_subscribe(uid, &group, &name).await {
+            Ok(true) => {
+                let _ = ctx.reply_text(format!("UID: {uid}\n昵称: {name}\n订阅成功~")).await;
+            }
+            Ok(false) => {
+                let _ = ctx.reply_text(format!("UID: {uid}\n昵称: {name}\n本群已经订阅过了")).await;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "写入订阅失败");
+                let _ = ctx.reply_text("订阅失败：数据库写入出错").await;
+            }
+        }
+        Handled::Consumed
+    }
+
+    /// `哔哩退订 <uid>`。
+    async fn unsubscribe(&self, ctx: &Ctx) -> Handled {
+        if !self.permit(ctx).await {
+            return Handled::Consumed;
+        }
+        let Some(uid) = ctx.arg(0) else {
+            let _ = ctx.reply_text("用法：哔哩退订 <UID>").await;
+            return Handled::Consumed;
+        };
+        let Some(store) = &self.config.store else {
+            let _ = ctx.reply_text("未启用持久化，订阅功能不可用").await;
+            return Handled::Consumed;
+        };
+
+        let group = ctx.target.id().to_string();
+        match store.bili_unsubscribe(uid, &group).await {
+            Ok(true) => {
+                let _ = ctx.reply_text(format!("{uid} 退订成功")).await;
+            }
+            Ok(false) => {
+                let _ = ctx.reply_text(format!("{uid} 未订阅")).await;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "删除订阅失败");
+                let _ = ctx.reply_text("退订失败：数据库写入出错").await;
+            }
+        }
+        Handled::Consumed
+    }
+
+    /// 群管理员校验。
+    ///
+    /// 不通过时**回一条说明**：静默无视会让用户以为机器人没收到命令，
+    /// 而实际上他只是没权限。
+    async fn permit(&self, ctx: &Ctx) -> bool {
+        if !ctx.is_group() {
+            let _ = ctx.reply_text("订阅是群功能，请在群里使用").await;
+            return false;
+        }
+        if !ctx.is_admin() {
+            let _ = ctx.reply_text("只有群管理员能管理订阅").await;
+            return false;
+        }
+        true
+    }
+
+    /// 校验 UID 并取昵称。
+    async fn fetch_up_name(&self, uid: &str) -> Result<String, String> {
+        let url = format!("{}{uid}", self.config.card_api);
+        let res = self
+            .http
+            .get(&url)
+            .header("Accept", "application/json")
+            .header("Referer", "https://space.bilibili.com/")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
+            .send()
+            .await
+            .map_err(|err| format!("请求失败：{err}"))?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(format!("接口返回 HTTP {status}"));
+        }
+        let body = res.text().await.map_err(|err| format!("读取响应失败：{err}"))?;
+        let parsed: CardResponse =
+            serde_json::from_str(&body).map_err(|err| format!("解析响应失败：{err}"))?;
+        if parsed.code != 0 {
+            return Err(if parsed.message.is_empty() {
+                "该 UID 不存在".to_string()
+            } else {
+                parsed.message
+            });
+        }
+        let name = parsed
+            .data
+            .and_then(|d| d.card)
+            .map(|c| c.name)
+            .unwrap_or_default();
+        if name.trim().is_empty() {
+            return Err("该 UID 不存在".to_string());
+        }
+        Ok(name)
     }
 
     /// 把短链解析成真实地址。
@@ -301,6 +475,12 @@ impl BiliPlugin {
 #[async_trait]
 impl Handler for BiliPlugin {
     async fn handle(&self, ctx: &Ctx) -> Handled {
+        match ctx.content().split_whitespace().next().unwrap_or_default() {
+            "哔哩订阅" => return self.subscribe(ctx).await,
+            "哔哩退订" => return self.unsubscribe(ctx).await,
+            _ => {}
+        }
+
         let Some(link) = find_link(ctx.content()) else {
             return Handled::Next;
         };
@@ -367,6 +547,15 @@ impl Handler for BiliPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uid_must_be_pure_digits() {
+        assert!(valid_uid("703007996"));
+        assert!(valid_uid("1"));
+        for bad in ["", "abc", "123abc", "-1", "12 34", "123456789012345678901"] {
+            assert!(!valid_uid(bad), "不该接受：{bad}");
+        }
+    }
 
     #[test]
     fn finds_both_link_forms() {

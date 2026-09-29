@@ -117,6 +117,8 @@ impl Dispatcher {
                 sender_name: message.author.username.clone(),
                 event_name: name.to_string(),
                 content: message.trimmed().to_string(),
+                // 原文一并入库：附件不在 content 里，只有它能还原完整消息。
+                raw: message.raw.clone(),
                 created_at: event_unix(&message),
             });
         }
@@ -126,12 +128,21 @@ impl Dispatcher {
         };
 
         // 用 INFO：这是运维判断「事件到底有没有送达」的唯一依据。
-        // 内容截断，避免把整篇消息灌进日志。
+        // 正文截断，避免把整篇消息灌进日志；但**附件地址与元素个数不截断** ——
+        // 「发了图却没被识别」这类问题只能靠它们定位。
+        // 完整原始载荷见 `qqbot_api::event` 的 DEBUG 日志。
         tracing::info!(
             event = name,
             msg_id = %ctx.message_id(),
             target = %target.key(),
             content = %truncate_for_log(ctx.content(), 60),
+            attachments = ctx.message.attachments.len(),
+            attachment_url = %ctx
+                .message
+                .first_attachment()
+                .and_then(|a| a.url.as_deref())
+                .unwrap_or("-"),
+            elements = ctx.message.msg_elements.len(),
             "收到消息"
         );
 

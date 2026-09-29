@@ -98,6 +98,15 @@ impl Event {
         }
     }
 
+    /// 把原始 JSON 回填进解析结果。
+    ///
+    /// 之所以要留一份原文：类型是照文档声明的，文档没写到的字段在
+    /// `from_str` 那一刻就没了。要落库、要事后重新提取，只能靠原文。
+    fn with_raw(mut m: MessageEvent, raw: &str) -> MessageEvent {
+        m.raw = Some(raw.to_string());
+        m
+    }
+
     /// 第二阶段解析：按事件名把 `d` 反序列化为具体类型。
     ///
     /// `event_id` 是 payload **外层** 的 `id`，事件类被动回复需要它作为凭证，
@@ -114,6 +123,11 @@ impl Event {
             return Ok(None);
         };
         let raw = d.get();
+        // 排障用：完整原始载荷。默认关闭（DEBUG 级）。
+        // 需要它是因为 `MessageEvent` 只声明了文档写到的字段 ——
+        // 引用消息、聊天记录这类嵌套结构在文档里只有一句话，
+        // 真实字段名只能从原始 JSON 里看。反序列化会把没声明的字段静默丢掉。
+        tracing::debug!(target: "qqbot_api::event", event = name, payload = raw, "事件原始载荷");
         let event_id = event_id.map(str::to_string);
         let with_id = |mut n: RawNotice| {
             n.event_id = event_id.clone();
@@ -124,15 +138,18 @@ impl Event {
             "READY" => Event::Ready(Box::new(serde_json::from_str::<Ready>(raw)?)),
             "RESUMED" => Event::Resumed,
 
-            "C2C_MESSAGE_CREATE" => {
-                Event::C2cMessage(Arc::new(serde_json::from_str::<MessageEvent>(raw)?))
-            }
-            "GROUP_AT_MESSAGE_CREATE" => {
-                Event::GroupAtMessage(Arc::new(serde_json::from_str::<MessageEvent>(raw)?))
-            }
-            "GROUP_MESSAGE_CREATE" => {
-                Event::GroupMessage(Arc::new(serde_json::from_str::<MessageEvent>(raw)?))
-            }
+            "C2C_MESSAGE_CREATE" => Event::C2cMessage(Arc::new(Self::with_raw(
+                serde_json::from_str::<MessageEvent>(raw)?,
+                raw,
+            ))),
+            "GROUP_AT_MESSAGE_CREATE" => Event::GroupAtMessage(Arc::new(Self::with_raw(
+                serde_json::from_str::<MessageEvent>(raw)?,
+                raw,
+            ))),
+            "GROUP_MESSAGE_CREATE" => Event::GroupMessage(Arc::new(Self::with_raw(
+                serde_json::from_str::<MessageEvent>(raw)?,
+                raw,
+            ))),
 
             "FRIEND_ADD" => Event::FriendAdd(with_id(serde_json::from_str(raw)?)),
             "FRIEND_DEL" => Event::FriendDel(with_id(serde_json::from_str(raw)?)),

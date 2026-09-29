@@ -42,6 +42,9 @@ pub struct MessageScene {
 /// 消息附件。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MessageAttachment {
+    /// 实测存在但文档未写；目前观察到为空串。
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
@@ -127,6 +130,14 @@ pub struct MessageEvent {
     pub ark_data: Option<ArkData>,
     #[serde(default)]
     pub msg_elements: Vec<MsgElement>,
+    /// 原始事件 JSON。
+    ///
+    /// `#[serde(skip)]`：它不是协议字段，而是由 `Event::parse` 在解析后回填。
+    /// 需要它是因为类型里只声明了文档写到的字段 ——
+    /// **没声明的会在反序列化时静默丢掉**，而附件、引用、聊天记录
+    /// 恰恰是文档写得最含糊的部分。
+    #[serde(skip)]
+    pub raw: Option<String>,
 }
 
 impl MessageEvent {

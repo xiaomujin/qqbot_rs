@@ -269,6 +269,39 @@ event="GROUP_MESSAGE_CREATE" content="<@0F1E2D3C4B5A69788796A5B4C3D2E1F0> 日报
 另外注意：机器人在群里的 openid 是**按群**下发的，事先无从得知，
 因此无法只剥离「机器人自己的」提及 —— 只能剥离开头的任意提及。
 
+### 6.2.2 引用消息（`message_type = 103`）—— 实测
+
+用户**回复**某条消息时，事件里会带上被引用消息的内容：
+
+- `message_type` 为 **103**；
+- `message_scene.ext` 多出一项 **`ref_msg_idx=REFIDX_...`**（被引用消息的索引），
+  与 `msg_elements[0].msg_idx` 相等；
+- **被引用消息的附件就在 `msg_elements[].attachments` 里**，
+  该元素的 `message_type` 同样是 103；
+- 可能还有 `parallel_message.msg_nodes`（并行消息，形如 `1\n[图片]2`）。
+
+```json
+{
+  "content": " 123",
+  "message_type": 103,
+  "message_scene": {"ext": ["ref_msg_idx=REFIDX_HxhS...", "msg_idx=REFIDX_rG7z...", "auth_token=..."]},
+  "msg_elements": [{
+    "message_type": 103,
+    "content": "1\n2",
+    "msg_idx": "REFIDX_HxhS...",
+    "attachments": [{"content_type": "image/jpeg", "size": 47195, "url": "https://multimedia.nt.qq.com.cn/..."}]
+  }]
+}
+```
+
+> ⚠️ 容易踩的坑：**只看 `attachments` 顶层字段会漏掉被引用的图片** ——
+> 非回复消息里图片确实在顶层 `attachments`，但回复消息里它在 `msg_elements` 内。
+> 只按前者实现，症状就是「发图能收录、回复收录失败」。
+
+另外，`attachments[]` 里有一个文档未写但实测存在的字段 **`content`**（当前观察到为空串）。
+这也说明：**类型里没声明的字段会在反序列化时静默丢掉**，
+需要完整消息时应保留原始 JSON（见 `MessageEvent::raw`）。
+
 **User**
 
 | 字段 | 描述 |

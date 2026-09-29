@@ -16,5 +16,12 @@ target/selftest/
 .idea/
 *.swp
 
+# 运行时数据（SQLite）
 /data
-/docs
+
+# /docs 不再整体忽略：协议速查与审计报告要跟着代码入库，
+# 否则 ARCHITECTURE.md / README.md 里的链接在 clone 后是断的。
+#
+# 但 samples/ 例外 —— 本仓库是公开的，而它含真实 AppID、真实群 openid
+# （live-run.log）以及用真实群聊记录渲染出来的词云截图。这些只留本地。
+/docs/samples/

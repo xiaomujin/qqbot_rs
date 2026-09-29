@@ -11,9 +11,11 @@
 //! - 鉴权：请求头 `Authorization: QQBot {ACCESS_TOKEN}`
 //! - ⚠️ 失败时 HTTP 状态码**可能仍是 200**，必须以响应体的 `err_code` 判定成败
 
+pub mod bot;
 pub mod client;
 pub mod error;
 pub mod event;
+pub mod group;
 pub mod intents;
 pub mod message;
 pub mod opcode;
@@ -23,10 +25,36 @@ pub use client::{
     ApiClient, ApiClientConfig, GatewayInfo, MediaUploadResult, SendResult, SessionStartLimit,
     TokenProvider, UploadConfig, UploadPartUrl, UploadPrepareResult,
 };
+pub use bot::{
+    BotInfo, EmptyResponse, Menu, MenuItem, MenuItemType, MenuResponse, MenuSwitch,
+    MenuUpdateRequest, MenuUpdateResponse, Panel, PanelCreateRequest, PanelCreateResponse,
+    PanelDetailResponse, PanelItem, PanelItemType, PanelListQuery, PanelListResponse, PanelRecord,
+    PanelScope, PanelTargetOp, PanelTargetRequest, PanelTargetType, PanelUpdateRequest,
+    PanelUpdateResponse, ShareLinkData, ShareLinkRequest, ShareLinkResponse, SubMenuItem,
+    SubMenuItemType,
+};
 pub use error::ApiError;
+pub use group::{
+    ApprovalJoinRequest, ApprovalOp, ApplySource, BatchRemoveMembersRequest,
+    BatchRemoveMembersResponse, BlacklistOp, BlacklistUser, BotState, CreateStrategyRequest,
+    CreateStrategyResponse, EnableState, ExecuteStrategyRequest, GlobalMuteRule, GroupAction,
+    GroupActionOp, GroupId, GroupInfo, GroupMember, GroupMemberListQuery, GroupMemberListResponse,
+    JoinApprovalStrategy, JoinApprovalStrategyListQuery, JoinApprovalStrategyListResponse,
+    JoinRequest, JoinRequestListQuery, JoinRequestListResponse, MemberBlacklist,
+    MemberBlacklistOpResponse, MemberBlacklistQuery, MemberBlacklistRequest, MemberMuteState,
+    MemberRole, MuteMode, MuteOp, MuteRecurringRule, MuteScheduleRule, RecvMsgSetting,
+    RestrictChatSetting, ReviewQA, SetMemberMuteState, SetRestrictChatSettingRequest,
+    UpdateStrategyRequest, UpdateStrategyResponse, VerifyInfo, VerifyMethod, WhitelistOp,
+    WhitelistUsersRequest, WhitelistUsersResponse,
+};
 pub use event::{Event, MessageEvent, RawNotice, User};
 pub use intents::Intents;
-pub use message::{Button, Keyboard, Markdown, Media, MsgType, OutMessage, Target};
+pub use message::{
+    Button, ButtonAction, InteractionCode, InteractionResponse, Keyboard, KeyboardContent,
+    KeyboardRow, Markdown, Media, MessageExtInfo, MessageReference, Modal, MsgType, OutMessage,
+    Permission, RenderData, StreamContentType, StreamInputMode, StreamInputState, StreamMessage,
+    StreamMessageResult, Target,
+};
 pub use opcode::OpCode;
 pub use payload::{Hello, Identify, Payload, Properties, RawPayload, Ready, ReadyUser, Resume};
 

@@ -28,7 +28,7 @@
 
 ## 0.5 实施状态（2026-09-28）
 
-本方案已落地为可运行代码，`cargo test --workspace` **149 项全绿**，`cargo clippy` 零警告。
+本方案已落地为可运行代码，`cargo test --workspace` **209 项全绿**，`cargo clippy` 零警告。
 **已在真实 QQ 群内完成端到端往返验证**（详见下方「线上实测」）。
 
 | 阶段 | 内容 | 状态 |
@@ -253,6 +253,38 @@ INFO 消息已发送 key="group:617E53BC..." mode="passive" msg_seq=Some(1)
 说明本地时钟与服务端可能存在偏差；原先直接返回错误丢消息，现在会清空本地窗口、
 消耗一次主动配额后重试一次（`active_retry` 指标单独计数）。
 
+### 接口覆盖补齐（2026-09-29）
+
+`qqbot-api` 原先只覆盖「消息收发 + 富媒体上传」两条链路。本轮把官方文档
+**服务端接口**里除**频道（Guild / Channel）**以外的部分全部补齐：
+新增 **29 个端点**、**2 个纯类型模块**（[`bot.rs`](crates/qqbot-api/src/bot.rs) /
+[`group.rs`](crates/qqbot-api/src/group.rs)），测试从 149 项增至 **209 项**。
+
+| 模块 | 覆盖范围 | 新增端点 |
+|---|---|---|
+| `message.rs` | 流式单聊消息、互动事件回调、引用回复、完整键盘 | 2 |
+| `bot.rs` | 机器人详情、分享链接、全局自定义菜单、指令面板 CRUD + 关联对象 | 10 |
+| `group.rs` | 群信息 / 机器人状态 / 入群申请 / 审批 / 禁言 / 成员 / 黑名单 / 入群自动审批策略 | 17 |
+
+**有意不实现**：频道（Guild / Channel / 身份组 / 论坛 / 音频 / 小程序）相关的全部接口，
+以及 `GET /users/@me/guilds`（获取机器人频道列表）—— 那是另一套产品面，与群机器人无关。
+端点全清单见 [`docs/qq-bot-api-v2-protocol.md`](docs/qq-bot-api-v2-protocol.md) 第 11 节，
+逐接口的约束要点见第 12 节。
+
+**顺带修掉的协议细节**（都写进了注释）：
+
+- `Keyboard` 之前只有 `content`，**短形式（只传平台模板 `id`）根本表达不出来**；
+  现在 `id` 与 `content` 二选一并在文档里标明互斥。
+- `ButtonAction::permission` 原先是个裸 `serde_json::Value`，现在是有类型的 `Permission`，
+  并补上 `enter` / `reply` / `anchor` / `modal` / `click_limit` 等此前缺失的字段。
+- `OutMessage` 补上 `message_reference`（引用回复）；`SendResult` 补上 `ext_info` ——
+  它的 `ref_idx` 正是**引用机器人自己发的消息**时要填的值。
+- 「响应为空」的接口（撤回 / 互动回调 / 审批 / 删除策略 …）**不能用 `()` 接**：
+  官方示例给的是 `{}`，而 serde 的 `()` 只吃 `null`。统一用 `EmptyResponse`
+  （`#[serde(from = "Option<Value>")]`，`null` 与 `{}` 都收得住）。
+- 分页查询串改由 **serde 驱动**（reqwest 的 `query` 特性），不再手写百分号编码 ——
+  手写版本每加一个查询字段都要同步改一处，迟早漂移。
+
 ### rust-skills 审计与修复（2026-09-29）
 
 用 [rust-skills](https://github.com/leonardomso/rust-skills)（265 条规则 / 26 类别）对整个 workspace 做了一轮逐 crate 审计，
@@ -406,7 +438,10 @@ qqbot/
 │  │   ├─ opcode.rs                #   0/1/2/6/7/9/10/11/12/13
 │  │   ├─ intents.rs               #   bitflags
 │  │   ├─ event/                   #   每个事件一个 struct
-│  │   ├─ message.rs               #   OutMessage / MsgType / Target
+│  │   ├─ message.rs               #   OutMessage / MsgType / Target / 键盘 / 流式消息 / 互动回调
+│  │   ├─ bot.rs                   #   机器人详情 / 分享链接 / 自定义菜单 / 指令面板
+│  │   ├─ group.rs                 #   群信息 / 成员 / 禁言 / 入群审批 / 黑名单
+│  │   ├─ client.rs                #   ★ 唯一带 IO 的模块（HTTP + access_token）
 │  │   └─ error.rs                 #   err_code 枚举 + 可重试判定
 │  │
 │  ├─ qqbot-gateway/               # ★ Actor #1

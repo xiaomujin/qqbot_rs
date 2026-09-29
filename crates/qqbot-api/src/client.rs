@@ -9,9 +9,25 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::bot::{
+    self, BotInfo, EmptyResponse, MenuResponse, MenuUpdateRequest, MenuUpdateResponse,
+    PanelCreateRequest, PanelCreateResponse, PanelDetailResponse, PanelListQuery, PanelListResponse,
+    PanelTargetRequest, PanelUpdateRequest, PanelUpdateResponse, ShareLinkRequest, ShareLinkResponse,
+};
 use crate::error::ApiError;
+use crate::group::{
+    ApprovalJoinRequest, BatchRemoveMembersRequest, BatchRemoveMembersResponse, BotState,
+    CreateStrategyRequest, CreateStrategyResponse, ExecuteStrategyRequest, GroupInfo, GroupMember,
+    GroupMemberListQuery, GroupMemberListResponse, JoinApprovalStrategyListQuery,
+    JoinApprovalStrategyListResponse, JoinRequestListQuery, JoinRequestListResponse,
+    MemberBlacklist, MemberBlacklistOpResponse, MemberBlacklistQuery, MemberBlacklistRequest,
+    RestrictChatSetting, SetRestrictChatSettingRequest, UpdateStrategyRequest,
+    UpdateStrategyResponse, WhitelistUsersRequest, WhitelistUsersResponse,
+};
 use crate::intents::Intents;
-use crate::message::{OutMessage, Target};
+use crate::message::{
+    InteractionResponse, MessageExtInfo, OutMessage, StreamMessage, StreamMessageResult, Target,
+};
 use crate::payload::{Identify, Properties, Resume};
 use crate::DEFAULT_API_BASE;
 
@@ -226,6 +242,9 @@ pub struct SendResult {
     pub id: Option<String>,
     #[serde(default)]
     pub timestamp: Option<String>,
+    /// 扩展信息。里面的 `ref_idx` 是**引用回复**时要填的 `message_reference.message_id`。
+    #[serde(default)]
+    pub ext_info: Option<MessageExtInfo>,
 }
 
 /// 上传返回。
@@ -367,6 +386,263 @@ impl ApiClient {
         self.get_json("/gateway/bot").await
     }
 
+    // ---------- 机器人 / 自定义菜单 / 指令面板 ----------
+
+    /// 获取机器人详情（`GET /users/@me`）。
+    pub async fn bot_info(&self) -> Result<BotInfo, ApiError> {
+        self.get_json(bot::USERS_ME_PATH).await
+    }
+
+
+    /// 生成机器人分享链接（`POST /v2/generate_url_link`）。
+    ///
+    /// `callback_data` 最长 32 字符，用户通过该链接添加机器人时会透传回来。
+    pub async fn generate_share_link(
+        &self,
+        req: &ShareLinkRequest,
+    ) -> Result<ShareLinkResponse, ApiError> {
+        self.post_json(bot::GENERATE_URL_LINK_PATH, req).await
+    }
+
+    /// 查询全局自定义菜单（`GET /v2/menu`）。**仅单聊场景有效**。
+    pub async fn menu(&self) -> Result<MenuResponse, ApiError> {
+        self.get_json(bot::MENU_PATH).await
+    }
+
+    /// 修改全局自定义菜单（`PUT /v2/menu`）。
+    ///
+    /// ⚠️ **全量覆盖**：没带上的旧菜单项等同于删除。
+    pub async fn update_menu(&self, req: &MenuUpdateRequest) -> Result<MenuUpdateResponse, ApiError> {
+        self.put_json(bot::MENU_PATH, req).await
+    }
+
+    /// 查询指令面板列表（`GET /v2/panels`）。
+    ///
+    /// `scope` 必填；用响应里的 `next_cursor` 翻页，`has_more()` 判断是否到底。
+    pub async fn list_panels(&self, query: &PanelListQuery) -> Result<PanelListResponse, ApiError> {
+        self.get_json_query(bot::PANELS_PATH, query).await
+    }
+
+    /// 创建指令面板（`POST /v2/panels`）。一个机器人最多 20 个面板。
+    pub async fn create_panel(
+        &self,
+        req: &PanelCreateRequest,
+    ) -> Result<PanelCreateResponse, ApiError> {
+        self.post_json(bot::PANELS_PATH, req).await
+    }
+
+    /// 查询指令面板详情（`GET /v2/panels/{panel_id}`）。
+    pub async fn panel_detail(&self, panel_id: &str) -> Result<PanelDetailResponse, ApiError> {
+        self.get_json(&bot::panel_path(panel_id)).await
+    }
+
+    /// 修改指令面板（`PUT /v2/panels/{panel_id}`）。
+    ///
+    /// ⚠️ `panel` 全量覆盖元素与备注，但**不影响已关联的用户 / 群**。
+    pub async fn update_panel(
+        &self,
+        panel_id: &str,
+        req: &PanelUpdateRequest,
+    ) -> Result<PanelUpdateResponse, ApiError> {
+        self.put_json(&bot::panel_path(panel_id), req).await
+    }
+
+    /// 删除指令面板（`DELETE /v2/panels/{panel_id}`）。
+    pub async fn delete_panel(&self, panel_id: &str) -> Result<(), ApiError> {
+        let _: EmptyResponse = self.delete_json(&bot::panel_path(panel_id)).await?;
+        Ok(())
+    }
+
+    /// 增删指令面板关联的用户 / 群（`PUT /v2/panels/{panel_id}/target`）。
+    ///
+    /// 仅 `c2c` / `group` 且 `target_type=specific` 的面板可用，单次最多 20 个。
+    pub async fn update_panel_target(
+        &self,
+        panel_id: &str,
+        req: &PanelTargetRequest,
+    ) -> Result<(), ApiError> {
+        let _: EmptyResponse = self.put_json(&bot::panel_target_path(panel_id), req).await?;
+        Ok(())
+    }
+
+    // ---------- 群聊管理 ----------
+
+    /// 获取群基本信息（`GET /v2/groups/{group_openid}/info`）。
+    ///
+    /// ⚠️ 该接口**仅白名单机器人可用**，未申请权限会返回业务错误码 `11253`。
+    pub async fn group_info(&self, group_openid: &str) -> Result<GroupInfo, ApiError> {
+        self.get_json(&format!("/v2/groups/{group_openid}/info")).await
+    }
+
+    /// 获取机器人在该群内的状态（`GET /v2/groups/{group_openid}/bot_state`）。
+    ///
+    /// `recv_msg_setting` 就是「是否接收群内全部消息」那一项。
+    pub async fn group_bot_state(&self, group_openid: &str) -> Result<BotState, ApiError> {
+        self.get_json(&format!("/v2/groups/{group_openid}/bot_state")).await
+    }
+
+    /// 拉取入群申请列表（`GET /v2/groups/{group_openid}/join_request_list`）。
+    ///
+    /// 需要群管理员身份。用响应里的 `next_cursor` 翻页，`is_last_page()` 判断到底。
+    pub async fn group_join_requests(
+        &self,
+        group_openid: &str,
+        query: &JoinRequestListQuery,
+    ) -> Result<JoinRequestListResponse, ApiError> {
+        self.get_json_query(&format!("/v2/groups/{group_openid}/join_request_list"), query)
+            .await
+    }
+
+    /// 审批入群申请
+    /// （`POST /v2/groups/{group_openid}/approval_join_request/{member_openid}`）。
+    ///
+    /// 需要群管理员身份；响应为空。
+    pub async fn approve_join_request(
+        &self,
+        group_openid: &str,
+        member_openid: &str,
+        req: &ApprovalJoinRequest,
+    ) -> Result<(), ApiError> {
+        let path = format!("/v2/groups/{group_openid}/approval_join_request/{member_openid}");
+        let _: EmptyResponse = self.post_json(&path, req).await?;
+        Ok(())
+    }
+
+    /// 查询群禁言状态（`GET /v2/groups/{group_openid}/restrict_chat_setting`）。
+    pub async fn group_restrict_chat_setting(
+        &self,
+        group_openid: &str,
+    ) -> Result<RestrictChatSetting, ApiError> {
+        self.get_json(&format!("/v2/groups/{group_openid}/restrict_chat_setting")).await
+    }
+
+    /// 设置群成员禁言（`POST /v2/groups/{group_openid}/restrict_chat_setting`）。
+    ///
+    /// ⚠️ 单次最多 20 人、最长 30 天，且**只能操作普通成员**（群主 / 管理员 / 机器人不行）。
+    pub async fn set_group_restrict_chat_setting(
+        &self,
+        group_openid: &str,
+        req: &SetRestrictChatSettingRequest,
+    ) -> Result<(), ApiError> {
+        let path = format!("/v2/groups/{group_openid}/restrict_chat_setting");
+        let _: EmptyResponse = self.post_json(&path, req).await?;
+        Ok(())
+    }
+
+    /// 获取群成员列表（`GET /v2/groups/{group_openid}/members`）。
+    ///
+    /// ⚠️ 该接口**没有 `limit` 参数**，每页固定最多 30 条；能力正在内邀接入中。
+    pub async fn group_members(
+        &self,
+        group_openid: &str,
+        query: &GroupMemberListQuery,
+    ) -> Result<GroupMemberListResponse, ApiError> {
+        self.get_json_query(&format!("/v2/groups/{group_openid}/members"), query).await
+    }
+
+    /// 获取单个群成员信息
+    /// （`GET /v2/groups/{group_openid}/members/{member_openid}`）。
+    pub async fn group_member(
+        &self,
+        group_openid: &str,
+        member_openid: &str,
+    ) -> Result<GroupMember, ApiError> {
+        self.get_json(&format!("/v2/groups/{group_openid}/members/{member_openid}")).await
+    }
+
+    /// 批量移除群成员（`POST /v2/groups/{group_openid}/batch_remove_members`）。
+    ///
+    /// 单次最多 20 人；可顺带拉黑，拉黑失败的 openid 在响应里。
+    pub async fn batch_remove_group_members(
+        &self,
+        group_openid: &str,
+        req: &BatchRemoveMembersRequest,
+    ) -> Result<BatchRemoveMembersResponse, ApiError> {
+        self.post_json(&format!("/v2/groups/{group_openid}/batch_remove_members"), req).await
+    }
+
+    /// 查询群黑名单（`GET /v2/groups/{group_openid}/member_blacklist`）。
+    pub async fn group_member_blacklist(
+        &self,
+        group_openid: &str,
+        query: &MemberBlacklistQuery,
+    ) -> Result<MemberBlacklist, ApiError> {
+        self.get_json_query(&format!("/v2/groups/{group_openid}/member_blacklist"), query).await
+    }
+
+    /// 操作群黑名单（`POST /v2/groups/{group_openid}/member_blacklist`）。
+    ///
+    /// ⚠️ **目标成员还在群里时无法加入黑名单**，要先移除或用批量移除接口的
+    /// `add_to_member_blacklist`。单次最多 20 人。
+    pub async fn update_group_member_blacklist(
+        &self,
+        group_openid: &str,
+        req: &MemberBlacklistRequest,
+    ) -> Result<MemberBlacklistOpResponse, ApiError> {
+        self.post_json(&format!("/v2/groups/{group_openid}/member_blacklist"), req).await
+    }
+
+    // ---------- 入群自动审批策略 ----------
+
+    /// 查询入群自动审批策略列表（`GET /v2/groups/join_approval_strategy`）。
+    pub async fn join_approval_strategies(
+        &self,
+        query: &JoinApprovalStrategyListQuery,
+    ) -> Result<JoinApprovalStrategyListResponse, ApiError> {
+        self.get_json_query("/v2/groups/join_approval_strategy", query).await
+    }
+
+    /// 创建入群自动审批策略（`POST /v2/groups/join_approval_strategy`）。
+    ///
+    /// `group_openids` 与 `group_ids` **二选一必填**；一个机器人最多 20 个策略。
+    pub async fn create_join_approval_strategy(
+        &self,
+        req: &CreateStrategyRequest,
+    ) -> Result<CreateStrategyResponse, ApiError> {
+        self.post_json("/v2/groups/join_approval_strategy", req).await
+    }
+
+    /// 修改入群自动审批策略
+    /// （`PATCH /v2/groups/join_approval_strategy/{strategy_id}`）。
+    pub async fn update_join_approval_strategy(
+        &self,
+        strategy_id: &str,
+        req: &UpdateStrategyRequest,
+    ) -> Result<UpdateStrategyResponse, ApiError> {
+        self.patch_json(&format!("/v2/groups/join_approval_strategy/{strategy_id}"), req).await
+    }
+
+    /// 删除入群自动审批策略
+    /// （`DELETE /v2/groups/join_approval_strategy/{strategy_id}`）。
+    pub async fn delete_join_approval_strategy(&self, strategy_id: &str) -> Result<(), ApiError> {
+        let _: EmptyResponse =
+            self.delete_json(&format!("/v2/groups/join_approval_strategy/{strategy_id}")).await?;
+        Ok(())
+    }
+
+    /// 执行入群自动审批策略
+    /// （`POST /v2/groups/join_approval_strategy/{strategy_id}/execute`）。
+    ///
+    /// **异步**：对关联的全部群做全量扫描，官方说约 **10 分钟**完成，接口立即返回。
+    pub async fn execute_join_approval_strategy(&self, strategy_id: &str) -> Result<(), ApiError> {
+        let path = format!("/v2/groups/join_approval_strategy/{strategy_id}/execute");
+        let _: EmptyResponse = self.post_json(&path, &ExecuteStrategyRequest {}).await?;
+        Ok(())
+    }
+
+    /// 修改策略的白名单号码
+    /// （`POST /v2/groups/join_approval_strategy/{strategy_id}/whitelist_users`）。
+    ///
+    /// 单次最多 10000 个号码；号码必须是**字符串**（官方为避免 JS 精度问题而定）。
+    pub async fn update_join_approval_whitelist(
+        &self,
+        strategy_id: &str,
+        req: &WhitelistUsersRequest,
+    ) -> Result<WhitelistUsersResponse, ApiError> {
+        let path = format!("/v2/groups/join_approval_strategy/{strategy_id}/whitelist_users");
+        self.post_json(&path, req).await
+    }
+
     /// 发送消息。
     pub async fn send_message(&self, target: &Target, msg: &OutMessage) -> Result<SendResult, ApiError> {
         self.post_json(&target.messages_path(), msg).await
@@ -375,7 +651,45 @@ impl ApiClient {
     /// 撤回消息。官方限制：发送超过 **2 分钟**不可撤回。
     pub async fn recall_message(&self, target: &Target, message_id: &str) -> Result<(), ApiError> {
         let path = format!("{}/{}", target.messages_path(), message_id);
-        self.delete_json(&path).await
+        // 官方撤回成功时返回空体或 `{}`，用 Value 接收再丢弃，
+        // 避免 `()` 的 unit 反序列化把 `{}` 判成类型错误。
+        let _: serde_json::Value = self.delete_json(&path).await?;
+        Ok(())
+    }
+
+    /// 流式发送单聊消息的**一个分片**。
+    ///
+    /// 首片不填 `stream_msg_id`，把响应里的 `id` 填进后续分片；
+    /// `input_state = Finished` 的那一片表示生成结束。
+    ///
+    /// ⚠️ 官方明确「群消息不支持流式参数」，传 `Target::Group` 会直接返回
+    /// 协议错误，而不会白跑一次注定失败的网络请求。
+    pub async fn send_stream_message(
+        &self,
+        target: &Target,
+        msg: &StreamMessage,
+    ) -> Result<StreamMessageResult, ApiError> {
+        let path = target.stream_messages_path().ok_or_else(|| {
+            ApiError::Protocol("群聊不支持流式消息（官方：群消息不支持流式参数）".to_string())
+        })?;
+        self.post_json(&path, msg).await
+    }
+
+    /// 回应互动事件（`PUT /interactions/{interaction_id}`）。
+    ///
+    /// 收到 `INTERACTION_CREATE` 后**必须**调用，否则用户端一直转圈：
+    /// 官方给的超时是 **3 秒**（指令回调场景），且同一个 `interaction_id` 只能回应一次。
+    ///
+    /// `interaction_id` 取自事件 `d.id`，**不带** `INTERACTION_CREATE:` 前缀。
+    pub async fn respond_interaction(
+        &self,
+        interaction_id: &str,
+        response: InteractionResponse,
+    ) -> Result<(), ApiError> {
+        let path = format!("/interactions/{interaction_id}");
+        // 官方响应体是 `{}`，同样用 Value 接收。
+        let _: serde_json::Value = self.put_json(&path, &response).await?;
+        Ok(())
     }
 
     /// 通过公网 URL 上传富媒体（平台自动下载转存）。
@@ -449,6 +763,34 @@ impl ApiClient {
 
     async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
         let req = self.http.delete(self.url(path));
+        self.execute(req).await
+    }
+
+    async fn put_json<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ApiError> {
+        let req = self.http.put(self.url(path)).json(body);
+        self.execute(req).await
+    }
+
+    async fn patch_json<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ApiError> {
+        let req = self.http.patch(self.url(path)).json(body);
+        self.execute(req).await
+    }
+
+    /// 带查询参数的 GET。分页接口（`cursor` / `limit`）走这里。
+    async fn get_json_query<T: DeserializeOwned, Q: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        query: &Q,
+    ) -> Result<T, ApiError> {
+        let req = self.http.get(self.url(path)).query(query);
         self.execute(req).await
     }
 

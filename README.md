@@ -191,7 +191,7 @@ ctx.reply_svg(svg).await?;
 ## 测试
 
 ```bash
-cargo test --workspace        # 149 项测试（含端到端）
+cargo test --workspace        # 209 项测试（含端到端）
 cargo test --test end_to_end  # 只跑收发链路端到端
 cargo test -p qqbot-gateway --test gateway_protocol  # 只跑网关协议（Identify/Resume/分片/op9）
 cargo run -- self-test        # 渲染链路离线自检（无需网络与凭据）

@@ -2,36 +2,30 @@
 //!
 //! 本示例**只接收**，不会主动发送任何消息。
 //!
-//! 运行：`cargo run -p qqbot-gateway --example handshake`
+//! 运行（凭据从环境变量读，不再依赖 bot.txt）：
+//! `$env:QQBOT_APP_ID='...'; $env:QQBOT_APP_SECRET='...'; cargo run -p qqbot-gateway --example handshake`
 
 use std::time::Duration;
 
 use qqbot_api::{ApiClient, ApiClientConfig, Event, Intents};
 use qqbot_gateway::{spawn_gateway, GatewayConfig};
 
-fn parse_bot_txt(text: &str) -> (Option<String>, Option<String>) {
-    let mut app_id = None;
-    let mut secret = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // 官方文档用的是全角冒号，这里统一成半角再切分。
-        let normalized = line.replace('：', ":");
-        let Some((k, v)) = normalized.split_once(':') else { continue };
-        let key = k.trim().to_ascii_lowercase();
-        let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
-        if val.is_empty() {
-            continue;
-        }
-        if key.contains("appid") || key.contains("app_id") {
-            app_id = Some(val);
-        } else if key.contains("secret") {
-            secret = Some(val);
-        }
+/// 从环境变量取凭据。
+///
+/// 示例刻意**不读 `config.toml`**：那要给这个 crate 加 `toml` + `serde` 两个
+/// dev-dependency，而示例只用于手工验证握手，环境变量足够。
+///
+/// 错误用 `&'static str`：消息是字面量，不必为它分配一个 String，
+/// 而 `?` 依然能把它转成 `Box<dyn Error>`。
+fn credentials() -> Result<(String, String), &'static str> {
+    let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    match (get("QQBOT_APP_ID"), get("QQBOT_APP_SECRET")) {
+        (Some(a), Some(s)) => Ok((a, s)),
+        _ => Err(
+            "未找到凭据。请先设置环境变量 QQBOT_APP_ID / QQBOT_APP_SECRET：\n\
+             $env:QQBOT_APP_ID='...'; $env:QQBOT_APP_SECRET='...'",
+        ),
     }
-    (app_id, secret)
 }
 
 fn summarize(ev: &Event) -> String {
@@ -52,11 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .init();
 
-    let text = std::fs::read_to_string("bot.txt")
-        .or_else(|_| std::fs::read_to_string("../../bot.txt"))?;
-    let (app_id, secret) = parse_bot_txt(&text);
-    let app_id = app_id.ok_or("bot.txt 中未找到 AppID")?;
-    let secret = secret.ok_or("bot.txt 中未找到 AppSecret")?;
+    let (app_id, secret) = credentials()?;
     println!("[1/4] AppID = {app_id}，AppSecret 长度 = {}", secret.len());
 
     let api = ApiClient::new(ApiClientConfig::new(app_id, secret))?;

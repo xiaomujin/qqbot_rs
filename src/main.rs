@@ -30,31 +30,53 @@ async fn main() -> Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "run".to_string());
 
     match mode.as_str() {
+        // 离线自检**不读配置**：没有 config.toml、没有任何凭据也必须能跑。
         "self-test" | "--self-test" => {
             init_tracing("debug");
             self_test().await
-        }
-        "check" | "--check" => {
-            init_tracing("info");
-            check().await
         }
         "help" | "--help" | "-h" => {
             println!("用法: qqbot [run|check|self-test]");
             Ok(())
         }
+        // 其余两种模式都要先读配置，见 `boot()`。
+        "check" | "--check" => check(boot()?).await,
         other => {
             if other != "run" {
                 eprintln!("未知模式 {other:?}，回退到 run");
             }
-            init_tracing("info");
-            run().await
+            run(boot()?).await
         }
     }
 }
 
-fn init_tracing(default_level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+/// 读配置 → 按配置里的级别初始化日志 → 记录配置来源。
+///
+/// `run` 与 `check` 共用，避免两条路径各自漂移。
+/// 顺序不能反：日志级别本身来自配置，所以 `init_tracing` 必须排在 `load` 之后。
+fn boot() -> Result<Config> {
+    let cfg = Config::load()?;
+    init_tracing(&cfg.log_level);
+    tracing::info!(sources = %cfg.sources, "配置已加载");
+    Ok(cfg)
+}
+
+/// 初始化日志。
+///
+/// 优先级：`RUST_LOG` > `configured`（来自 config.toml，默认 `info`）。
+/// 非法指令**不静默生效**：回退到 info，并往 stderr 说清楚是哪个来源的值坏了。
+fn init_tracing(configured: &str) {
+    let explicit = std::env::var("RUST_LOG")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let (source, value) = match &explicit {
+        Some(v) => ("RUST_LOG", v.as_str()),
+        None => ("log_level", configured),
+    };
+    let filter = EnvFilter::try_new(value).unwrap_or_else(|err| {
+        eprintln!("{source}={value:?} 不是合法的日志指令（{err}），回退到 info");
+        EnvFilter::new("info")
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -154,8 +176,7 @@ async fn self_test() -> Result<()> {
 }
 
 /// 只校验凭据，不建立长连接。
-async fn check() -> Result<()> {
-    let cfg = Config::load()?;
+async fn check(cfg: Config) -> Result<()> {
     println!("AppID = {}（密钥长度 {}）", cfg.app_id, cfg.client_secret.len());
 
     let api = ApiClient::new(cfg.api_config())?;
@@ -173,8 +194,7 @@ async fn check() -> Result<()> {
 }
 
 /// 正常服务模式。
-async fn run() -> Result<()> {
-    let cfg = Config::load()?;
+async fn run(cfg: Config) -> Result<()> {
     let api = ApiClient::new(cfg.api_config())?;
 
     let media = MediaUploader::new(api.clone());

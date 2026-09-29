@@ -1,0 +1,46 @@
+# qqbot 配置模板
+#
+# 用法：复制成 config.toml 后按需修改
+#   cp config.example.toml config.toml
+#
+# config.toml 已加入 .gitignore（它可能含 AppSecret），**不要**提交。
+#
+# 优先级（从高到低）：
+#   1. 环境变量（QQBOT_* / RUST_LOG）—— 部署期覆盖，容器 / CI / systemd 用这个
+#   2. config.toml（本文件复制出来的那份）
+#   3. 内置默认值
+#
+# 本文件允许**只写一部分**：删掉任何一个键都会退回内置默认值。
+# 但键名拼错会直接报错（不会静默忽略），所以不要凭记忆改键名。
+
+# ---- 凭据（必填）----
+# 也可以走环境变量 QQBOT_APP_ID / QQBOT_APP_SECRET。
+app_id = ""
+client_secret = ""
+
+# ---- 消息持久化 ----
+# SQLite 路径。置为空串 "" 表示**关闭持久化**，此时词云只用内存语料。
+db_path = "data/qqbot.db"
+# 消息保留天数，超期由定时任务清理（1 ~ 36500）。
+retention_days = 365
+# 词云统计窗口：只看最近这段时间的消息。
+wordcloud_window_days = 30
+
+# ---- 日志 ----
+# 环境变量 RUST_LOG 的优先级高于这里。
+log_level = "info"
+
+# ---- 渲染 ----
+[render]
+# 单次渲染超时（秒），超时降级为纯文本。默认 5。
+timeout_secs = 5
+
+# ---- 按需打开（默认值随机器规格而定，所以默认注释掉）----
+# 接口基址（调试 / 私有化部署用）
+# api_base = "https://api.bot.qq.com"
+# 网关地址（调试用；不填则走 /gateway/bot 探测）
+# gateway_url = "wss://api.sgroup.qq.com/websocket"
+# 会话分片数。默认 = CPU 核数 × 2
+# session_shards = 24
+# 单条事件处理的最大并发。默认 16
+# dispatch_concurrency = 16

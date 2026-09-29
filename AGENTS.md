@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 bin（`src/`） |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 209 项，全绿 |
+| 测试基线 | 224 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -40,13 +40,33 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 
 ### 与机器人同时构建
 
-机器人运行时 Windows 会锁住 `target/release/qqbot.exe`，`cargo build --release` 会失败。
-**不要**为了构建去杀进程或改锁；换一个目标目录并行构建：
+Windows 会锁住**正在运行的那个** exe。所以**开发期一律从副本启动**，
+让 `target/debug/qqbot.exe` 保持自由 —— 边跑边编，不用停机器人：
 
 ```powershell
-$env:CARGO_TARGET_DIR = "target-verify"
-cargo build --release --workspace
+# 启动 / 换二进制
+cargo build
+Copy-Item -Force target\debug\qqbot.exe target\devrun\qqbot.exe
+Remove-Item target\live.log -ErrorAction SilentlyContinue
+$env:RUST_LOG='info'
+& .\target\devrun\qqbot.exe run 2>&1 | Tee-Object -FilePath target\live.log
 ```
+
+`target\devrun\` 落在 `/target` 忽略范围内，不会入库。
+
+只有**改了代码**时才会撞锁（cargo 需要重新链接）。`cargo test` 与 `cargo clippy`
+**永远不受影响** —— 它们只写 `target/debug/deps/`，不重写这个 exe。
+万一直接跑了 `target/debug/qqbot.exe`，症状是 `failed to remove file ... 拒绝访问 (os error 5)`；
+**不要**为了构建去杀进程或改锁，停掉机器人再编即可。
+
+### debug 构建的代价（实测）
+
+渲染慢 **25~31 倍**：卡片 1184ms / 词云 2727ms（release 分别是 47ms / 88ms）。
+仍在 `render.timeout_secs` 默认的 5s 之内，所以**不会**降级成纯文本，但余量只有 1.8 倍 ——
+调试期间别同时堆多个词云请求。
+
+好处是 debug 打开整数溢出检查：`retention_days * DAY_SECS` 这类乘法一旦回绕会
+**直接 panic**，而不是在 release 下静默算出错误结果。
 
 ---
 
@@ -66,7 +86,7 @@ cargo build --release --workspace
    排查时用 `Get-Process qqbot`（注意：进程多于一个时它返回**数组**，不要直接做算术）。
 
 4. **绝不把凭据 / 运行时数据 / 真实样例入库。**
-   `bot.txt`、`config.local.toml`、`.env`、`/data`、`/docs/samples/` 都在 `.gitignore` 里，
+   `config.toml`（含 AppSecret）、`.env`、`/data`、`/docs/samples/` 都在 `.gitignore` 里，
    而**本仓库是公开的**。`docs/samples/` 含真实 AppID、真实群 openid、真实群聊渲染出的词云截图，
    只留本地。提交前扫一眼 `git status`。
 
@@ -177,6 +197,10 @@ cargo check -p qqbot
 - **`qqbot-api` 的 `types` / `event` / `message` / `payload` 模块禁止出现 IO**；
   HTTP 只能写在 `client.rs`。协议类型要能离线单测。
 - **最小化 diff**：不做与任务无关的重命名、重排、格式化。
+- **改完 Markdown 必须回读校验**：Markdown 没有编译器，占位符残留、代码块围栏错位、
+  路径里的反斜杠丢失，都不会被 clippy / 测试 / 构建发现。用脚本生成 Markdown 时，
+  内容里的反引号与反斜杠**一律走占位符替换**（先写 `@@` 再整体换掉），不要直接写进
+  模板字面量 —— 单级替换会把 ``` 变成 `@，而反斜杠会被静默吃掉。
 - Rust 代码评审可加载 `rust-skills` 规则集（265 条 / 26 类）；
   已知误报：`#[async_trait]`（`Arc<dyn Handler>` 必需）、测试里的 `unwrap()`。
 
@@ -196,12 +220,14 @@ cargo check -p qqbot
 | 富媒体分片上传 / 秒传缓存 | `crates/qqbot-media/src/uploader.rs` |
 | 渲染服务、模板、词云布局 | `crates/qqbot-render/src/` |
 | 存储 schema / 读写线程 / 保留期 | `crates/qqbot-store/src/` |
-| 配置项与环境变量 | `src/config.rs` |
+| 配置项与环境变量 | `src/config.rs`（新增键要同步 `config.example.toml`） |
 | 装配与事件主循环 | `src/main.rs` |
 
-环境变量：`QQBOT_APP_ID`、`QQBOT_APP_SECRET`、`QQBOT_DB_PATH`（**显式置空即关闭持久化**）、
-`QQBOT_RETENTION_DAYS`、`QQBOT_WORDCLOUD_WINDOW_DAYS`、`QQBOT_API_BASE`、`QQBOT_GATEWAY_URL`。
-凭据优先级：环境变量 > `bot.txt`。
+配置优先级：**环境变量 > `config.toml` > 内置默认值**。
+`config.toml` 已 gitignore，模板是 `config.example.toml`；`QQBOT_CONFIG` 可指定路径。
+配置解析是**纯函数**（`Config::resolve(env, file)`，见 `src/config.rs`）：
+edition 2024 起 `env::set_var` 是 unsafe，而本 workspace 禁 unsafe，
+所以**必须注入环境变量才能测试** —— 不要在 `resolve` 里直接读 `std::env`。
 
 ---
 

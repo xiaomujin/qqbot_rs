@@ -1,5 +1,5 @@
 # 凭据：绝不入库
-bot.txt
+config.toml
 config.local.toml
 .env
 

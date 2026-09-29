@@ -15,18 +15,18 @@
 
 ## 快速开始
 
-### 1. 配置凭据
+### 1. 配置
 
 任选一种（优先级从高到低）：
 
 ```bash
-# 方式一：环境变量
+# 方式一：配置文件（推荐）—— 模板带注释，config.toml 已加入 .gitignore
+cp config.example.toml config.toml
+# 然后填 app_id / client_secret
+
+# 方式二：环境变量（容器 / CI 用这个）
 export QQBOT_APP_ID=你的AppID
 export QQBOT_APP_SECRET=你的AppSecret
-
-# 方式二：项目根目录的 bot.txt（已加入 .gitignore）
-# AppID：你的AppID
-# AppSecret：你的AppSecret
 ```
 
 ### 2. 运行
@@ -50,17 +50,43 @@ cargo run -- self-test     # 离线渲染自检（无需网络与凭据）
 
 ---
 
-## 配置项
+## 配置
 
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `QQBOT_APP_ID` / `QQBOT_APP_SECRET` | 无 | 凭据。未设置时回退读 `bot.txt` |
-| `QQBOT_DB_PATH` | `data/qqbot.db` | 消息库路径。**显式置空可关闭持久化**（词云退回内存语料） |
-| `QQBOT_RETENTION_DAYS` | `365` | 消息保留天数，超期由定时任务清理 |
-| `QQBOT_WORDCLOUD_WINDOW_DAYS` | `30` | 词云统计窗口 |
-| `QQBOT_API_BASE` | 官方地址 | 覆盖 API 基址（调试用） |
-| `QQBOT_GATEWAY_URL` | 自动探测 | 覆盖网关地址（调试用） |
-| `RUST_LOG` | `info` | 日志级别 |
+优先级（从高到低）：
+
+1. **环境变量** `QQBOT_*` / `RUST_LOG` —— 部署期覆盖（容器 / CI / systemd）
+2. **`config.toml`** —— 本机基线，允许只写一部分
+3. 内置默认值
+
+`config.toml` 默认从当前目录向上查找；也可以用 `QQBOT_CONFIG` 指定路径（此时文件必须存在）。
+仓库里的 [config.example.toml](config.example.toml) 是带注释的模板：
+
+```bash
+cp config.example.toml config.toml
+```
+
+**没写进 `config.toml` 的键一律退回默认值**，所以以后新增键不会让旧配置失效；
+但键名**拼错会直接报错**，不会被静默忽略。
+
+| 键 | 环境变量 | 默认值 | 说明 |
+|---|---|---|---|
+| `app_id` | `QQBOT_APP_ID` | 无（必填） | 机器人 AppID |
+| `client_secret` | `QQBOT_APP_SECRET` | 无（必填） | 机器人 AppSecret |
+| `api_base` | `QQBOT_API_BASE` | 官方地址 | API 基址（调试 / 私有化部署） |
+| `gateway_url` | `QQBOT_GATEWAY_URL` | 自动探测 | 网关地址（调试用） |
+| `db_path` | `QQBOT_DB_PATH` | `data/qqbot.db` | 消息库路径。**置为空串即关闭持久化**（词云退回内存语料） |
+| `retention_days` | `QQBOT_RETENTION_DAYS` | `365` | 消息保留天数（1 ~ 36500），超期由定时任务清理 |
+| `wordcloud_window_days` | `QQBOT_WORDCLOUD_WINDOW_DAYS` | `30` | 词云统计窗口 |
+| `log_level` | `RUST_LOG` | `info` | 日志级别 |
+| `session_shards` | `QQBOT_SESSION_SHARDS` | CPU 核数 × 2 | 会话分片数 |
+| `dispatch_concurrency` | `QQBOT_DISPATCH_CONCURRENCY` | `16` | 单条事件处理的最大并发 |
+| `render.timeout_secs` | `QQBOT_RENDER_TIMEOUT_SECS` | `5` | 单次渲染超时（秒），超时降级为纯文本 |
+
+> 「缺失」与「非法」是两回事：**没写** → 用默认值；**写了但解析不了**
+> （例如 `QQBOT_RETENTION_DAYS=abc`）→ 启动直接报错，不会静默回退成 365 天。
+>
+> 启动日志会打一行 `配置已加载 sources=...`，说明这次生效的来源，
+> 便于排查「我改的到底是哪个文件」。
 
 ---
 
@@ -114,7 +140,7 @@ ctx.reply_svg(svg).await?;
 ## 测试与自检
 
 ```bash
-cargo test --workspace        # 209 项测试（含端到端）
+cargo test --workspace        # 224 项测试（含端到端）
 cargo test --test end_to_end  # 只跑收发链路端到端
 cargo test -p qqbot-gateway --test gateway_protocol  # 只跑网关协议（Identify/Resume/分片/op9）
 cargo test -p qqbot-store     # 只跑存储：幂等 / 隔离 / 保留期边界 / 不阻塞
@@ -175,7 +201,7 @@ crates/
 └─ qqbot-plugins/   业务插件（帮助 / 骰子 / 词云）
 src/
 ├─ main.rs          组合根：装配服务、连接网关、事件循环
-└─ config.rs        配置加载（环境变量 > bot.txt）
+└─ config.rs        配置加载（环境变量 > config.toml > 默认值）
 ```
 
 ---

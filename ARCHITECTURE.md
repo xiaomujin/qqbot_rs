@@ -285,6 +285,48 @@ INFO 消息已发送 key="group:617E53BC..." mode="passive" msg_seq=Some(1)
 - 分页查询串改由 **serde 驱动**（reqwest 的 `query` 特性），不再手写百分号编码 ——
   手写版本每加一个查询字段都要同步改一处，迟早漂移。
 
+### 工具链升级：edition 2024 + rusqlite 0.40.2（2026-09-29）
+
+| 项 | 从 | 到 |
+|---|---|---|
+| `edition` | 2021 | **2024** |
+| `rust-version`（MSRV） | 1.85 | **1.88** |
+| `resolver` | 2 | **3** |
+| `rusqlite` | 0.37 | **0.40.2** |
+| bundled SQLite | 3.50.2 | 3.53.2 |
+
+**MSRV 为什么是 1.88**：edition 2024 要 Rust 1.85，而 rusqlite 0.40.2 要 1.88
+（它的 release note 就一句 "Lower MSRV to 1.88.0"），取较高者。
+
+**edition 2024 迁移的实际代价：零**。整个 workspace 一次 `cargo check` 就过了，
+**没有改一行业务代码** —— 因为 2024 最凶的那几条变更在这个项目里全都不适用：
+`unsafe_op_in_unsafe_fn` 变默认错误、`unsafe extern` 块、`static mut` 引用报错、
+`std::env::set_var`/`remove_var` 变成 `unsafe fn` —— workspace lint 里
+`unsafe_code = "deny"`，整个项目**零 `unsafe`**，也没有 `set_var`/`gen` 这类用法。
+
+**但 clippy 多报了 7 条 `collapsible_if`**：edition 2024 稳定了 **let-chains**
+（`if let Some(x) = a && cond`），原先写不出来的合并形式现在可以写了，于是嵌套判断被判为可折叠。
+7 处已按 clippy 的建议合并：
+
+| 文件 | 位置 |
+|---|---|
+| `qqbot-api/src/client.rs` | `fetch_token` / `decode_response` 里的错误码判断 |
+| `qqbot-store/src/schema.rs` | `open` 里建目录前的两级判断 |
+| `qqbot-core/src/session.rs` | `expire_window`、被动窗口过期后的重试分支 |
+| `qqbot-render/src/service.rs` | 两处缓存命中判断 |
+
+**resolver 2 → 3**：edition 2024 隐含的就是 resolver 3，它会按 `rust-version` 挑依赖版本。
+切换时 `Cargo.lock` **逐字节未变**（SHA256 一致），说明当前依赖图本来就满足 MSRV 1.88，
+所以这是一次零风险的顺带对齐。
+
+**rusqlite 0.37 → 0.40.2 也没有改代码**。逐条核过 0.38/0.39/0.40 的破坏性变更，与本项目相关的只有两条：
+「默认关掉 `u64`/`usize` 的 `ToSql`/`FromSql`」—— 本项目所有 SQL 参数都是 `i64`/`String`/`&str`，
+不受影响；「语句缓存变成可选特性」—— `cache` 在 0.40.2 的**默认特性**里，`prepare_cached` 照常可用。
+
+> ⚠️ **本项目不使用 rustfmt**。`cargo fmt --check` 会标记几乎每一个文件（现有风格与 rustfmt 默认值不同，
+> 例如结构体字面量习惯写成一行）。上面 7 处 let-chain 的缩进是**手写对齐**的 ——
+> **不要跑 `cargo fmt --all`**，否则会产生一个覆盖全仓库的巨大 diff。
+
 ### rust-skills 审计与修复（2026-09-29）
 
 用 [rust-skills](https://github.com/leonardomso/rust-skills)（265 条规则 / 26 类别）对整个 workspace 做了一轮逐 crate 审计，

@@ -151,14 +151,12 @@ impl TokenProvider {
             ))
         })?;
 
-        if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
-            if code != 0 {
-                return Err(ApiError::Business {
-                    code,
-                    message: v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
-                    trace_id: None,
-                });
-            }
+        if let Some(code) = v.get("code").and_then(|c| c.as_i64()) && code != 0 {
+            return Err(ApiError::Business {
+                code,
+                message: v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+                trace_id: None,
+            });
         }
 
         let token = v
@@ -845,16 +843,14 @@ pub fn decode_response<T: DeserializeOwned>(
         })?
     };
 
-    if let Some(code) = v.get("err_code").and_then(|c| c.as_i64()) {
-        if code != 0 {
-            return Err(ApiError::Business {
-                code,
-                message: v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
-                trace_id: trace.or_else(|| {
-                    v.get("trace_id").and_then(|t| t.as_str()).map(str::to_string)
-                }),
-            });
-        }
+    if let Some(code) = v.get("err_code").and_then(|c| c.as_i64()) && code != 0 {
+        return Err(ApiError::Business {
+            code,
+            message: v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+            trace_id: trace.or_else(|| {
+                v.get("trace_id").and_then(|t| t.as_str()).map(str::to_string)
+            }),
+        });
     }
 
     if !(200..300).contains(&status) {

@@ -36,11 +36,9 @@ CREATE TABLE IF NOT EXISTS meta (
 
 /// 打开（必要时创建）数据库并应用 PRAGMA。
 pub fn open(path: &Path) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建数据库目录 {} 失败", parent.display()))?;
-        }
+    if let Some(parent) = path.parent() && !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建数据库目录 {} 失败", parent.display()))?;
     }
     let conn = Connection::open(path)
         .with_context(|| format!("打开数据库 {} 失败", path.display()))?;

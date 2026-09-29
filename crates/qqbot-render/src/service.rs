@@ -205,12 +205,10 @@ impl RenderService {
         let key = cache_key(&req.source, scale);
         let use_cache = req.cache;
 
-        if use_cache {
-            if let Some(hit) = self.cache.get(&key) {
-                self.metrics.hits.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!("qqbot_render_cache_total", "result" => "hit").increment(1);
-                return Ok((*hit).clone());
-            }
+        if use_cache && let Some(hit) = self.cache.get(&key) {
+            self.metrics.hits.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("qqbot_render_cache_total", "result" => "hit").increment(1);
+            return Ok((*hit).clone());
         }
 
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -243,12 +241,10 @@ async fn dispatcher(
     metrics: Arc<Metrics>,
 ) {
     while let Some(job) = rx.recv().await {
-        if job.request.cache {
-            if let Some(hit) = cache.get(&job.key) {
-                metrics.hits.fetch_add(1, Ordering::Relaxed);
-                let _ = job.ack.send(Ok((*hit).clone()));
-                continue;
-            }
+        if job.request.cache && let Some(hit) = cache.get(&job.key) {
+            metrics.hits.fetch_add(1, Ordering::Relaxed);
+            let _ = job.ack.send(Ok((*hit).clone()));
+            continue;
         }
         metrics.misses.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("qqbot_render_cache_total", "result" => "miss").increment(1);

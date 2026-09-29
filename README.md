@@ -237,6 +237,9 @@ cargo run -p qqbot-store --example seed -- data/qqbot.db 400 "旧消息"
 
 ## 部署
 
+需要 **Rust 1.88+**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取较高者）。
+SQLite 走 `rusqlite` 的 `bundled` 特性，源码随依赖一起编译，**无需预装 SQLite**。
+
 ```bash
 cargo build --release
 ./target/release/qqbot

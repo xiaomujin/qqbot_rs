@@ -207,10 +207,8 @@ impl SessionState {
 
     /// 丢弃过期的被动窗口。
     pub fn expire_window(&mut self, now: Instant) {
-        if let Some(w) = &self.window {
-            if now >= w.deadline {
-                self.window = None;
-            }
+        if let Some(w) = &self.window && now >= w.deadline {
+            self.window = None;
         }
     }
 }
@@ -422,34 +420,32 @@ async fn handle_send(
 
     // 2) 服务端判定被动窗口已过期（err_code 40034005）：清掉本地窗口后改用主动消息重试一次。
     //    本地时钟与服务端存在偏差时，这一步能避免直接丢消息。
-    if let Err(err) = &result {
-        if err.is_passive_expired() && message.msg_id.is_some() {
-            tracing::warn!(key, "被动回复窗口已被服务端判定过期，改用主动消息重试");
+    if let Err(err) = &result && err.is_passive_expired() && message.msg_id.is_some() {
+        tracing::warn!(key, "被动回复窗口已被服务端判定过期，改用主动消息重试");
 
-            let retry_now = Instant::now();
-            let allowed = {
-                let state = states
-                    .entry(key.to_string())
-                    .or_insert_with(|| SessionState::new(is_group, retry_now));
-                state.expire_window(retry_now);
-                state.try_active(retry_now)
-            };
-            if !allowed {
-                metrics::counter!("qqbot_send_rejected_total", "reason" => "quota_after_expired").increment(1);
-                return Err(CoreError::QuotaExceeded);
-            }
-
-            let mut retry = request.body.to_out_message();
-            retry.event_id = request.event_id.clone();
-            metrics::counter!("qqbot_send_total", "mode" => "active_retry", "kind" => request.body.kind())
-                .increment(1);
-
-            let retry_result = api.send_message(&request.target, &retry).await;
-            if let Err(e) = &retry_result {
-                tracing::warn!(key, error = %e, "主动消息重试仍失败");
-            }
-            return retry_result.map_err(CoreError::Api);
+        let retry_now = Instant::now();
+        let allowed = {
+            let state = states
+                .entry(key.to_string())
+                .or_insert_with(|| SessionState::new(is_group, retry_now));
+            state.expire_window(retry_now);
+            state.try_active(retry_now)
+        };
+        if !allowed {
+            metrics::counter!("qqbot_send_rejected_total", "reason" => "quota_after_expired").increment(1);
+            return Err(CoreError::QuotaExceeded);
         }
+
+        let mut retry = request.body.to_out_message();
+        retry.event_id = request.event_id.clone();
+        metrics::counter!("qqbot_send_total", "mode" => "active_retry", "kind" => request.body.kind())
+            .increment(1);
+
+        let retry_result = api.send_message(&request.target, &retry).await;
+        if let Err(e) = &retry_result {
+            tracing::warn!(key, error = %e, "主动消息重试仍失败");
+        }
+        return retry_result.map_err(CoreError::Api);
     }
 
     match &result {

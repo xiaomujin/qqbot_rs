@@ -1,5 +1,7 @@
 # cq-bot → qqbot 迁移优先级
 
+> **进度与勾选见 [migration-checklist.md](migration-checklist.md)** —— 本文件只讲「为什么这么排」。
+>
 > 对 [xiaomujin/cq-bot](https://github.com/xiaomujin/cq-bot)（Java 25 + Spring Boot + Shiro，OneBot v11 反向 WS）
 > 的业务功能盘点，以及迁移到本项目（QQ 官方 API v2，Rust）的优先级排序。
 > 盘点基于 `master` 分支逐文件阅读，141 个 Java 文件、24 条触发正则、4 张 SQLite 表。

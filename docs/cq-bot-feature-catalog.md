@@ -1,6 +1,8 @@
 # cq-bot 功能全清单（迁移选择用）
 
 > 源项目 [xiaomujin/cq-bot](https://github.com/xiaomujin/cq-bot) 的**全部业务功能**，逐条摊平，供勾选。
+>
+> 已经定下范围与进度：见 **[migration-checklist.md](migration-checklist.md)**（保留 36 项 / 不做 16 项）。
 > 触发列写的是**源项目的实际触发方式**；本项目已开启群聊全量消息模式，因此这些触发**可以原样保留**。
 
 ---

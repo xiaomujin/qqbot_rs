@@ -89,7 +89,17 @@ async fn self_test() -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
 
     let started = Instant::now();
-    let render = RenderService::new(RenderConfig::default());
+    // 自检是**诊断工具**，不是生产路径，所以超时给得很宽。
+    //
+    // 默认的 5 秒是照 release 的预算定的（词云 88ms），而 debug 下词云要
+    // 2.7 秒左右 —— 只有 1.8 倍余量。机器稍微忙一点（比如机器人正在跑）
+    // 就会超时，于是自检报「渲染超时」，看起来像代码坏了，其实只是慢。
+    //
+    // 放宽之后，自检失败就真的意味着「渲染不出来」而不是「机器忙」。
+    let render = RenderService::new(RenderConfig {
+        timeout: std::time::Duration::from_secs(120),
+        ..RenderConfig::default()
+    });
     println!("渲染服务就绪（初始化 {:?}）", started.elapsed());
 
     // ---- 1) 内置模板 ----

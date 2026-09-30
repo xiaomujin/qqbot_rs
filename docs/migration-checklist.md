@@ -332,21 +332,64 @@ cq-bot 那边是对整条消息做 `contains("地图")` + `contains("海关")`�
 **需要你提供带 `SESSDATA` 的 Cookie**（放进 `config.toml`，不要提交）。
 只有登录会话才能过这层风控。
 
-### D5 永劫无间 —— 等你的 Cookie
+### D5 永劫无间 —— 上游已整体下线
 
-cq-bot 里那个 session 是**别人账号**的，且接口路径已变（返回 404）。
-需要你自己登录后提供 Cookie。
+cq-bot 用的是 `record.uu.163.com/api/naraka/{auth,career}`。现在：
+
+```
+GET /api/naraka/auth/<名>/163   → 404 {"code":1012,"msg":"not found"}
+```
+
+**不是路径写错，是整个站换掉了。** `record.uu.163.com/naraka/` 现在返回的是
+**UU 加速器主应用**的壳（1554 字节），它的 JS bundle（`app.66d04c90.js`）里
+全是 `/young/auth/`、`/api/login/status` 这些加速器接口，
+`career` / `role_name` / `season` 这些词一个都搜不到。
+
+试过 8 个候选路径（`/api/naraka/v2/...`、`/api/v2/naraka/...`、
+`/api/record/naraka/...`、`/api/naraka/role/...`、`/api/naraka/season` 等），
+全部 404。
+
+**所以给 Cookie 也没用** —— 需要的是一个新的战绩数据源。
+cq-bot 里那个 session 本来也是**别人账号**的，不该用。
 
 ### D1–D4 三角洲 —— 上游现在要求登录
 
 `kkrb.net` 的 `getOVData` 一律返回 `-101 系统繁忙`，`isLoggedIn` 为 false。
 需要该站的账号，或等它放开。
 
-### F2 搜图 / E6 摸鱼日历 —— 上游已加反爬或已死
+### F2 搜图 —— 网络层被挡，不是代码问题
 
-这两项**不建议再接**：
-F2 的两个上游都连不上、E6 的三个源全部失效。
-除非找到稳定且允许抓取的替代源，否则保持不做。
+`saucenao.com` 与 `ascii2d.net` 在本机一律 `fetch failed`。
+
+**排除了 DNS 与 IPv6 两个常见嫌疑**：
+
+| 检查 | 结果 |
+|---|---|
+| 解析到 IPv6 | 是（`2606:4700::`，Cloudflare） |
+| 解析到 IPv4 | **也解析得到**（`104.26.15.28` 等） |
+| 直连 IPv4 | **仍然失败** |
+
+两家都挂在 Cloudflare 后面，直连 IPv4 也不通，所以是**网络层的封锁**，
+换实现方式解决不了。除非有可用的代理出口，否则保持不做。
+
+### E6 摸鱼日历 —— 试过的源全部失效
+
+cq-bot 用的三个（`api.52vmy.cn` / `api.vvhan.com` / `api.j4u.ink`）已全废。
+本轮又试了 5 个常见替代，**没有一个可用**：
+
+| 源 | 结果 |
+|---|---|
+| `api.oioweb.cn/api/common/Moyu` | 连不上 |
+| `api.pearktrue.cn/api/moyu/` | 连不上 |
+| `api.qqsuu.cn/api/dm-moyu` | 声称 `image/png`，**实际返回 PHP 报错 HTML**（上游 SSL 校验失败） |
+| `api.dujin.org/pic/moyu/` | 404 |
+| `api.xygeng.cn/one/moyu` | `{"code":500}` |
+
+`api.qqsuu.cn` 那条值得记一笔：**它 `Content-Type` 撒谎**，
+按图片下载会得到 801 字节的 HTML。这类源即使暂时能用也不可靠。
+
+本项的图片下载 → 上传 → 发送链路本身没问题（E5 日报就是这条路），
+**缺的只是一个稳定的图源**。
 
 ---
 

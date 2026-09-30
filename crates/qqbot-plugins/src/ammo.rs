@@ -140,10 +140,6 @@ pub fn query_tokens(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 口径键转可读文本：`Caliber556x45NATO` → `556x45NATO`。
-pub fn readable_caliber(raw: &str) -> String {
-    raw.strip_prefix("Caliber").unwrap_or(raw).to_string()
-}
 
 /// 卡片行：左边名称，右边三项关键数值。
 pub fn format_rows(items: &[Ammo]) -> Vec<serde_json::Value> {
@@ -367,9 +363,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn caliber_key_is_readable() {
-        assert_eq!(readable_caliber("Caliber556x45NATO"), "556x45NATO");
-        assert_eq!(readable_caliber("545x39"), "545x39");
-    }
 }

@@ -106,7 +106,10 @@ pub fn is_item_id(raw: &str) -> bool {
 
 /// 价格写成「万」，否则六位数看不过来。
 pub fn format_price(value: i64) -> String {
-    if value.abs() >= 10_000 {
+    // `unsigned_abs` 而不是 `abs`：`i64::MIN.abs()` 在 debug 下会 panic。
+    // 价格当然不可能是 i64::MIN，但一个会在越界输入上 panic 的格式化函数
+    // 没有理由留着 —— 它迟早会被用在别的地方。
+    if value.unsigned_abs() >= 10_000 {
         format!("{:.2}万", value as f64 / 10_000.0)
     } else {
         value.to_string()

@@ -162,6 +162,43 @@ pub struct TarkovItem {
     pub weight: f64,
 }
 
+/// 拼出「按 slug 片段检索」的 SQL 与参数。
+///
+/// 弹药 / 任务 / 物品三个检索方法本来各抄了一遍同样的拼装逻辑，
+/// 连 `for i in 0..tokens.len()` 都一模一样。抽出来之后，
+/// 加一个新的可检索表只需要写它自己的列映射。
+///
+/// `select` 必须是**本文件里的常量**，绝不能来自外部输入 ——
+/// 它会被直接拼进 SQL。
+fn like_query(
+    select: &str,
+    tokens: &[String],
+    limit: usize,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = format!("{select} WHERE 1 = 1");
+    for (i, _) in tokens.iter().enumerate() {
+        let _ = write!(sql, " AND normalized_name LIKE ?{}", i + 1);
+    }
+    let _ = write!(sql, " ORDER BY normalized_name LIMIT ?{}", tokens.len() + 1);
+
+    let mut params: Vec<rusqlite::types::Value> = tokens
+        .iter()
+        .map(|t| rusqlite::types::Value::Text(format!("%{t}%")))
+        .collect();
+    params.push(rusqlite::types::Value::Integer(limit as i64));
+    (sql, params)
+}
+
+const SELECT_AMMO: &str = "SELECT id, normalized_name, caliber, damage, penetration_power, \
+     armor_damage, fragmentation_chance, initial_speed, projectile_count, tracer, base_price \
+     FROM ammo";
+
+const SELECT_TASKS: &str = "SELECT id, normalized_name, trader, min_level, is_kappa, \
+     is_lightkeeper, experience, objectives, wiki_link FROM tarkov_task";
+
+const SELECT_ITEMS: &str = "SELECT id, normalized_name, base_price, last_low_price, \
+     avg24h_price, low24h_price, high24h_price, weight FROM tarkov_item";
+
 /// 从一行读出物品。三个查询共用同一段列映射，列顺序必须与 SQL 里一致。
 fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<TarkovItem> {
     Ok(TarkovItem {
@@ -495,28 +532,13 @@ impl ResourceStore {
         limit: usize,
     ) -> Result<Vec<TarkovItem>> {
         self.with(move |conn| {
-            let mut sql = String::from(
-                "SELECT id, normalized_name, base_price, last_low_price, avg24h_price, \
-                 low24h_price, high24h_price, weight FROM tarkov_item WHERE 1 = 1",
-            );
-            for i in 0..tokens.len() {
-                let _ = write!(sql, " AND normalized_name LIKE ?{}", i + 1);
-            }
-            let _ = write!(sql, " ORDER BY normalized_name LIMIT ?{}", tokens.len() + 1);
-
-            let mut params: Vec<rusqlite::types::Value> = tokens
-                .iter()
-                .map(|t| rusqlite::types::Value::Text(format!("%{t}%")))
-                .collect();
-            params.push(rusqlite::types::Value::Integer(limit as i64));
-
+            let (sql, params) = like_query(SELECT_ITEMS, &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params), read_item)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
+            // 必须先 collect 成 `rusqlite::Result` 再 `?`：
+            // `FromIterator<Result<T, E>>` 要求 E 与目标**完全一致**，
+            // 不会替我们把 rusqlite::Error 转成 anyhow::Error。
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         })
         .await
     }
@@ -527,8 +549,7 @@ impl ResourceStore {
         self.with(move |conn| {
             let found = conn
                 .query_row(
-                    "SELECT id, normalized_name, base_price, last_low_price, avg24h_price, \
-                     low24h_price, high24h_price, weight FROM tarkov_item WHERE id = ?1",
+                    &format!("{SELECT_ITEMS} WHERE id = ?1"),
                     rusqlite::params![id],
                     read_item,
                 )
@@ -587,21 +608,7 @@ impl ResourceStore {
         limit: usize,
     ) -> Result<Vec<TarkovTask>> {
         self.with(move |conn| {
-            let mut sql = String::from(
-                "SELECT id, normalized_name, trader, min_level, is_kappa, is_lightkeeper, \
-                 experience, objectives, wiki_link FROM tarkov_task WHERE 1 = 1",
-            );
-            for i in 0..tokens.len() {
-                let _ = write!(sql, " AND normalized_name LIKE ?{}", i + 1);
-            }
-            let _ = write!(sql, " ORDER BY normalized_name LIMIT ?{}", tokens.len() + 1);
-
-            let mut params: Vec<rusqlite::types::Value> = tokens
-                .iter()
-                .map(|t| rusqlite::types::Value::Text(format!("%{t}%")))
-                .collect();
-            params.push(rusqlite::types::Value::Integer(limit as i64));
-
+            let (sql, params) = like_query(SELECT_TASKS, &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
                 Ok(TarkovTask {
@@ -616,11 +623,10 @@ impl ResourceStore {
                     wiki_link: r.get(8)?,
                 })
             })?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
+            // 必须先 collect 成 `rusqlite::Result` 再 `?`：
+            // `FromIterator<Result<T, E>>` 要求 E 与目标**完全一致**，
+            // 不会替我们把 rusqlite::Error 转成 anyhow::Error。
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         })
         .await
     }
@@ -681,22 +687,7 @@ impl ResourceStore {
     /// `["545", "bp"]`，而 `545x39mm-bp` 两个都含。
     pub async fn search_ammo(&self, tokens: Vec<String>, limit: usize) -> Result<Vec<Ammo>> {
         self.with(move |conn| {
-            let mut sql = String::from(
-                "SELECT id, normalized_name, caliber, damage, penetration_power, armor_damage, \
-                 fragmentation_chance, initial_speed, projectile_count, tracer, base_price \
-                 FROM ammo WHERE 1 = 1",
-            );
-            for i in 0..tokens.len() {
-                let _ = write!(sql, " AND normalized_name LIKE ?{}", i + 1);
-            }
-            let _ = write!(sql, " ORDER BY normalized_name LIMIT ?{}", tokens.len() + 1);
-
-            let mut params: Vec<rusqlite::types::Value> = tokens
-                .iter()
-                .map(|t| rusqlite::types::Value::Text(format!("%{t}%")))
-                .collect();
-            params.push(rusqlite::types::Value::Integer(limit as i64));
-
+            let (sql, params) = like_query(SELECT_AMMO, &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
                 Ok(Ammo {
@@ -713,11 +704,10 @@ impl ResourceStore {
                     base_price: r.get(10)?,
                 })
             })?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
+            // 必须先 collect 成 `rusqlite::Result` 再 `?`：
+            // `FromIterator<Result<T, E>>` 要求 E 与目标**完全一致**，
+            // 不会替我们把 rusqlite::Error 转成 anyhow::Error。
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         })
         .await
     }

@@ -133,16 +133,19 @@ pub fn format_rows(items: &[TarkovTask]) -> Vec<serde_json::Value> {
     items
         .iter()
         .map(|t| {
-            let mut parts: Vec<String> = Vec::new();
+            // `&str` 而不是 `String`：这几个片段要么是借用，要么是字面量，
+            // 只有等级需要一次格式化，没必要每个都分配。
+            let level = format!("{}级", t.min_level);
+            let mut parts: Vec<&str> = Vec::new();
             if !t.trader.is_empty() {
-                parts.push(t.trader.clone());
+                parts.push(&t.trader);
             }
-            parts.push(format!("{}级", t.min_level));
+            parts.push(&level);
             if t.is_kappa {
-                parts.push("卡帕".to_string());
+                parts.push("卡帕");
             }
             if t.is_lightkeeper {
-                parts.push("灯塔".to_string());
+                parts.push("灯塔");
             }
             json!({ "label": t.normalized_name, "value": parts.join(" · ") })
         })

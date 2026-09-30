@@ -3,7 +3,12 @@
 //! 数据来自 `json.tarkov.dev/regular/tasks` + `/traders` —— 与弹药（B6）同一份
 //! 静态 JSON，GraphQL 后端挂掉时照样能用。
 //!
-//! ⚠️ **名字是英文 slug 而不是中文**，原因同 `ammo.rs`：静态 JSON 的 `name` 是
+//! **中文名尽力而为地取自 GraphQL。** cq-bot 的 `QUERY_TASKS` 就是
+//! `tasks(lang: zh)`，打的是同一个 `api.tarkov.dev/graphql`。
+//! 那个后端自 2026-09 起对所有查询返回 422，所以这一步失败是**正常情况**：
+//! 失败就退回只有 slug 的静态 JSON，其它字段一个不少。
+//!
+//! ⚠️ **GraphQL 不可用时名字只有英文 slug**，原因同 `ammo.rs`：静态 JSON 的 `name` 是
 //! 翻译键。这里用 `normalizedName`（`gunsmith-part-1`）与商人的 `normalizedName`
 //! （`prapor`）。**任务目标的文字也是翻译键**，所以只存条数、不存文字。
 
@@ -26,6 +31,10 @@ const MAX_ROWS: usize = 14;
 pub struct TaskConfig {
     pub tasks_url: String,
     pub traders_url: String,
+    /// 中文名的来源。与 cq-bot 的 `QUERY_TASKS` 同一个接口。
+    ///
+    /// 它挂着的时候（2026-09 起一直 422）任务只有 slug，检索仍然可用。
+    pub graphql_url: String,
     pub store: Option<Arc<ResourceStore>>,
 }
 
@@ -34,6 +43,7 @@ impl Default for TaskConfig {
         Self {
             tasks_url: "https://json.tarkov.dev/regular/tasks".into(),
             traders_url: "https://json.tarkov.dev/regular/traders".into(),
+            graphql_url: "https://api.tarkov.dev/graphql".into(),
             store: None,
         }
     }
@@ -69,6 +79,53 @@ struct TaskEntry {
     objectives: Vec<serde_json::Value>,
     #[serde(default, rename = "wikiLink")]
     wiki_link: String,
+}
+
+/// 只要 id 与中文名。cq-bot 的 `QUERY_TASKS` 也是 `tasks(lang: zh)`。
+const QUERY_TASK_NAMES: &str = "{ tasks(lang: zh) { id name } }";
+
+#[derive(Debug, Deserialize)]
+struct NamesResponse {
+    #[serde(default)]
+    data: Option<NamesData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamesData {
+    #[serde(default)]
+    tasks: Vec<NameEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NameEntry {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// 把 GraphQL 返回的中文名并进任务表，返回填上了几条。
+///
+/// 按 **id** 对齐而不是按名字 —— 名字正是这里要替换的东西。
+/// 对不上的条目保持 `None`（上游加了新任务而我们还没同步时会这样）。
+pub fn merge_names(tasks: &mut [TarkovTask], body: &str) -> Result<usize, String> {
+    let parsed: NamesResponse =
+        serde_json::from_str(body).map_err(|err| format!("解析中文名失败：{err}"))?;
+    let names = parsed.data.ok_or("中文名响应缺少 data")?.tasks;
+    let map: HashMap<String, String> = names
+        .into_iter()
+        .filter(|n| !n.id.is_empty() && !n.name.trim().is_empty())
+        .map(|n| (n.id, n.name))
+        .collect();
+
+    let mut filled = 0;
+    for task in tasks.iter_mut() {
+        if let Some(zh) = map.get(&task.id) {
+            task.name_zh = Some(zh.clone());
+            filled += 1;
+        }
+    }
+    Ok(filled)
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +169,8 @@ pub fn parse_tasks(tasks_body: &str, traders_body: &str) -> Result<Vec<TarkovTas
             Some(TarkovTask {
                 id,
                 normalized_name,
+                // 中文名要另外去 GraphQL 取，这里先留空。
+                name_zh: None,
                 // 解析不到商人就留空：上游加新商人时不该让整个导入失败。
                 trader: trader_names.get(&task.trader).cloned().unwrap_or_default(),
                 min_level: task.min_player_level,
@@ -187,7 +246,7 @@ impl TaskPlugin {
             }
         };
 
-        let items = match parse_tasks(&tasks_body, &traders_body) {
+        let mut items = match parse_tasks(&tasks_body, &traders_body) {
             Ok(items) if !items.is_empty() => items,
             Ok(_) => {
                 let _ = ctx.reply_text("解析出 0 条任务，上游格式可能变了").await;
@@ -200,9 +259,25 @@ impl TaskPlugin {
             }
         };
 
+        // 中文名**尽力而为**：cq-bot 的 `QUERY_TASKS` 走的就是这个接口，
+        // 而它自 2026-09 起对所有查询返回 422。失败不影响其它字段。
+        let zh = match self.fetch_names().await {
+            Ok(body) => match merge_names(&mut items, &body) {
+                Ok(n) => format!("，其中 {n} 条带中文名"),
+                Err(reason) => {
+                    tracing::warn!(error = %reason, "任务中文名解析失败");
+                    "，中文名不可用".to_string()
+                }
+            },
+            Err(reason) => {
+                tracing::warn!(error = %reason, "任务中文名获取失败，只按 slug 检索");
+                "，中文名不可用".to_string()
+            }
+        };
+
         match store.replace_tasks(items).await {
             Ok(count) => {
-                let _ = ctx.reply_text(format!("任务数据已更新，共 {count} 条")).await;
+                let _ = ctx.reply_text(format!("任务数据已更新，共 {count} 条{zh}")).await;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "写入任务数据失败");
@@ -263,6 +338,25 @@ impl TaskPlugin {
             let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;
         }
         Handled::Consumed
+    }
+
+    /// 取中文名。**失败是预期内的** —— 那个后端一直在 422。
+    async fn fetch_names(&self) -> Result<String, String> {
+        let res = self
+            .http
+            .post(&self.config.graphql_url)
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({ "query": QUERY_TASK_NAMES }))
+            .send()
+            .await
+            .map_err(|err| format!("请求失败：{err}"))?;
+        let status = res.status();
+        let body = res.text().await.map_err(|err| format!("读取失败：{err}"))?;
+        if !status.is_success() {
+            let snippet: String = body.chars().take(120).collect();
+            return Err(format!("HTTP {status}：{snippet}"));
+        }
+        Ok(body)
     }
 
     async fn fetch(&self, url: &str) -> Result<String, String> {
@@ -376,6 +470,38 @@ mod tests {
         assert!(resolved > 400, "应当有四百个以上任务解析出商人，实际 {resolved}");
         let kappa = items.iter().filter(|t| t.is_kappa).count();
         assert!(kappa > 0, "应当有卡帕任务");
+    }
+
+    #[test]
+    fn merges_chinese_names_by_id() {
+        let mut items = parse_tasks(&tasks_json(), TRADERS).unwrap();
+        assert!(items.iter().all(|t| t.name_zh.is_none()), "静态 JSON 里没有中文");
+
+        // 形状照实测的 `tasks(lang: zh)` 响应。
+        let body = r#"{"data":{"tasks":[{"id":"k1","name":"彻夜难眠"},{"id":"k2","name":"第一梯队"}]}}"#;
+        assert_eq!(merge_names(&mut items, body).unwrap(), 2);
+
+        let by_slug = |s: &str| items.iter().find(|t| t.normalized_name == s).unwrap();
+        assert_eq!(by_slug("gunsmith-part-1").name_zh.as_deref(), Some("彻夜难眠"));
+        assert_eq!(by_slug("first-in-line").name_zh.as_deref(), Some("第一梯队"));
+    }
+
+    #[test]
+    fn merge_ignores_unknown_and_empty_entries() {
+        let mut items = parse_tasks(&tasks_json(), TRADERS).unwrap();
+        // 上游有而我们没有的 id、以及空名字，都该被忽略而不是写成空串。
+        let body = r#"{"data":{"tasks":[{"id":"不存在","name":"幽灵"},{"id":"k1","name":"   "},{"id":"k2","name":"第一梯队"}]}}"#;
+        assert_eq!(merge_names(&mut items, body).unwrap(), 1);
+        let by_slug = |s: &str| items.iter().find(|t| t.normalized_name == s).unwrap();
+        assert_eq!(by_slug("first-in-line").name_zh.as_deref(), Some("第一梯队"));
+        assert!(by_slug("gunsmith-part-1").name_zh.is_none(), "空名字不该写成空串");
+    }
+
+    #[test]
+    fn merge_reports_broken_input() {
+        let mut items = parse_tasks(&tasks_json(), TRADERS).unwrap();
+        assert!(merge_names(&mut items, "不是 JSON").is_err());
+        assert!(merge_names(&mut items, r#"{"data":null}"#).is_err());
     }
 
     #[test]

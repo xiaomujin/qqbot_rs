@@ -136,6 +136,11 @@ pub struct TarkovTask {
     pub id: String,
     /// 可读 slug，如 `gunsmith-part-1`。
     pub normalized_name: String,
+    /// 中文名，来自 GraphQL 的 `tasks(lang: zh)`。
+    ///
+    /// `None` 表示那个后端不可用（它 2026-09 起对所有查询返回 422），
+    /// 此时只能按 slug 检索。
+    pub name_zh: Option<String>,
     /// 商人的可读 slug，如 `prapor`。
     pub trader: String,
     pub min_level: i64,
@@ -170,14 +175,24 @@ pub struct TarkovItem {
 ///
 /// `select` 必须是**本文件里的常量**，绝不能来自外部输入 ——
 /// 它会被直接拼进 SQL。
+///
+/// `columns` 里多个列之间是 **OR** —— 任务既有英文 slug 又有中文名，
+/// 用户打哪个都该查到。多个 token 之间仍然是 AND。
+///
+/// 同一个 token 的多个列**复用同一个占位符**，所以参数个数还是每个 token 一个。
 fn like_query(
     select: &str,
+    columns: &[&str],
     tokens: &[String],
     limit: usize,
 ) -> (String, Vec<rusqlite::types::Value>) {
     let mut sql = format!("{select} WHERE 1 = 1");
     for (i, _) in tokens.iter().enumerate() {
-        let _ = write!(sql, " AND normalized_name LIKE ?{}", i + 1);
+        let clause: Vec<String> = columns
+            .iter()
+            .map(|c| format!("{c} LIKE ?{}", i + 1))
+            .collect();
+        let _ = write!(sql, " AND ({})", clause.join(" OR "));
     }
     let _ = write!(sql, " ORDER BY normalized_name LIMIT ?{}", tokens.len() + 1);
 
@@ -193,7 +208,7 @@ const SELECT_AMMO: &str = "SELECT id, normalized_name, caliber, damage, penetrat
      armor_damage, fragmentation_chance, initial_speed, projectile_count, tracer, base_price \
      FROM ammo";
 
-const SELECT_TASKS: &str = "SELECT id, normalized_name, trader, min_level, is_kappa, \
+const SELECT_TASKS: &str = "SELECT id, normalized_name, name_zh, trader, min_level, is_kappa, \
      is_lightkeeper, experience, objectives, wiki_link FROM tarkov_task";
 
 const SELECT_ITEMS: &str = "SELECT id, normalized_name, base_price, last_low_price, \
@@ -532,7 +547,7 @@ impl ResourceStore {
         limit: usize,
     ) -> Result<Vec<TarkovItem>> {
         self.with(move |conn| {
-            let (sql, params) = like_query(SELECT_ITEMS, &tokens, limit);
+            let (sql, params) = like_query(SELECT_ITEMS, &["normalized_name"], &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params), read_item)?;
             // 必须先 collect 成 `rusqlite::Result` 再 `?`：
@@ -577,14 +592,15 @@ impl ResourceStore {
             tx.execute("DELETE FROM tarkov_task", [])?;
             {
                 let mut stmt = tx.prepare_cached(
-                    "INSERT OR REPLACE INTO tarkov_task(id, normalized_name, trader, min_level, \
+                    "INSERT OR REPLACE INTO tarkov_task(id, normalized_name, name_zh, trader, min_level, \
                      is_kappa, is_lightkeeper, experience, objectives, wiki_link) \
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 )?;
                 for t in &items {
                     stmt.execute(rusqlite::params![
                         t.id,
                         t.normalized_name,
+                        t.name_zh,
                         t.trader,
                         t.min_level,
                         t.is_kappa,
@@ -608,19 +624,20 @@ impl ResourceStore {
         limit: usize,
     ) -> Result<Vec<TarkovTask>> {
         self.with(move |conn| {
-            let (sql, params) = like_query(SELECT_TASKS, &tokens, limit);
+            let (sql, params) = like_query(SELECT_TASKS, &["normalized_name", "name_zh"], &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
                 Ok(TarkovTask {
                     id: r.get(0)?,
                     normalized_name: r.get(1)?,
-                    trader: r.get(2)?,
-                    min_level: r.get(3)?,
-                    is_kappa: r.get(4)?,
-                    is_lightkeeper: r.get(5)?,
-                    experience: r.get(6)?,
-                    objectives: r.get(7)?,
-                    wiki_link: r.get(8)?,
+                    name_zh: r.get(2)?,
+                    trader: r.get(3)?,
+                    min_level: r.get(4)?,
+                    is_kappa: r.get(5)?,
+                    is_lightkeeper: r.get(6)?,
+                    experience: r.get(7)?,
+                    objectives: r.get(8)?,
+                    wiki_link: r.get(9)?,
                 })
             })?;
             // 必须先 collect 成 `rusqlite::Result` 再 `?`：
@@ -687,7 +704,7 @@ impl ResourceStore {
     /// `["545", "bp"]`，而 `545x39mm-bp` 两个都含。
     pub async fn search_ammo(&self, tokens: Vec<String>, limit: usize) -> Result<Vec<Ammo>> {
         self.with(move |conn| {
-            let (sql, params) = like_query(SELECT_AMMO, &tokens, limit);
+            let (sql, params) = like_query(SELECT_AMMO, &["normalized_name"], &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
                 Ok(Ammo {
@@ -1045,6 +1062,7 @@ mod tests {
         TarkovTask {
             id: id.into(),
             normalized_name: slug.into(),
+            name_zh: None,
             trader: trader.into(),
             min_level: level,
             is_kappa: level > 40,
@@ -1120,6 +1138,27 @@ mod tests {
         let slick = s.search_items(vec!["slick".into()], 10).await.unwrap();
         assert_eq!(slick[0].avg24h_price, None);
         assert_eq!(slick[0].base_price, 1000, "商人价仍在");
+    }
+
+    /// 中文名与英文 slug 都要能查到 —— 用户打哪个取决于上游有没有语言包。
+    #[tokio::test]
+    async fn task_search_matches_both_slug_and_chinese_name() {
+        let s = store();
+        let mut a = task("k1", "first-in-line", "prapor", 1);
+        a.name_zh = Some("彻夜难眠".into());
+        let b = task("k2", "gunsmith-part-1", "mechanic", 5);
+        s.replace_tasks(vec![a, b]).await.unwrap();
+
+        // 英文 slug
+        assert_eq!(s.search_tasks(vec!["first".into()], 10).await.unwrap().len(), 1);
+        // 中文名
+        let zh = s.search_tasks(vec!["彻夜".into()], 10).await.unwrap();
+        assert_eq!(zh.len(), 1, "中文名也要能查到: {zh:?}");
+        assert_eq!(zh[0].normalized_name, "first-in-line");
+        // 没有中文名的条目不受影响
+        assert_eq!(s.search_tasks(vec!["gunsmith".into()], 10).await.unwrap().len(), 1);
+        // 查不到就是空
+        assert!(s.search_tasks(vec!["不存在".into()], 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

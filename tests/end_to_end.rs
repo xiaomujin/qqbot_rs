@@ -313,6 +313,13 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path == "/daily-long.png" {
         return ("200 OK", "FAKE-DAILY-LONG-IMAGE".to_string());
     }
+    // 塔科夫 GraphQL：只用来取任务中文名（cq-bot 的 `tasks(lang: zh)`）。
+    if path == "/graphql" {
+        return (
+            "200 OK",
+            json!({ "data": { "tasks": [{ "id": "k1", "name": "彻夜难眠" }] } }).to_string(),
+        );
+    }
     // 塔科夫静态 JSON：任务与商人。
     if path.starts_with("/regular/tasks") {
         return (
@@ -557,6 +564,7 @@ async fn build_stack_with(
             task: qqbot_plugins::TaskConfig {
                 tasks_url: format!("{}/regular/tasks", mock.base_url()),
                 traders_url: format!("{}/regular/traders", mock.base_url()),
+                graphql_url: format!("{}/graphql", mock.base_url()),
                 store: None,
             },
         },
@@ -2484,19 +2492,60 @@ async fn chinese_query_explains_the_english_only_data() {
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        r#"{"id":"ZH_2","author":{"member_openid":"U1"},"content":"查任务 彻夜难眠","group_openid":"GZH"}"#,
+        // 用一个**确实不存在**的中文名：mock 的 GraphQL 会给 k1 中文名，
+        // 打那个名字是查得到的，测不到这条分支。
+        r#"{"id":"ZH_2","author":{"member_openid":"U1"},"content":"查任务 完全不存在的中文名","group_openid":"GZH"}"#,
     )
     .await;
 
     let send = mock
         .all(|h| h.path == "/v2/groups/GZH/messages")
         .into_iter()
-        .find(|h| h.body.contains("彻夜难眠") || h.body.contains("英文"))
+        .find(|h| h.body.contains("英文") || h.body.contains("不存在"))
         .expect("中文查询应当有回复");
     let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
     let text = body["content"].as_str().unwrap_or_default();
     assert!(text.contains("英文"), "要说清楚上游只有英文: {text}");
     assert!(!text.contains("用法"), "他打了参数，不能说用法错误: {text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 任务中文名：cq-bot 的 `QUERY_TASKS` 就是 `tasks(lang: zh)`，这里走同一条路。
+#[tokio::test]
+async fn task_chinese_names_come_from_graphql_and_are_searchable() {
+    let mock = MockServer::start().await;
+    let (dispatcher, store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"ZH_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新任务","group_openid":"GZH"}"#,
+    )
+    .await;
+
+    // 结构化数据来自静态 JSON，中文名来自 GraphQL —— 两者都到位。
+    let imported = store.search_tasks(vec!["彻夜".into()], 10).await.unwrap();
+    assert_eq!(imported.len(), 1, "中文名应当写进库: {imported:?}");
+    assert_eq!(imported[0].normalized_name, "gunsmith-part-1");
+    assert_eq!(imported[0].name_zh.as_deref(), Some("彻夜难眠"));
+    assert_eq!(imported[0].trader, "mechanic", "结构化字段一个都不能少");
+
+    // 用户发中文也能查到。
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"ZH_2","author":{"member_openid":"U1"},"content":"查任务 彻夜","group_openid":"GZH"}"#,
+    )
+    .await;
+    let hit = mock
+        .all(|h| h.path == "/v2/groups/GZH/messages")
+        .into_iter()
+        .any(|h| {
+            let b: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            b["msg_type"] == 7
+        });
+    assert!(hit, "中文查询应当出卡片，而不是「查不到」");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

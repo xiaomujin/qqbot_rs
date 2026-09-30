@@ -14,7 +14,8 @@ use rusqlite::Connection;
 /// v6 增加 `ammo`（塔科夫弹药数据，从 tarkov.dev 静态 JSON 导入）。
 /// v7 增加 `tarkov_task`（塔科夫任务数据，同一来源）。
 /// v8 增加 `tarkov_item`（塔科夫物品与跳蚤价格，同一来源）。
-pub const SCHEMA_VERSION: i64 = 8;
+/// v9 给 `tarkov_task` 加 `name_zh`（GraphQL `lang: zh` 的中文名）。
+pub const SCHEMA_VERSION: i64 = 9;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -133,6 +134,9 @@ CREATE TABLE IF NOT EXISTS tarkov_task (
     id              TEXT PRIMARY KEY,
     -- 可读 slug（`gunsmith-part-1`）。与弹药同理：`name` 是翻译键。
     normalized_name TEXT NOT NULL,
+    -- 中文名，来自 GraphQL 的 `tasks(lang: zh)`。
+    -- **可为空**：那个后端挂着的时候只有 slug 可用。
+    name_zh         TEXT,
     -- 商人的可读 slug（`prapor`），由 traders 表解析而来。
     trader          TEXT NOT NULL DEFAULT '',
     min_level       INTEGER NOT NULL DEFAULT 0,
@@ -145,6 +149,8 @@ CREATE TABLE IF NOT EXISTS tarkov_task (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tarkov_task_name ON tarkov_task(normalized_name);
+
+CREATE INDEX IF NOT EXISTS idx_tarkov_task_name_zh ON tarkov_task(name_zh);
 
 -- 塔科夫物品与跳蚤价格。价格字段可为 NULL —— 实测 5442 件里只有 3525 件有价。
 CREATE TABLE IF NOT EXISTS tarkov_item (
@@ -202,6 +208,10 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
 fn upgrade(conn: &Connection, from: i64) -> Result<()> {
     if from < 3 {
         add_column_if_missing(conn, "messages", "raw", "TEXT")?;
+    }
+    if from < 9 {
+        // 可空：GraphQL 挂着时这一列全是 NULL，检索要能接受。
+        add_column_if_missing(conn, "tarkov_task", "name_zh", "TEXT")?;
     }
     Ok(())
 }

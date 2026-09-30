@@ -1446,9 +1446,9 @@ async fn boss_chance_aggregates_by_map_and_averages() {
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        // 用 `boss刷` 而不是 `boss刷新率`：后者是 B9–B15 的静态图命令
-        // （cq-bot 里也是），这里要测的是实时数据那条路。
-        r#"{"id":"BOSS_1","author":{"member_openid":"U1"},"content":"boss刷","group_openid":"GB"}"#,
+        // 用 `boss刷新率`：它曾经被 B9–B15 的静态图截走，
+        // 现在归实时数据。这条测试盯的就是那个归属不再变回去。
+        r#"{"id":"BOSS_1","author":{"member_openid":"U1"},"content":"boss刷新率","group_openid":"GB"}"#,
     )
     .await;
 

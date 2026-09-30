@@ -44,11 +44,15 @@ pub const MAPS: &[(&str, &str)] = &[
 ];
 
 /// 命令 → 文件名。照抄 cq-bot 的各个分支。
+///
+/// **少了 cq-bot 的 `boss刷新率`。** 那张 `bossRefreshRate.png` 是张静态图，
+/// 而 B7 能给出**实时**的刷新率（`json.tarkov.dev` 的 `spawnChance`），
+/// 静态图没有存在意义 —— 所以 `boss刷新率` 让给实时数据，
+/// 那张图不再使用（文件留着不碍事）。
 pub const STATIC: &[(&str, &str)] = &[
     ("任务流程图", "TaskProcess.jpg"),
     ("任务物品图", "TaskItem.png"),
     ("信誉栏位图", "reputation.png"),
-    ("boss刷新率", "bossRefreshRate.png"),
     ("boss丢包时间", "bossLossWrap.png"),
     ("3x4道具", "3x4.png"),
     ("耳机强度", "headset.png"),
@@ -66,21 +70,15 @@ pub const STATIC: &[(&str, &str)] = &[
 ///
 /// 另外 7 个是整串精确匹配。
 ///
-/// ## `boss刷新率` 归谁
+/// ## `boss刷新率` 不在这里
 ///
-/// **cq-bot 自己在这里是歧义的**：它的实时刷新率正则
-/// `^(?i)(boss(刷|概))` 会连 `boss刷新率` 一起吞掉，
-/// 而 `TarKovMapPlugin` 又用 `startsWith("boss刷新率")` 发静态图 ——
-/// 谁先跑谁赢。
+/// cq-bot 在这件事上**自相矛盾**：它的实时刷新率正则 `^(?i)(boss(刷|概))`
+/// 会连 `boss刷新率` 一起吞掉，而 `TarKovMapPlugin` 又用
+/// `startsWith("boss刷新率")` 发静态图 —— 谁先跑谁赢。
 ///
-/// 这里按「两个功能都可达」来解：
-///
-/// | 输入 | 结果 |
-/// |---|---|
-/// | `boss刷新率` | 静态图（cq-bot 的文件名就叫 `bossRefreshRate.png`） |
-/// | `boss刷` / `boss概率` / `boss概览` | 实时数据（B7，它的正则本来就是宽松前缀） |
-///
-/// 也就是说 B7 的宽松前缀**不再吞掉**静态图那条命令，两边都留着。
+/// 这里**不做静态图**：B7 能给出实时的 `spawnChance`，
+/// 一张静态图没有存在意义。所以 `boss刷新率` / `boss刷` / `boss概`
+/// 全部交给 B7 的实时数据，本插件的 `resolve` 对它们一律返回 `None`。
 ///
 /// **要求「地图」两个字真的出现**，而不是像 cq-bot 那样只看名字 ——
 /// 否则群里说一句「海关」就会蹦出一张图。
@@ -175,7 +173,15 @@ mod tests {
         for (cmd, file) in STATIC {
             assert_eq!(resolve(cmd), Some(*file), "{cmd}");
         }
-        assert_eq!(STATIC.len(), 7);
+        assert_eq!(STATIC.len(), 6, "cq-bot 那张 bossRefreshRate.png 不再使用");
+    }
+
+    /// `boss刷新率` 归 B7 的实时数据，本插件不该截走它。
+    #[test]
+    fn boss_spawn_rate_is_left_to_the_live_data() {
+        for cmd in ["boss刷新率", "boss刷", "boss概", "boss概率", "boss概览"] {
+            assert_eq!(resolve(cmd), None, "{cmd} 应当交给 B7");
+        }
     }
 
     #[test]

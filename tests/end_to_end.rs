@@ -2099,3 +2099,30 @@ async fn delta_reports_upstream_code_failure() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// D4：一图流把三块数据渲染成**一张**分段卡片。
+#[tokio::test]
+async fn delta_overview_renders_one_sectioned_card() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DF_5","author":{"member_openid":"U1"},"content":"一图流","group_openid":"GDF5"}"#,
+    )
+    .await;
+
+    // 「一图流」顾名思义只发一张图：多发一张就白占一次被动回复配额。
+    let media = mock
+        .all(|h| h.path == "/v2/groups/GDF5/messages")
+        .into_iter()
+        .filter(|h| {
+            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            body["msg_type"] == 7
+        })
+        .count();
+    assert_eq!(media, 1, "应当只发一张卡片");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

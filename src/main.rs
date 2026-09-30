@@ -92,34 +92,46 @@ async fn self_test() -> Result<()> {
     let render = RenderService::new(RenderConfig::default());
     println!("渲染服务就绪（初始化 {:?}）", started.elapsed());
 
-    // ---- 1) 模板卡片 ----
-    let t0 = Instant::now();
-    let card = render
-        .render_template(
-            "card.svg",
-            serde_json::json!({
-                "title": "自检 · 模板渲染",
-                "rows": [
-                    {"label": "渲染后端", "value": "resvg (纯 Rust)"},
-                    {"label": "外部依赖", "value": "无 Chromium / 无 Node"},
-                    {"label": "中文字体", "value": "系统字体"},
-                    {"label": "输出倍率", "value": "2.0x"}
-                ],
-                "width": 720,
-                "height": 340
-            }),
-        )
-        .await
-        .context("模板渲染失败")?;
-    let card_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    std::fs::write(out_dir.join("card.png"), &card.png)?;
-    println!(
-        "✓ card.svg   {}x{}  {} 字节  {:.1}ms",
-        card.width,
-        card.height,
-        card.png.len(),
-        card_ms
-    );
+    // ---- 1) 内置模板 ----
+    //
+    // 逐个渲染**所有**内置模板，而不是只渲染 card.svg ——
+    // 否则新增一个模板而它语法有错时，自检照样「通过」，
+    // 一直到线上第一次用到它才炸。
+    //
+    // 数据里刻意带 `&` 与 `<>`：SVG 不转义会让 XML 解析失败，
+    // 而那是整张卡片渲染不出来、错误信息还看不出原因的一类 bug。
+    let data = serde_json::json!({
+        "title": "自检 · 模板渲染",
+        "rows": [
+            // 带 `section` 的行在 sections.svg 里当小标题渲染 ——
+            // 自检数据里留一条，否则那个分支永远没被看过。
+            {"section": true, "label": "分段标题"},
+            {"label": "外部依赖", "value": "无 Chromium / 无 Node"},
+            {"label": "转义自检", "value": "A&B <ok>"},
+            {"label": "输出倍率", "value": "2.0x"}
+        ],
+        "body": "转义自检：A&B <ok>",
+        "body_lines": ["转义自检：A&B <ok>", "第二行"],
+        "width": 720,
+        "height": 400
+    });
+    for (name, _) in qqbot_render::BUILTIN_TEMPLATES {
+        let t0 = Instant::now();
+        let out = render
+            .render_template(name, data.clone())
+            .await
+            .with_context(|| format!("模板 {name} 渲染失败"))?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let file = out_dir.join(name.replace(".svg", ".png"));
+        std::fs::write(&file, &out.png)?;
+        println!(
+            "✓ {name}  {}x{}  {} 字节  {:.1}ms",
+            out.width,
+            out.height,
+            out.png.len(),
+            ms
+        );
+    }
 
     // ---- 2) 词云（算法布局，非模板） ----
     // 刻意用长尾分布：字号按 sqrt(词频) 缩放、透明度同维度，

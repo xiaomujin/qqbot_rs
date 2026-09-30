@@ -1,0 +1,24 @@
+<!-- 分段卡片：rows 里带 `section: true` 的行当小标题渲染（左侧、无右值）。
+     与 card.svg 共用同一套 48px 行距，所以小标题也占一行 ——
+     这样 y 坐标只要 loop.index0 就够了，模板里不用维护游标。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="{{ width }}" height="{{ height }}" viewBox="0 0 {{ width }} {{ height }}">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="{{ width }}" height="{{ height }}" rx="24" fill="url(#bg)"/>
+  <rect x="0" y="0" width="{{ width }}" height="6" rx="3" fill="#38bdf8"/>
+  <text x="40" y="78" font-family="Microsoft YaHei, SimHei, sans-serif" font-size="36" font-weight="bold" fill="#7dd3fc">{{ title }}</text>
+  <line x1="40" y1="104" x2="{{ width - 40 }}" y2="104" stroke="#334155" stroke-width="2"/>
+{%- for row in rows %}
+{%- if row.section %}
+  <text x="40" y="{{ 156 + loop.index0 * 48 }}" font-family="Microsoft YaHei, SimHei, sans-serif" font-size="30" font-weight="bold" fill="#7dd3fc">{{ row.label }}</text>
+{%- else %}
+  <text x="40" y="{{ 156 + loop.index0 * 48 }}" font-family="Microsoft YaHei, SimHei, sans-serif" font-size="26" fill="#e2e8f0">{{ row.label }}</text>
+  <text x="{{ width - 40 }}" y="{{ 156 + loop.index0 * 48 }}" text-anchor="end" font-family="Microsoft YaHei, SimHei, sans-serif" font-size="26" font-weight="bold" fill="#38bdf8">{{ row.value }}</text>
+{%- endif %}
+{%- endfor %}
+  <text x="{{ width - 40 }}" y="{{ height - 24 }}" text-anchor="end" font-family="Microsoft YaHei, SimHei, sans-serif" font-size="18" fill="#64748b">{{ footer | default("qqbot") }}</text>
+</svg>

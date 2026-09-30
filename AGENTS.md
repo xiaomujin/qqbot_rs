@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 bin（`src/`） |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 408 项，全绿 |
+| 测试基线 | 413 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -31,7 +31,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | lint | `cargo clippy --workspace --all-targets` |
 | 测试 | `cargo test --workspace` |
 | release 构建 | `cargo build --release --workspace` |
-| 渲染自检（离线，无需网络与凭据） | `cargo run -- self-test` |
+| 渲染自检（离线，无需网络与凭据） | `cargo run -- self-test`（逐个渲染**所有**内置模板 + 词云） |
 | 凭据与网关连通性 | `cargo run -- check` |
 | 启动机器人 | `cargo run` |
 | 消息库统计 | `cargo run -p qqbot-store --example seed -- data/qqbot.db` |
@@ -222,7 +222,7 @@ cargo check -p qqbot
 | 插件对外 HTTP | `crates/qqbot-plugins/src/http.rs`（统一 20s 超时，**不要在插件里自建 `reqwest::Client`**） |
 | 插件配置 | 各插件自带 `XxxConfig`（如 `DailyConfig`），由 `PluginsConfig` 汇总传入 `register` |
 | 富媒体分片上传 / 秒传缓存 | `crates/qqbot-media/src/uploader.rs` |
-| 渲染服务、模板、词云布局 | `crates/qqbot-render/src/`。**SVG 模板必须转义**（`&` 不转义会让 XML 解析失败，整张卡片渲染不出来） |
+| 渲染服务、模板、词云布局 | `crates/qqbot-render/src/`（模板在 `templates/`，新增要加进 `BUILTIN_TEMPLATES`）。**SVG 模板必须转义**（`&` 不转义会让 XML 解析失败，整张卡片渲染不出来） |
 | 存储 schema / 读写线程 / 保留期 | `crates/qqbot-store/src/` |
 | 配置项与环境变量 | `src/config.rs`（新增键要同步 `config.example.toml`） |
 | 装配与事件主循环 | `src/main.rs` |

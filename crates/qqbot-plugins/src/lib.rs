@@ -165,11 +165,11 @@ pub async fn register(
 
     // 三角洲行动：集市 / 脑机 / 密码（D1–D3）。一图流见下。
     let delta = delta::DeltaPlugin::new(cfg.delta.clone(), http.clone());
-    for cmd in ["集市", "脑机", "密码"] {
+    for cmd in ["集市", "脑机", "密码", "一图流"] {
         router.on_any(Matcher::Command(cmd.into()), delta.clone());
     }
     // 带前缀的写法也认，避免与其它插件撞词。
-    for cmd in ["三角洲集市", "三角洲脑机", "三角洲密码"] {
+    for cmd in ["三角洲集市", "三角洲脑机", "三角洲密码", "三角洲一图流"] {
         router.on_listener(Matcher::Command(cmd.into()), delta.clone());
     }
 

@@ -191,6 +191,30 @@ fn market_rows(data: &DeltaData) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// 往 `rows` 里追加一个小标题与它下面的行；没有内容就整段不出现。
+///
+/// 空段落会留下一个孤零零的标题，比缺一段更难看。
+fn push_section(rows: &mut Vec<serde_json::Value>, name: &str, body: Vec<serde_json::Value>) {
+    if body.is_empty() {
+        return;
+    }
+    rows.push(json!({ "section": true, "label": name }));
+    rows.extend(body);
+}
+
+/// 一图流：把密码、集市、脑机拼成一张分段卡片。
+///
+/// cq-bot 是让 Puppeteer 截整个 `overview.html`；本项目**禁止引入 Chromium**
+/// （AGENTS.md 硬性禁令第 7 条，纯 Rust 光栅化是刻意的硬约束），
+/// 所以改成用同一份数据自己渲染 —— 内容一样，只是排版由我们决定。
+pub fn overview_rows(data: &DeltaData) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    push_section(&mut rows, "密码门", password_rows(data));
+    push_section(&mut rows, "集市", market_rows(data));
+    push_section(&mut rows, "脑机", container_rows(data));
+    rows
+}
+
 #[derive(Default)]
 struct DeltaState {
     /// 会话 cookie。握手时更新，之后所有请求复用。
@@ -290,7 +314,15 @@ impl DeltaPlugin {
         Ok(body)
     }
 
-    async fn render(&self, ctx: &Ctx, title: &str, rows: Vec<serde_json::Value>, footer: &str) {
+    /// `template` 是 `card.svg`（两列）或 `sections.svg`（带小标题）。
+    async fn render(
+        &self,
+        ctx: &Ctx,
+        template: &str,
+        title: &str,
+        rows: Vec<serde_json::Value>,
+        footer: &str,
+    ) {
         if rows.is_empty() {
             let _ = ctx.reply_text("上游没有返回数据，稍后再试").await;
             return;
@@ -303,7 +335,7 @@ impl DeltaPlugin {
             "height": height,
             "footer": footer,
         });
-        if let Err(err) = ctx.reply_template("card.svg", data).await {
+        if let Err(err) = ctx.reply_template(template, data).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "三角洲卡片发送失败");
             let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;
         }
@@ -364,14 +396,14 @@ impl Handler for DeltaPlugin {
                     .first()
                     .map(|m| format!("{} · {}", m.activity_name, m.activity_time))
                     .unwrap_or_default();
-                self.render(ctx, "三角洲集市", market_rows(&data), &footer).await;
+                self.render(ctx, "card.svg", "三角洲集市", market_rows(&data), &footer).await;
                 Handled::Consumed
             }
             "三角洲脑机" | "脑机" => {
                 let Some(data) = self.fetch_or_report(ctx).await else {
                     return Handled::Consumed;
                 };
-                self.render(ctx, "三角洲脑机", container_rows(&data), "容器消耗能量")
+                self.render(ctx, "card.svg", "三角洲脑机", container_rows(&data), "容器消耗能量")
                     .await;
                 Handled::Consumed
             }
@@ -380,7 +412,16 @@ impl Handler for DeltaPlugin {
                     return Handled::Consumed;
                 };
                 let footer = format!("更新于 {}", format_updated(&data.passwords.db.updated));
-                self.render(ctx, "三角洲密码门", password_rows(&data), &footer).await;
+                self.render(ctx, "card.svg", "三角洲密码门", password_rows(&data), &footer).await;
+                Handled::Consumed
+            }
+            "三角洲一图流" | "一图流" => {
+                let Some(data) = self.fetch_or_report(ctx).await else {
+                    return Handled::Consumed;
+                };
+                let footer = format!("更新于 {}", format_updated(&data.passwords.db.updated));
+                self.render(ctx, "sections.svg", "三角洲一图流", overview_rows(&data), &footer)
+                    .await;
                 Handled::Consumed
             }
             _ => Handled::Next,
@@ -470,6 +511,38 @@ mod tests {
     #[test]
     fn broken_json_is_an_error_not_a_panic() {
         assert!(parse_overview("不是 JSON").is_err());
+    }
+
+    #[test]
+    fn overview_puts_the_three_blocks_in_one_card() {
+        let data = parse_overview(FIXTURE).unwrap();
+        let rows = overview_rows(&data);
+        let sections: Vec<&str> = rows
+            .iter()
+            .filter(|r| r["section"] == true)
+            .map(|r| r["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(sections, vec!["密码门", "集市", "脑机"]);
+        // 小标题本身不带右值。
+        assert!(rows.iter().filter(|r| r["section"] == true).all(|r| r.get("value").is_none()));
+        // 三个小标题 + 5 密码 + 1 集市 + 2 脑机。
+        assert_eq!(rows.len(), 3 + 5 + 1 + 2);
+    }
+
+    #[test]
+    fn overview_skips_empty_sections() {
+        // 只有密码、没有集市与脑机时，不该留下两个孤零零的标题。
+        let data = parse_overview(FIXTURE).unwrap();
+        let mut sparse = data.clone();
+        sparse.market.clear();
+        sparse.containers.clear();
+        let rows = overview_rows(&sparse);
+        let sections: Vec<&str> = rows
+            .iter()
+            .filter(|r| r["section"] == true)
+            .map(|r| r["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(sections, vec!["密码门"]);
     }
 
     #[test]

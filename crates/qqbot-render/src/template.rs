@@ -6,6 +6,7 @@ use crate::error::RenderError;
 pub const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     ("card.svg", include_str!("../templates/card.svg")),
     ("notice.svg", include_str!("../templates/notice.svg")),
+    ("sections.svg", include_str!("../templates/sections.svg")),
 ];
 
 /// 极简模板引擎，只做 SVG 文本替换。
@@ -139,6 +140,48 @@ mod tests {
         assert!(svg.contains("A&amp;B"), "{svg}");
         assert!(svg.contains("x&lt;y"), "{svg}");
         assert!(!svg.contains("A&B"), "裸 & 会让 XML 解析失败: {svg}");
+    }
+
+    /// 分段卡片同样必须转义 —— 数据来自第三方接口，里面出现 `&` 完全可能。
+    #[test]
+    fn sections_template_escapes_and_marks_sections() {
+        let e = TemplateEngine::new();
+        let svg = e
+            .render(
+                "sections.svg",
+                &json!({
+                    "title": "三角洲",
+                    "rows": [
+                        { "section": true, "label": "密码门" },
+                        { "label": "零号大坝", "value": "05&33" },
+                    ],
+                    "width": 1000,
+                    "height": 300,
+                }),
+            )
+            .unwrap();
+        assert!(svg.contains("密码门"));
+        assert!(svg.contains("05&amp;33"), "分段卡片也要转义: {svg}");
+        assert!(!svg.contains("05&33"), "裸 & 会让 XML 解析失败: {svg}");
+    }
+
+    /// 缺 `section` 字段时按普通行渲染 —— MiniJinja 里未定义的键是假值。
+    #[test]
+    fn sections_template_treats_missing_flag_as_a_normal_row() {
+        let e = TemplateEngine::new();
+        let svg = e
+            .render(
+                "sections.svg",
+                &json!({
+                    "title": "t",
+                    "rows": [{ "label": "甲", "value": "乙" }],
+                    "width": 600,
+                    "height": 240,
+                }),
+            )
+            .unwrap();
+        assert!(svg.contains("甲"));
+        assert!(svg.contains("乙"));
     }
 
     #[test]

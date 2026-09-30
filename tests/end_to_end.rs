@@ -39,6 +39,8 @@ struct MockInner {
     fail_first_sends: usize,
     /// `/regular/maps` 是否返回上游故障。
     fail_maps: AtomicBool,
+    /// 三角洲接口是否返回上游的 `code=-101`（模拟未握手 / 系统繁忙）。
+    delta_busy: AtomicBool,
     /// BA 图片接口是否返回「模糊搜索」（code 101）。
     ba_fuzzy: AtomicBool,
     /// 番剧更新页是否返回一个解析不出条目的页面（模拟站点改版）。
@@ -57,7 +59,13 @@ impl MockServer {
     }
 
     fn builder() -> MockBuilder {
-        MockBuilder { fail_first_sends: 0, fail_maps: false, ba_fuzzy: false, bangumi_empty: false }
+        MockBuilder {
+        fail_first_sends: 0,
+        fail_maps: false,
+        delta_busy: false,
+        ba_fuzzy: false,
+        bangumi_empty: false,
+    }
     }
 
     fn base_url(&self) -> String {
@@ -80,6 +88,7 @@ impl MockServer {
 struct MockBuilder {
     fail_first_sends: usize,
     fail_maps: bool,
+    delta_busy: bool,
     ba_fuzzy: bool,
     bangumi_empty: bool,
 }
@@ -92,6 +101,11 @@ impl MockBuilder {
 
     fn fail_maps(mut self, on: bool) -> Self {
         self.fail_maps = on;
+        self
+    }
+
+    fn delta_busy(mut self, on: bool) -> Self {
+        self.delta_busy = on;
         self
     }
 
@@ -113,6 +127,7 @@ impl MockBuilder {
             sends: AtomicUsize::new(0),
             fail_first_sends: self.fail_first_sends,
             fail_maps: AtomicBool::new(self.fail_maps),
+            delta_busy: AtomicBool::new(self.delta_busy),
             ba_fuzzy: AtomicBool::new(self.ba_fuzzy),
             bangumi_empty: AtomicBool::new(self.bangumi_empty),
         });
@@ -243,6 +258,31 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
             )
             .to_string(),
         );
+    }
+    // 三角洲（kkrb）：握手三步 + 数据。
+    if path == "/getMenu" {
+        // 真实站点在这一步下发会话标记；这里只要确认请求发到了。
+        return ("200 OK", json!({"code": 1, "menu": []}).to_string());
+    }
+    if path == "/getOVData" {
+        if inner.delta_busy.load(Ordering::Relaxed) {
+            return ("200 OK", json!({"code": -101, "msg": "系统繁忙，请稍后再试"}).to_string());
+        }
+        return (
+            "200 OK",
+            concat!(
+                r#"{"code":1,"msg":"获取成功","data":{"#,
+                r#""bdData":{"db":{"password":"0533","updated":"20260930000002"},"cgxg":{"password":"0637","updated":"20260930000002"},"bks":{"password":"0593","updated":"20260930000002"},"htjd":{"password":"0774","updated":"20260930000002"},"cxjy":{"password":"0352","updated":"20260930000002"}},"#,
+                r#""bcicData":[{"name":"快递箱","energy":"8"},{"name":"手提箱","energy":"16"}],"#,
+                r#""ariiData":[{"activityName":"研发部门 - 集市","activityTime":"2026/09/25 - 2025/10/02","itemName":"锈迹斑斑的海盗铜币","currectPrice":36046,"activitySuggestedPrice":13052}]"#,
+                r#"}}"#,
+            )
+            .to_string(),
+        );
+    }
+    // 握手的前两步：只要求 200。
+    if path == "/overview" {
+        return ("200 OK", "<html>overview</html>".to_string());
     }
     // 塔科夫静态 JSON：任务与商人。
     if path.starts_with("/regular/tasks") {
@@ -463,6 +503,12 @@ async fn build_stack_with(
             market: qqbot_plugins::MarketConfig {
                 items_url: format!("{}/regular/items", mock.base_url()),
                 store: None,
+            },
+            delta: qqbot_plugins::DeltaConfig {
+                home_url: format!("{}/", mock.base_url()),
+                overview_url: format!("{}/overview", mock.base_url()),
+                menu_url: format!("{}/getMenu", mock.base_url()),
+                data_url: format!("{}/getOVData", mock.base_url()),
             },
             task: qqbot_plugins::TaskConfig {
                 tasks_url: format!("{}/regular/tasks", mock.base_url()),
@@ -1995,6 +2041,61 @@ async fn market_search_before_import_says_so() {
     let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
     let text = body["content"].as_str().unwrap_or_default();
     assert!(text.contains("更新物品"), "要告诉用户怎么解决: {text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D1–D3：三条命令各出一张卡片，且都要先完成握手。
+#[tokio::test]
+async fn delta_commands_render_cards_after_handshake() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    for (id, cmd, group) in [
+        ("DF_1", "集市", "GDF"),
+        ("DF_2", "脑机", "GDF2"),
+        ("DF_3", "密码", "GDF3"),
+    ] {
+        let msg = format!(
+            r#"{{"id":"{id}","author":{{"member_openid":"U1"}},"content":"{cmd}","group_openid":"{group}"}}"#
+        );
+        feed(&dispatcher, "GROUP_MESSAGE_CREATE", &msg).await;
+
+        let card = mock
+            .all(|h| h.path == format!("/v2/groups/{group}/messages"))
+            .into_iter()
+            .find(|h| {
+                let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+                body["msg_type"] == 7
+            })
+            .unwrap_or_else(|| panic!("{cmd} 应当回一张卡片"));
+        assert!(serde_json::from_str::<serde_json::Value>(&card.body).is_ok());
+    }
+
+    // 握手必须先发生，否则真实站点会稳定返回 code=-101。
+    assert!(!mock.all(|h| h.path == "/getMenu").is_empty(), "必须先调 getMenu");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 上游用 code 表达失败时要说清楚，不能默默回一张空卡片。
+#[tokio::test]
+async fn delta_reports_upstream_code_failure() {
+    let mock = MockServer::builder().delta_busy(true).start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DF_4","author":{"member_openid":"U1"},"content":"密码","group_openid":"GDF4"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GDF4/messages")
+        .expect("应当回复错误提示");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("-101"), "要带上游的 code: {text}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

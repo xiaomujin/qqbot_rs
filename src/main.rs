@@ -279,6 +279,7 @@ async fn run(cfg: Config) -> Result<()> {
             ammo: qqbot_plugins::AmmoConfig::default(),
             task: qqbot_plugins::TaskConfig::default(),
             market: qqbot_plugins::MarketConfig::default(),
+            delta: qqbot_plugins::DeltaConfig::default(),
         },
     )
     .await

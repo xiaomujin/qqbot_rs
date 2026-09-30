@@ -6,7 +6,7 @@
 > 完整功能盘点见 [cq-bot-feature-catalog.md](cq-bot-feature-catalog.md)，
 > 优先级论证见 [cq-bot-migration-plan.md](cq-bot-migration-plan.md)。
 
-**进度：20 / 36 完成**
+**进度：23 / 36 完成**
 
 > 勾选框计数说明：阶段 1 的「B9–B15 静态图」一条含 **7 项**功能，
 > 所以勾选框总数（4 + 26）会小于功能总数（36）。
@@ -78,7 +78,14 @@
 - ✅ **引用消息解析** —— 从 `msg_elements` 的 `message_type = 103` 取被引用附件
 - ✅ **资源管理** —— 关键词 → 素材，群/系统两级作用域，
       **B9–B15 的静态图直接用它收录，不需要写代码**
-- ✅ **测试基线** —— 398 项，clippy 零警告
+- [x] **D1 / D2 / D3 三角洲集市 / 脑机 / 密码** —— 新插件 `delta.rs`
+      ｜ ✅ **已实跑验证**（`live_delta`）
+      ｜ 🔑 **关键是握手顺序**：必须依次 首页 → `?viewpage=view/overview` → `getMenu`，
+      `getOVData` 才返回数据。少了 `getMenu` 会稳定拿到 `code=-101 系统繁忙`
+      （实测 6 次全失败；补上之后 2 次全成功）—— 不是限流，是会话状态
+      ｜ ⚠️ **实跑抓到 mock 抓不到的 bug**：`currectPrice` 是**浮点**（真实数据里出现过
+      `51937.6`），按 `i64` 解析会整个失败。mock 用整数时这个分支从没被走到
+- ✅ **测试基线** —— 408 项，clippy 零警告
 
 ---
 
@@ -86,7 +93,7 @@
 
 成本口径：🟢 直接 ｜ 🔵 接口 ｜ 🟡 需写模板 ｜ 🟠 外部依赖 ｜ 🔴 阻塞
 
-### 已完成（20 / 36）
+### 已完成（23 / 36）
 
 - [x] **A1 帮助** —— `帮助` ｜ 已有，且是**自动生成**的（读路由表），比源项目的硬编码列表好
 - [x] **A4 群消息记录** —— 无命令，`messages` 表全量落库（v3 起连原始 JSON 一起存）
@@ -213,15 +220,62 @@
 
 ### B9–B15 塔科夫静态图（7 项）—— 等图片文件
 
-**零代码**。图片到位后用系统控制者的账号在群里发：
+**零代码。** 收录 → 关键词触发的整条链路已经实现并有 4 条端到端测试覆盖
+（`resource_keyword_sends_the_file_passively` / `group_resource_is_invisible_to_other_groups` /
+`system_resource_is_visible_everywhere` / `non_resource_keyword_falls_through`），
+图片到位就能用。
+
+文件名与关键词**照抄 cq-bot 的 `TarKovMapPlugin`**（`keywordToImageMap` + 各分支），
+所以直接拿它原来的图就行。共 **19 个文件**。
+
+#### 12 张地图
+
+| 关键词 | cq-bot 文件名 |
+|---|---|
+| `储备站地图` | `tarkov_map/Reserve.jpg` |
+| `灯塔地图` | `tarkov_map/Lighthouse.jpg` |
+| `工厂地图` | `tarkov_map/Factory.jpg` |
+| `海岸线地图` | `tarkov_map/Shoreline.jpg` |
+| `海关地图` | `tarkov_map/Customs.jpg` |
+| `街区地图` | `tarkov_map/StreetsOfTarKov.jpg` |
+| `立交桥地图` | `tarkov_map/Interchange.jpg` |
+| `森林地图` | `tarkov_map/Woods.jpg` |
+| `实验室地图` | `tarkov_map/TheLab.jpg` |
+| `疗养院地图` | `tarkov_map/ShorelineHose.jpg` |
+| `中心区地图` | `tarkov_map/Center.jpg` |
+| `迷宫地图` | `tarkov_map/Maze.jpg` |
+
+#### 7 张静态图
+
+| 关键词（= 整条消息） | cq-bot 文件名 |
+|---|---|
+| `任务流程图` | `tarkov_map/TaskProcess.jpg` |
+| `任务物品图` | `tarkov_map/TaskItem.png` |
+| `信誉栏位图` | `tarkov_map/reputation.png` |
+| `boss刷新率` | `tarkov_map/bossRefreshRate.png` |
+| `boss丢包时间` | `tarkov_map/bossLossWrap.png` |
+| `3x4道具` | `tarkov_map/3x4.png` |
+| `耳机强度` | `tarkov_map/headset.png` |
+
+#### 收录命令
 
 ```
-系统收录 地图 <服务器上的绝对路径> 立交桥地图
-系统收录 任务流程图 <路径>
+系统收录 海关地图 /opt/bot_img/tarkov_map/Customs.jpg
+系统收录 任务流程图 /opt/bot_img/tarkov_map/TaskProcess.jpg
 ```
 
-或者直接在群里**发图 + 回复它**发 `系统收录 <关键词>`（图片会落到 `basepath`）。
-需要的图片：地图、任务流程图、任务物品图、信誉栏位图、boss丢包时间、3x4道具、耳机强度。
+#### ⚠️ 与 cq-bot 的一处命令差异，必须知道
+
+cq-bot 是 `地图 海关`，我们这里是 `海关地图`。原因是**关键词是单 token**：
+`系统收录` 按空格切分参数，`地图 海关` 存不进去；
+而资源触发的匹配是**整条消息精确相等**，不是子串包含。
+
+cq-bot 那边是对整条消息做 `contains("地图")` + `contains("海关")`，
+也就是**子串**匹配。照搬会带来误触发（「今天海关真难打」也会发图），
+所以这里保留了精确匹配，改用 `海关地图` 这种关键词。
+
+另外 7 张静态图**不需要 `地图` 前缀**，关键词就是命令本身，与 cq-bot 完全一致。
+
 
 ### B3 —— 卡在**本地化名称**，不是数据本身
 
@@ -255,9 +309,28 @@
 
 ### C2 / C6 —— 等 B 站登录 Cookie
 
-`x/polymer/web-dynamic/v1/feed/space` 对四个不同 UID 都返回 `code=0` 但 `items=[]`，
-说明硬编码的 buvid3 只够过风控、不够取数据。
+`x/polymer/web-dynamic/v1/feed/space`（cq-bot 用的就是它，配硬编码 buvid3）
+现在直接返回 **HTTP 412**：
+
+```
+错误号: 412  由于触发哔哩哔哩安全风控策略，该次访问请求被拒绝。
+```
+
+**对照实验说明问题在接口而不在网络**：同一时刻、同一台机器、同一个 UA，
+`x/web-interface/view`（视频详情）返回 **200 正常数据**。
+所以是**动态接口的风控更严**，不是网络不通。
+
+（早期探测时它返回的是 `code=0` 但 `items=[]` —— 空数组而非报错，
+比 412 更难判断；现在升级成明确的风控拒绝了。）
+
+试过的替代路径，全部不通：
+- 补 `b_nut` cookie：无变化
+- 换四个不同的活跃 UID：无变化
+- RSSHub 三个实例（`rsshub.app` / `rssforever` / `injahow`）：
+  第一个连不上，另两个 **503**
+
 **需要你提供带 `SESSDATA` 的 Cookie**（放进 `config.toml`，不要提交）。
+只有登录会话才能过这层风控。
 
 ### D5 永劫无间 —— 等你的 Cookie
 

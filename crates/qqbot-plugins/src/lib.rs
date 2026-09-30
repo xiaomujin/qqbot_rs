@@ -3,6 +3,7 @@
 //! 注册顺序即责任链顺序（同优先级下），靠前的插件先执行。
 
 pub mod daily;
+pub mod delta;
 pub mod dice;
 pub mod help;
 pub mod market;
@@ -23,6 +24,7 @@ pub use dice::{parse_spec, DicePlugin};
 pub use help::HelpPlugin;
 pub use resource::{register_resources, ResourcesConfig};
 pub use ammo::AmmoConfig;
+pub use delta::DeltaConfig;
 pub use market::MarketConfig;
 pub use task::TaskConfig;
 pub use ba::BaConfig;
@@ -64,6 +66,8 @@ pub struct PluginsConfig {
     pub task: TaskConfig,
     /// 塔科夫跳蚤市场的配置。
     pub market: MarketConfig,
+    /// 三角洲行动的配置。
+    pub delta: DeltaConfig,
 }
 
 /// 把所有内置插件注册到路由表。
@@ -158,6 +162,16 @@ pub async fn register(
     let market = market::MarketPlugin::new(market_cfg, http.clone());
     router.on_any(Matcher::Command("跳蚤".into()), market.clone());
     router.on_any(Matcher::Command("更新物品".into()), market.clone());
+
+    // 三角洲行动：集市 / 脑机 / 密码（D1–D3）。一图流见下。
+    let delta = delta::DeltaPlugin::new(cfg.delta.clone(), http.clone());
+    for cmd in ["集市", "脑机", "密码"] {
+        router.on_any(Matcher::Command(cmd.into()), delta.clone());
+    }
+    // 带前缀的写法也认，避免与其它插件撞词。
+    for cmd in ["三角洲集市", "三角洲脑机", "三角洲密码"] {
+        router.on_listener(Matcher::Command(cmd.into()), delta.clone());
+    }
 
     // 番剧更新：三个写法整串匹配。
     let bangumi = bangumi::BangumiPlugin::new(cfg.bangumi.clone(), http.clone());

@@ -3,11 +3,9 @@
 //! 数据来自 `json.tarkov.dev/regular/items` —— **静态 JSON**，与 GraphQL 是同一份
 //! 数据源，但 GraphQL 后端挂掉时它照样能用（2026-09 实测）。
 //!
-//! ⚠️ **名字是英文 slug 而不是中文。** 静态 JSON 里的 `name` 是翻译键
-//! （形如 `54527a984bdc2d4e668b4567 Name`），只有 GraphQL 的 `lang: zh` 会解析它。
-//! 所以这里用 `normalizedName`（`556x45mm-m855`）做检索与显示 ——
-//! 玩家打的 `m855` / `bp` / `5.45` 都能命中，但界面不是中文。
-//! 等 GraphQL 恢复或拿到语言包，**只需改这一处的名称来源**。
+//! 中文名来自 `regular/items_zh` 语言包（键是 `<物品 id> Name`）——
+//! 静态 JSON 里的 `name` 是翻译键，语言包才是它的字典，不再依赖 GraphQL。
+//! 检索同时匹配 `normalizedName` 与中文名：玩家打 `m855`、`bp`、`5.45`、`穿甲` 都能命中。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +18,8 @@ use serde_json::json;
 
 /// 数据源。
 const ITEMS_URL: &str = "https://json.tarkov.dev/regular/items";
+/// 物品名语言包。中文名从这里来，不再依赖 GraphQL 的 `lang: zh`。
+const ITEMS_ZH_URL: &str = "https://json.tarkov.dev/regular/items_zh";
 /// 一次最多列几发。
 const MAX_ROWS: usize = 12;
 
@@ -29,14 +29,47 @@ const MAX_ROWS: usize = 12;
 pub struct AmmoConfig {
     /// 静态 JSON 地址。
     pub items_url: String,
+    /// 物品名语言包（`<id> Name`）。弹药名在上游是翻译键，没有它就只剩 slug。
+    pub items_zh_url: String,
     /// 弹药表。`None` 表示未启用持久化。
     pub store: Option<Arc<ResourceStore>>,
 }
 
 impl Default for AmmoConfig {
     fn default() -> Self {
-        Self { items_url: ITEMS_URL.into(), store: None }
+        Self {
+            items_url: ITEMS_URL.into(),
+            items_zh_url: ITEMS_ZH_URL.into(),
+            store: None,
+        }
     }
+}
+
+/// 物品名语言包：`<id> Name` → 中文。跳蚤市场也用它。
+pub type ItemLangPack = HashMap<String, String>;
+
+/// 语言包响应：`{"data": {"<物品 id> Name": "中文名"}}`。
+///
+/// 与 `ItemsResponse` 长得像但**不是一回事** —— 后者的 data 里还套着一层 items。
+#[derive(Debug, Default, Deserialize)]
+struct ItemLangResponse {
+    #[serde(default)]
+    data: Option<ItemLangPack>,
+}
+
+/// 解析一份物品名语言包。
+pub fn parse_item_lang(body: &str) -> Result<ItemLangPack, String> {
+    let parsed: ItemLangResponse =
+        serde_json::from_str(body).map_err(|err| format!("解析语言包失败：{err}"))?;
+    parsed.data.ok_or_else(|| "语言包缺少 data".to_string())
+}
+
+/// 取一件物品的中文名。查不到返回 `None`（显示退回 slug）。
+pub fn item_name(pack: &ItemLangPack, id: &str) -> Option<String> {
+    pack.get(&format!("{id} Name"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,7 +120,7 @@ struct AmmoProperties {
 ///
 /// 判据用 `propertiesType == ItemPropertiesAmmo` 而不是 `types` 里含 `ammo` ——
 /// 后者会把**手雷**也算进来（实测 `types: ["ammo","grenade"]`）。
-pub fn parse_ammo(body: &str) -> Result<Vec<Ammo>, String> {
+pub fn parse_ammo(body: &str, pack: &ItemLangPack) -> Result<Vec<Ammo>, String> {
     let parsed: ItemsResponse =
         serde_json::from_str(body).map_err(|err| format!("解析响应失败：{err}"))?;
     let items = parsed.data.ok_or("响应缺少 data")?.items;
@@ -103,9 +136,11 @@ pub fn parse_ammo(body: &str) -> Result<Vec<Ammo>, String> {
             if normalized_name.is_empty() {
                 return None;
             }
+            let name_zh = item_name(pack, &id);
             Some(Ammo {
                 id,
                 normalized_name,
+                name_zh,
                 caliber: props.caliber,
                 damage: props.damage,
                 penetration_power: props.penetration_power,
@@ -146,14 +181,6 @@ pub fn query_tokens(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 查询里有没有非 ASCII 字符。
-///
-/// 用来区分「关键词不对」与「打了中文，但上游数据只有英文 slug」——
-/// 后者是上游缺语言包，不该让用户以为自己打错了。
-pub fn has_non_ascii(raw: &str) -> bool {
-    !raw.is_ascii()
-}
-
 
 /// 卡片行：左边名称，右边三项关键数值。
 pub fn format_rows(items: &[Ammo]) -> Vec<serde_json::Value> {
@@ -161,7 +188,7 @@ pub fn format_rows(items: &[Ammo]) -> Vec<serde_json::Value> {
         .iter()
         .map(|a| {
             json!({
-                "label": a.normalized_name,
+                "label": a.name_zh.as_deref().unwrap_or(&a.normalized_name),
                 "value": format!("伤{} 穿{} 甲伤{}", a.damage, a.penetration_power, a.armor_damage),
             })
         })
@@ -191,15 +218,26 @@ impl AmmoPlugin {
             return Handled::Consumed;
         };
 
-        let body = match self.fetch().await {
-            Ok(body) => body,
+        let (body, lang) = match tokio::try_join!(
+            self.fetch(&self.config.items_url),
+            self.fetch(&self.config.items_zh_url)
+        ) {
+            Ok(pair) => pair,
             Err(reason) => {
                 tracing::warn!(error = %reason, "下载弹药数据失败");
                 let _ = ctx.reply_text(format!("下载失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
-        let items = match parse_ammo(&body) {
+        let pack = match parse_item_lang(&lang) {
+            Ok(pack) => pack,
+            Err(reason) => {
+                tracing::warn!(error = %reason, "弹药语言包解析失败");
+                let _ = ctx.reply_text(format!("语言包解析失败：{reason}")).await;
+                return Handled::Consumed;
+            }
+        };
+        let items = match parse_ammo(&body, &pack) {
             Ok(items) if !items.is_empty() => items,
             Ok(_) => {
                 let _ = ctx.reply_text("解析出 0 条弹药，上游格式可能变了").await;
@@ -250,8 +288,6 @@ impl AmmoPlugin {
             // 空表与「查不到」要给不同的话：前者是没导入，后者是关键词不对。
             let hint = match store.ammo_count().await {
                 Ok(0) => "弹药数据还没导入，请管理员发「更新子弹」",
-                // 数据里只有英文 slug，打了中文要说明白。
-                _ if has_non_ascii(query) => "弹药名只有英文 slug（如 545x39mm-bp）—— 上游静态数据里没有中文",
                 _ => "没有匹配的弹药，换个关键词试试",
             };
             let _ = ctx.reply_text(hint).await;
@@ -274,10 +310,10 @@ impl AmmoPlugin {
         Handled::Consumed
     }
 
-    async fn fetch(&self) -> Result<String, String> {
+    async fn fetch(&self, url: &str) -> Result<String, String> {
         let res = self
             .http
-            .get(&self.config.items_url)
+            .get(url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
             .send()
             .await
@@ -325,7 +361,7 @@ mod tests {
 
     #[test]
     fn keeps_only_real_ammo() {
-        let items = parse_ammo(FIXTURE).unwrap();
+        let items = parse_ammo(FIXTURE, &ItemLangPack::new()).unwrap();
         // 手雷的 types 里也有 ammo，但 propertiesType 不是，必须排除。
         assert_eq!(items.len(), 2, "{items:?}");
         assert_eq!(items[0].normalized_name, "545x39mm-bp", "应当按名称排序");
@@ -334,7 +370,7 @@ mod tests {
 
     #[test]
     fn maps_the_ballistic_fields() {
-        let items = parse_ammo(FIXTURE).unwrap();
+        let items = parse_ammo(FIXTURE, &ItemLangPack::new()).unwrap();
         let bp = &items[0];
         assert_eq!(bp.damage, 51);
         assert_eq!(bp.penetration_power, 37);
@@ -348,14 +384,14 @@ mod tests {
     #[test]
     fn projectile_count_defaults_to_one() {
         // 上游缺字段时是 0，显示成「0 发」会很怪。
-        let items = parse_ammo(FIXTURE).unwrap();
+        let items = parse_ammo(FIXTURE, &ItemLangPack::new()).unwrap();
         assert_eq!(items[0].projectile_count, 1);
     }
 
     #[test]
     fn broken_input_is_an_error_not_a_panic() {
-        assert!(parse_ammo("不是 JSON").is_err());
-        assert!(parse_ammo(r#"{"data":null}"#).is_err());
+        assert!(parse_ammo("不是 JSON", &ItemLangPack::new()).is_err());
+        assert!(parse_ammo(r#"{"data":null}"#, &ItemLangPack::new()).is_err());
     }
 
     #[test]
@@ -372,14 +408,6 @@ mod tests {
         // 用户收到「用法：...」，好像他没打参数。那是 bug，不是限制。
         assert_eq!(query_tokens("彻夜难眠"), vec!["彻夜难眠"]);
         assert_eq!(query_tokens("5.45 弹"), vec!["545", "弹"]);
-    }
-
-    #[test]
-    fn detects_non_ascii_queries() {
-        assert!(has_non_ascii("彻夜难眠"));
-        assert!(has_non_ascii("m855 弹"));
-        assert!(!has_non_ascii("m855"));
-        assert!(!has_non_ascii("first-in-line"));
     }
 
     #[test]

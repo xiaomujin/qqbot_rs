@@ -118,6 +118,8 @@ pub struct Ammo {
     pub id: String,
     /// 可读 slug，如 `556x45mm-m855`。检索与显示都用它。
     pub normalized_name: String,
+    /// 中文名，来自 `regular/items_zh` 的 `<id> Name`。解析不到时为 `None`。
+    pub name_zh: Option<String>,
     pub caliber: String,
     pub damage: i64,
     pub penetration_power: i64,
@@ -136,19 +138,128 @@ pub struct TarkovTask {
     pub id: String,
     /// 可读 slug，如 `gunsmith-part-1`。
     pub normalized_name: String,
-    /// 中文名，来自 GraphQL 的 `tasks(lang: zh)`。
+    /// 中文名，来自 `regular/tasks_zh` 语言包。实测 515/515 命中。
     ///
-    /// `None` 表示那个后端不可用（它 2026-09 起对所有查询返回 422），
-    /// 此时只能按 slug 检索。
+    /// 类型上仍可空：列要兼容旧库，导入器则**强制非空**（缺了就不写库）。
     pub name_zh: Option<String>,
+    /// 英文名，由 `normalizedName` 反推（`the-punisher-part-1` → `The Punisher Part 1`）。
+    pub name_en: Option<String>,
     /// 商人的可读 slug，如 `prapor`。
     pub trader: String,
+    /// 商人的中文名与头像。
+    pub trader_name_zh: Option<String>,
+    pub trader_image: String,
+    /// 任务图标。
+    pub task_image: String,
+    /// 任务发生的地图 slug，空串表示不限地图。
+    pub map: String,
+    /// 地图中文名，来自 `regular/maps_zh`。
+    pub map_name_zh: Option<String>,
     pub min_level: i64,
     pub is_kappa: bool,
     pub is_lightkeeper: bool,
     pub experience: i64,
-    pub objectives: i64,
     pub wiki_link: String,
+    /// 阵营（`USEC` / `BEAR`）。上游的 `Any` 在导入时就被过滤掉，空串表示不限。
+    pub faction: Option<String>,
+    /// 是否可重复接取。
+    pub restartable: bool,
+    /// 本次导入的 unix 秒。
+    pub updated_at: i64,
+}
+
+/// 任务目标。
+///
+/// 这里**故意没有** `count` / `is_optional` / `is_raid` / `time` 这些字段：
+/// 它们在导入时就已经折进 `display_text` 与 `marks` 了。
+/// 再存一份原始字段看着无害，实际是「两处真相」——
+/// 渲染层早晚会挑一处读，于是「×1 要不要显示」这种判断要在两个地方各写一遍。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TarkovObjective {
+    /// 上游的 `type`：`visit` / `shoot` / `giveItem` / `findItem` …
+    ///
+    /// **兜底的关键** —— 它是个稳定的枚举，万一新目标还没进语言包，
+    /// 导入时靠它拼出「击杀」这类通用文案。渲染已经不用它，留着是排障。
+    pub objective_type: String,
+    /// 静态 JSON 里的 `description`。实测它就是**目标自己的 id**，
+    /// 一个翻译键 —— 直接显示给用户等于显示一串 hex。
+    pub description_key: String,
+    /// **导入时拼好的正文**：「在海关使用 AKS-74U 消灭 Scav ×25」。
+    ///
+    /// 数量并进正文、×1 省掉、语言包缺失时退回通用文案 —— 都在导入时做完一次。
+    /// 渲染层拿到什么印什么。
+    pub display_text: String,
+    /// **导入时拼好的附加标记**（可选 / 战局内 / 时间窗口），`|` 分隔，空串表示没有。
+    ///
+    /// 存 `|` 而不是 ` · `：标记怎么呈现是排版的事，由渲染层按版式决定 ——
+    /// 目标少时走块引用，目标多时整段塞进代码块、标记只能写在行内。
+    pub marks: String,
+}
+
+/// 任务奖励的一行。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TarkovReward {
+    /// `standing`（商人声望）/ `item`（物品）/ `skill`（技能）/ `unlock`（解锁）。
+    pub kind: String,
+    /// 商人或物品的上游 id。
+    pub ref_id: String,
+    pub name_zh: Option<String>,
+    /// 声望是小数（0.1），物品是整数，用 f64 通吃。
+    pub amount: f64,
+    /// 结构化补充的 JSON：工艺解锁的 `{station, level}` 等。
+    pub extra: Option<String>,
+}
+
+/// 前置任务的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TarkovPrereq {
+    pub prereq_id: String,
+    /// 上游给的是数组（如 `["complete"]`），这里拍平成逗号分隔。
+    pub status: String,
+}
+
+/// 后续任务的一行。
+///
+/// 上游没有这个方向的数据，由 `taskRequirements` 反转得到。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TarkovSuccessor {
+    pub successor_id: String,
+    /// 与前置一样是 `complete` / `active` / `failed`，逗号分隔。
+    pub status: String,
+}
+
+/// 任务需要的一组钥匙：一张地图 + 这张地图上要的钥匙。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TarkovTaskKey {
+    /// 地图中文名，空串表示上游没给地图。
+    pub map_name: String,
+    /// 该地图上的钥匙名，`、` 连接 —— 导入时已用语言包解析。
+    pub keys: String,
+}
+
+/// 失败条件的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TarkovTaskFail {
+    /// 会把本任务判失败的任务名（导入时已解析成中文）。
+    pub task_name: String,
+    /// `complete` / `active` / `failed`，逗号分隔。
+    pub status: String,
+}
+
+/// 一个任务的完整内容：任务本身 + 六张子表。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TarkovTaskDetail {
+    pub task: TarkovTask,
+    pub objectives: Vec<TarkovObjective>,
+    pub rewards: Vec<TarkovReward>,
+    pub prereqs: Vec<TarkovPrereq>,
+    pub successors: Vec<TarkovSuccessor>,
+    /// 需要钥匙，一行一张地图。
+    pub keys: Vec<TarkovTaskKey>,
+    /// 商人的接取门槛，每行一句人话（导入时拼好，渲染层只管加 `- `）。
+    pub requirements: Vec<String>,
+    /// 失败条件。
+    pub fails: Vec<TarkovTaskFail>,
 }
 
 /// 一件塔科夫物品（含跳蚤价格）。
@@ -157,6 +268,8 @@ pub struct TarkovItem {
     pub id: String,
     /// 可读 slug，如 `colt-m4a1-556x45-assault-rifle`。
     pub normalized_name: String,
+    /// 中文名，来自 `regular/items_zh`。
+    pub name_zh: Option<String>,
     /// 商人基础价。
     pub base_price: i64,
     /// 跳蚤市场价。`None` 表示这件物品没有跳蚤数据（实测 5442 件里只有 3525 件有）。
@@ -204,14 +317,15 @@ fn like_query(
     (sql, params)
 }
 
-const SELECT_AMMO: &str = "SELECT id, normalized_name, caliber, damage, penetration_power, \
-     armor_damage, fragmentation_chance, initial_speed, projectile_count, tracer, base_price \
-     FROM ammo";
+const SELECT_AMMO: &str = "SELECT id, normalized_name, name_zh, caliber, damage, \
+     penetration_power, armor_damage, fragmentation_chance, initial_speed, projectile_count, \
+     tracer, base_price FROM ammo";
 
-const SELECT_TASKS: &str = "SELECT id, normalized_name, name_zh, trader, min_level, is_kappa, \
-     is_lightkeeper, experience, objectives, wiki_link FROM tarkov_task";
+const SELECT_TASKS: &str = "SELECT id, normalized_name, name_zh, name_en, trader, trader_name_zh, \
+     trader_image, task_image, map, map_name_zh, min_level, is_kappa, is_lightkeeper, experience, \
+     wiki_link, faction, restartable, updated_at FROM tarkov_task";
 
-const SELECT_ITEMS: &str = "SELECT id, normalized_name, base_price, last_low_price, \
+const SELECT_ITEMS: &str = "SELECT id, normalized_name, name_zh, base_price, last_low_price, \
      avg24h_price, low24h_price, high24h_price, weight FROM tarkov_item";
 
 /// 从一行读出物品。三个查询共用同一段列映射，列顺序必须与 SQL 里一致。
@@ -219,12 +333,13 @@ fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<TarkovItem> {
     Ok(TarkovItem {
         id: row.get(0)?,
         normalized_name: row.get(1)?,
-        base_price: row.get(2)?,
-        last_low_price: row.get(3)?,
-        avg24h_price: row.get(4)?,
-        low24h_price: row.get(5)?,
-        high24h_price: row.get(6)?,
-        weight: row.get(7)?,
+        name_zh: row.get(2)?,
+        base_price: row.get(3)?,
+        last_low_price: row.get(4)?,
+        avg24h_price: row.get(5)?,
+        low24h_price: row.get(6)?,
+        high24h_price: row.get(7)?,
+        weight: row.get(8)?,
     })
 }
 
@@ -517,14 +632,15 @@ impl ResourceStore {
             tx.execute("DELETE FROM tarkov_item", [])?;
             {
                 let mut stmt = tx.prepare_cached(
-                    "INSERT OR REPLACE INTO tarkov_item(id, normalized_name, base_price, \
+                    "INSERT OR REPLACE INTO tarkov_item(id, normalized_name, name_zh, base_price, \
                      last_low_price, avg24h_price, low24h_price, high24h_price, weight) \
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )?;
                 for it in &items {
                     stmt.execute(rusqlite::params![
                         it.id,
                         it.normalized_name,
+                        it.name_zh,
                         it.base_price,
                         it.last_low_price,
                         it.avg24h_price,
@@ -547,7 +663,8 @@ impl ResourceStore {
         limit: usize,
     ) -> Result<Vec<TarkovItem>> {
         self.with(move |conn| {
-            let (sql, params) = like_query(SELECT_ITEMS, &["normalized_name"], &tokens, limit);
+            let (sql, params) =
+                like_query(SELECT_ITEMS, &["normalized_name", "name_zh"], &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params), read_item)?;
             // 必须先 collect 成 `rusqlite::Result` 再 `?`：
@@ -585,30 +702,152 @@ impl ResourceStore {
 
     // ---- 塔科夫任务 ----
 
-    /// 整表替换任务数据。返回写入行数。理由同 `replace_ammo`。
-    pub async fn replace_tasks(&self, items: Vec<TarkovTask>) -> Result<usize> {
+    /// 从数据库行读一个任务。列顺序必须与 `SELECT_TASKS` 一致。
+    fn read_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<TarkovTask> {
+        Ok(TarkovTask {
+            id: r.get(0)?,
+            normalized_name: r.get(1)?,
+            name_zh: r.get(2)?,
+            name_en: r.get(3)?,
+            trader: r.get(4)?,
+            trader_name_zh: r.get(5)?,
+            trader_image: r.get(6)?,
+            task_image: r.get(7)?,
+            map: r.get(8)?,
+            map_name_zh: r.get(9)?,
+            min_level: r.get(10)?,
+            is_kappa: r.get(11)?,
+            is_lightkeeper: r.get(12)?,
+            experience: r.get(13)?,
+            wiki_link: r.get(14)?,
+            faction: r.get(15)?,
+            restartable: r.get(16)?,
+            updated_at: r.get(17)?,
+        })
+    }
+
+    /// 整表替换任务数据（含六张子表）。返回**任务**条数。理由同 `replace_ammo`。
+    ///
+    /// 九张表在**同一个事务**里替换：中途失败就整体回滚，
+    /// 不会留下「任务在、目标没了」这种半截状态。
+    pub async fn replace_tasks(&self, items: Vec<TarkovTaskDetail>) -> Result<usize> {
         self.with(move |conn| {
             let tx = conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM tarkov_task", [])?;
+            // 先删子表再删主表：虽然这里没开外键约束，但顺序反了将来加约束就炸。
+            for table in [
+                "tarkov_task_objective",
+                "tarkov_task_reward",
+                "tarkov_task_prereq",
+                "tarkov_task_successor",
+                "tarkov_task_key",
+                "tarkov_task_requirement",
+                "tarkov_task_fail",
+                "tarkov_task",
+            ] {
+                tx.execute(&format!("DELETE FROM {table}"), [])?;
+            }
             {
-                let mut stmt = tx.prepare_cached(
-                    "INSERT OR REPLACE INTO tarkov_task(id, normalized_name, name_zh, trader, min_level, \
-                     is_kappa, is_lightkeeper, experience, objectives, wiki_link) \
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                let mut task_stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_task(id, normalized_name, name_zh, name_en, \
+                     trader, trader_name_zh, trader_image, task_image, map, map_name_zh, \
+                     min_level, is_kappa, is_lightkeeper, experience, wiki_link, faction, \
+                     restartable, updated_at) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                             ?16, ?17, ?18)",
                 )?;
-                for t in &items {
-                    stmt.execute(rusqlite::params![
+                let mut obj_stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_task_objective(task_id, ordinal, \
+                     objective_type, description_key, display_text, marks) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                let mut key_stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_task_key(task_id, ordinal, map_name, keys) \
+                     VALUES(?1, ?2, ?3, ?4)",
+                )?;
+                let mut req_stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_task_requirement(task_id, ordinal, text) \
+                     VALUES(?1, ?2, ?3)",
+                )?;
+                let mut fail_stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_task_fail(task_id, ordinal, task_name, status) \
+                     VALUES(?1, ?2, ?3, ?4)",
+                )?;
+                let mut reward_stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_task_reward(task_id, ordinal, kind, ref_id, \
+                     name_zh, amount, extra) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?;
+                let mut prereq_stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_task_prereq(task_id, ordinal, prereq_id, status) \
+                     VALUES(?1, ?2, ?3, ?4)",
+                )?;
+                let mut succ_stmt = tx.prepare_cached(
+                    "INSERT OR REPLACE INTO tarkov_task_successor(task_id, ordinal, successor_id, \
+                     status) VALUES(?1, ?2, ?3, ?4)",
+                )?;
+
+                for detail in &items {
+                    let t = &detail.task;
+                    task_stmt.execute(rusqlite::params![
                         t.id,
                         t.normalized_name,
                         t.name_zh,
+                        t.name_en,
                         t.trader,
+                        t.trader_name_zh,
+                        t.trader_image,
+                        t.task_image,
+                        t.map,
+                        t.map_name_zh,
                         t.min_level,
                         t.is_kappa,
                         t.is_lightkeeper,
                         t.experience,
-                        t.objectives,
                         t.wiki_link,
+                        t.faction,
+                        t.restartable,
+                        t.updated_at,
                     ])?;
+                    for (i, o) in detail.objectives.iter().enumerate() {
+                        obj_stmt.execute(rusqlite::params![
+                            t.id,
+                            i as i64,
+                            o.objective_type,
+                            o.description_key,
+                            o.display_text,
+                            o.marks,
+                        ])?;
+                    }
+                    for (i, r) in detail.rewards.iter().enumerate() {
+                        reward_stmt.execute(rusqlite::params![
+                            t.id,
+                            i as i64,
+                            r.kind,
+                            r.ref_id,
+                            r.name_zh,
+                            r.amount,
+                            r.extra,
+                        ])?;
+                    }
+                    for (i, p) in detail.prereqs.iter().enumerate() {
+                        prereq_stmt.execute(rusqlite::params![t.id, i as i64, p.prereq_id, p.status])?;
+                    }
+                    for (i, s) in detail.successors.iter().enumerate() {
+                        succ_stmt.execute(rusqlite::params![
+                            t.id,
+                            i as i64,
+                            s.successor_id,
+                            s.status,
+                        ])?;
+                    }
+                    for (i, k) in detail.keys.iter().enumerate() {
+                        key_stmt.execute(rusqlite::params![t.id, i as i64, k.map_name, k.keys])?;
+                    }
+                    for (i, text) in detail.requirements.iter().enumerate() {
+                        req_stmt.execute(rusqlite::params![t.id, i as i64, text])?;
+                    }
+                    for (i, f) in detail.fails.iter().enumerate() {
+                        fail_stmt.execute(rusqlite::params![t.id, i as i64, f.task_name, f.status])?;
+                    }
                 }
             }
             tx.commit()?;
@@ -618,32 +857,187 @@ impl ResourceStore {
     }
 
     /// 按关键词检索任务。`tokens` 的语义同 `search_ammo`。
+    ///
+    /// 同时匹配 slug 与中文名 —— 上游有语言包时用户打中文，没有时打 slug。
     pub async fn search_tasks(
         &self,
         tokens: Vec<String>,
         limit: usize,
     ) -> Result<Vec<TarkovTask>> {
         self.with(move |conn| {
-            let (sql, params) = like_query(SELECT_TASKS, &["normalized_name", "name_zh"], &tokens, limit);
+            let (sql, params) =
+                like_query(SELECT_TASKS, &["normalized_name", "name_zh"], &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
-                Ok(TarkovTask {
-                    id: r.get(0)?,
-                    normalized_name: r.get(1)?,
-                    name_zh: r.get(2)?,
-                    trader: r.get(3)?,
-                    min_level: r.get(4)?,
-                    is_kappa: r.get(5)?,
-                    is_lightkeeper: r.get(6)?,
-                    experience: r.get(7)?,
-                    objectives: r.get(8)?,
-                    wiki_link: r.get(9)?,
-                })
-            })?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), Self::read_task)?;
             // 必须先 collect 成 `rusqlite::Result` 再 `?`：
             // `FromIterator<Result<T, E>>` 要求 E 与目标**完全一致**，
             // 不会替我们把 rusqlite::Error 转成 anyhow::Error。
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// 取一个任务的完整内容（任务 + 目标 + 奖励 + 前置/后续 + 钥匙/门槛/失败条件）。
+    ///
+    /// 找不到返回 `None` 而不是空壳 —— 「这个 id 不存在」与
+    /// 「这个任务没有目标」是两回事。
+    pub async fn task_detail(&self, id: String) -> Result<Option<TarkovTaskDetail>> {
+        self.with(move |conn| {
+            let sql = format!("{SELECT_TASKS} WHERE id = ?1");
+            let task = conn
+                .query_row(&sql, [&id], Self::read_task)
+                .optional()?;
+            let Some(task) = task else {
+                return Ok(None);
+            };
+
+            let mut obj_stmt = conn.prepare_cached(
+                "SELECT objective_type, description_key, display_text, marks \
+                 FROM tarkov_task_objective WHERE task_id = ?1 ORDER BY ordinal",
+            )?;
+            let objectives = obj_stmt
+                .query_map([&id], |r| {
+                    Ok(TarkovObjective {
+                        objective_type: r.get(0)?,
+                        description_key: r.get(1)?,
+                        display_text: r.get(2)?,
+                        marks: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut reward_stmt = conn.prepare_cached(
+                "SELECT kind, ref_id, name_zh, amount, extra FROM tarkov_task_reward \
+                 WHERE task_id = ?1 ORDER BY ordinal",
+            )?;
+            let rewards = reward_stmt
+                .query_map([&id], |r| {
+                    Ok(TarkovReward {
+                        kind: r.get(0)?,
+                        ref_id: r.get(1)?,
+                        name_zh: r.get(2)?,
+                        amount: r.get(3)?,
+                        extra: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut prereq_stmt = conn.prepare_cached(
+                "SELECT prereq_id, status FROM tarkov_task_prereq \
+                 WHERE task_id = ?1 ORDER BY ordinal",
+            )?;
+            let prereqs = prereq_stmt
+                .query_map([&id], |r| {
+                    Ok(TarkovPrereq {
+                        prereq_id: r.get(0)?,
+                        status: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut succ_stmt = conn.prepare_cached(
+                "SELECT successor_id, status FROM tarkov_task_successor \
+                 WHERE task_id = ?1 ORDER BY ordinal",
+            )?;
+            let successors = succ_stmt
+                .query_map([&id], |r| {
+                    Ok(TarkovSuccessor {
+                        successor_id: r.get(0)?,
+                        status: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut key_stmt = conn.prepare_cached(
+                "SELECT map_name, keys FROM tarkov_task_key \
+                 WHERE task_id = ?1 ORDER BY ordinal",
+            )?;
+            let keys = key_stmt
+                .query_map([&id], |r| {
+                    Ok(TarkovTaskKey {
+                        map_name: r.get(0)?,
+                        keys: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut req_stmt = conn.prepare_cached(
+                "SELECT text FROM tarkov_task_requirement \
+                 WHERE task_id = ?1 ORDER BY ordinal",
+            )?;
+            let requirements = req_stmt
+                .query_map([&id], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut fail_stmt = conn.prepare_cached(
+                "SELECT task_name, status FROM tarkov_task_fail \
+                 WHERE task_id = ?1 ORDER BY ordinal",
+            )?;
+            let fails = fail_stmt
+                .query_map([&id], |r| {
+                    Ok(TarkovTaskFail {
+                        task_name: r.get(0)?,
+                        status: r.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            Ok(Some(TarkovTaskDetail {
+                task,
+                objectives,
+                rewards,
+                prereqs,
+                successors,
+                keys,
+                requirements,
+                fails,
+            }))
+        })
+        .await
+    }
+
+    /// 按 id 批量取显示名（中文名优先，退回 slug）。
+    ///
+    /// 用来把前置任务 id 变成人看得懂的名字。查不到的 id 不出现在结果里，
+    /// 调用方退回显示 id —— 至少能对上号。
+    pub async fn task_names(&self, ids: Vec<String>) -> Result<std::collections::HashMap<String, String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.with(move |conn| {
+            // 占位符要按个数拼：SQLite 不接受把数组当参数传。
+            let placeholders = (1..=ids.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, COALESCE(name_zh, normalized_name) FROM tarkov_task \
+                 WHERE id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    /// 按中文名或 slug **精确**取任务 id。
+    ///
+    /// 卡片上的按钮发出去的是 `任务 <完整中文名>`，点进来时查询是完整名字 ——
+    /// 走 LIKE 会退化成模糊匹配（`惩罚者 - 1` 也能命中 `惩罚者 - 10`），
+    /// 所以先精确匹配一次，匹配不到再退回关键词检索。
+    pub async fn task_id_by_name(&self, name: String) -> Result<Option<String>> {
+        self.with(move |conn| {
+            conn.query_row(
+                "SELECT id FROM tarkov_task WHERE name_zh = ?1 OR normalized_name = ?1 LIMIT 1",
+                [&name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
         })
         .await
     }
@@ -656,7 +1050,6 @@ impl ResourceStore {
         })
         .await
     }
-
     // ---- 塔科夫弹药 ----
 
     /// 整表替换弹药数据。返回写入行数。
@@ -670,15 +1063,16 @@ impl ResourceStore {
             tx.execute("DELETE FROM ammo", [])?;
             {
                 let mut stmt = tx.prepare_cached(
-                    "INSERT OR REPLACE INTO ammo(id, normalized_name, caliber, damage, \
+                    "INSERT OR REPLACE INTO ammo(id, normalized_name, name_zh, caliber, damage, \
                      penetration_power, armor_damage, fragmentation_chance, initial_speed, \
                      projectile_count, tracer, base_price) \
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 )?;
                 for a in &items {
                     stmt.execute(rusqlite::params![
                         a.id,
                         a.normalized_name,
+                        a.name_zh,
                         a.caliber,
                         a.damage,
                         a.penetration_power,
@@ -704,21 +1098,23 @@ impl ResourceStore {
     /// `["545", "bp"]`，而 `545x39mm-bp` 两个都含。
     pub async fn search_ammo(&self, tokens: Vec<String>, limit: usize) -> Result<Vec<Ammo>> {
         self.with(move |conn| {
-            let (sql, params) = like_query(SELECT_AMMO, &["normalized_name"], &tokens, limit);
+            let (sql, params) =
+                like_query(SELECT_AMMO, &["normalized_name", "name_zh"], &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
                 Ok(Ammo {
                     id: r.get(0)?,
                     normalized_name: r.get(1)?,
-                    caliber: r.get(2)?,
-                    damage: r.get(3)?,
-                    penetration_power: r.get(4)?,
-                    armor_damage: r.get(5)?,
-                    fragmentation_chance: r.get(6)?,
-                    initial_speed: r.get(7)?,
-                    projectile_count: r.get(8)?,
-                    tracer: r.get(9)?,
-                    base_price: r.get(10)?,
+                    name_zh: r.get(2)?,
+                    caliber: r.get(3)?,
+                    damage: r.get(4)?,
+                    penetration_power: r.get(5)?,
+                    armor_damage: r.get(6)?,
+                    fragmentation_chance: r.get(7)?,
+                    initial_speed: r.get(8)?,
+                    projectile_count: r.get(9)?,
+                    tracer: r.get(10)?,
+                    base_price: r.get(11)?,
                 })
             })?;
             // 必须先 collect 成 `rusqlite::Result` 再 `?`：
@@ -998,6 +1394,7 @@ mod tests {
         Ammo {
             id: id.into(),
             normalized_name: slug.into(),
+            name_zh: None,
             caliber: "Caliber545x39".into(),
             damage: 50,
             penetration_power: pen,
@@ -1058,18 +1455,49 @@ mod tests {
         assert_eq!(s.search_ammo(vec!["545".into()], 5).await.unwrap().len(), 5);
     }
 
-    fn task(id: &str, slug: &str, trader: &str, level: i64) -> TarkovTask {
-        TarkovTask {
-            id: id.into(),
-            normalized_name: slug.into(),
-            name_zh: None,
-            trader: trader.into(),
-            min_level: level,
-            is_kappa: level > 40,
-            is_lightkeeper: false,
-            experience: 1000,
-            objectives: 2,
-            wiki_link: "https://x".into(),
+    fn task(id: &str, slug: &str, trader: &str, level: i64) -> TarkovTaskDetail {
+        TarkovTaskDetail {
+            task: TarkovTask {
+                id: id.into(),
+                normalized_name: slug.into(),
+                name_zh: Some(format!("{slug} 中文")),
+                name_en: None,
+                trader: trader.into(),
+                trader_name_zh: None,
+                trader_image: format!("https://img/{trader}.png"),
+                task_image: format!("https://img/{slug}.png"),
+                map: "customs".into(),
+                map_name_zh: None,
+                min_level: level,
+                is_kappa: level > 40,
+                is_lightkeeper: false,
+                experience: 1000,
+                wiki_link: "https://x".into(),
+                faction: None,
+                restartable: false,
+                updated_at: 0,
+            },
+            objectives: vec![TarkovObjective {
+                objective_type: "shoot".into(),
+                description_key: "6575a64d3fc09bdfb38b713d".into(),
+                display_text: "击杀 5 个 Scav ×5".into(),
+                marks: String::new(),
+            }],
+            rewards: vec![TarkovReward {
+                kind: "standing".into(),
+                ref_id: "5a7c2eca46aef81a7ca2145d".into(),
+                name_zh: None,
+                amount: 0.1,
+                extra: None,
+            }],
+            prereqs: vec![TarkovPrereq {
+                prereq_id: "p1".into(),
+                status: "complete".into(),
+            }],
+            successors: vec![],
+            keys: vec![],
+            requirements: vec![],
+            fails: vec![],
         }
     }
 
@@ -1103,6 +1531,7 @@ mod tests {
         TarkovItem {
             id: id.into(),
             normalized_name: slug.into(),
+            name_zh: None,
             base_price: 1000,
             last_low_price: avg.map(|v| v - 10),
             avg24h_price: avg,
@@ -1140,12 +1569,86 @@ mod tests {
         assert_eq!(slick[0].base_price, 1000, "商人价仍在");
     }
 
+    /// 子表要跟着主表一起进出，且顺序必须保住。
+    #[tokio::test]
+    async fn task_detail_roundtrips_children_in_order() {
+        let s = store();
+        let mut detail = task("k1", "first-in-line", "prapor", 1);
+        // 顺序是渲染的序号来源，插进去乱序取出来必须还是原序。
+        detail.objectives = vec![
+            TarkovObjective {
+                objective_type: "visit".into(),
+                description_key: "o1".into(),
+                display_text: "去海关看看".into(),
+                marks: "可选".into(),
+            },
+            TarkovObjective {
+                objective_type: "shoot".into(),
+                description_key: "o2".into(),
+                display_text: "击杀 3 个 Scav ×3".into(),
+                marks: "战局内".into(),
+            },
+        ];
+        // v12 新增的三张子表也要能进出。
+        detail.keys = vec![TarkovTaskKey {
+            map_name: "海关".into(),
+            keys: "宿舍206房间钥匙".into(),
+        }];
+        detail.requirements = vec!["大老板 忠诚等级 >= 2".into()];
+        detail.fails = vec![TarkovTaskFail {
+            task_name: "第三只眼".into(),
+            status: "complete".into(),
+        }];
+        // 后续任务也要能进出：它是导入时反转前置得到的。
+        detail.successors = vec![TarkovSuccessor {
+            successor_id: "k9".into(),
+            status: "complete".into(),
+        }];
+        s.replace_tasks(vec![detail]).await.unwrap();
+
+        let got = s.task_detail("k1".into()).await.unwrap().expect("应当能取回");
+        assert_eq!(got.task.normalized_name, "first-in-line");
+        assert_eq!(got.task.trader_image, "https://img/prapor.png");
+        assert_eq!(got.objectives.len(), 2);
+        assert_eq!(got.objectives[0].objective_type, "visit", "顺序要保住");
+        assert_eq!(got.objectives[0].display_text, "去海关看看");
+        assert_eq!(got.objectives[0].marks, "可选");
+        assert_eq!(got.objectives[1].display_text, "击杀 3 个 Scav ×3");
+        assert_eq!(got.objectives[1].marks, "战局内");
+        assert_eq!(got.rewards.len(), 1);
+        assert!((got.rewards[0].amount - 0.1).abs() < 1e-9, "声望是小数");
+        assert_eq!(got.prereqs[0].prereq_id, "p1");
+        assert_eq!(got.successors.len(), 1);
+        assert_eq!(got.successors[0].successor_id, "k9");
+        assert_eq!(got.keys.len(), 1, "钥匙要跟着任务一起回来");
+        assert_eq!(got.keys[0].map_name, "海关");
+        assert_eq!(got.keys[0].keys, "宿舍206房间钥匙");
+        assert_eq!(got.requirements, vec!["大老板 忠诚等级 >= 2".to_string()]);
+        assert_eq!(got.fails[0].task_name, "第三只眼");
+        assert_eq!(got.fails[0].status, "complete");
+
+        // 不存在的 id 是 None，而不是空壳。
+        assert!(s.task_detail("nope".into()).await.unwrap().is_none());
+    }
+
+    /// 整表替换要连子表一起清掉 —— 否则删掉的任务会留下孤儿目标。
+    #[tokio::test]
+    async fn replace_tasks_clears_children_too() {
+        let s = store();
+        s.replace_tasks(vec![task("k1", "a", "prapor", 1)]).await.unwrap();
+        assert_eq!(s.task_detail("k1".into()).await.unwrap().unwrap().objectives.len(), 1);
+
+        s.replace_tasks(vec![task("k2", "b", "prapor", 1)]).await.unwrap();
+        assert!(s.task_detail("k1".into()).await.unwrap().is_none(), "旧任务要没了");
+        assert_eq!(s.task_detail("k2".into()).await.unwrap().unwrap().objectives.len(), 1);
+    }
+
     /// 中文名与英文 slug 都要能查到 —— 用户打哪个取决于上游有没有语言包。
     #[tokio::test]
     async fn task_search_matches_both_slug_and_chinese_name() {
         let s = store();
         let mut a = task("k1", "first-in-line", "prapor", 1);
-        a.name_zh = Some("彻夜难眠".into());
+        a.task.name_zh = Some("彻夜难眠".into());
         let b = task("k2", "gunsmith-part-1", "mechanic", 5);
         s.replace_tasks(vec![a, b]).await.unwrap();
 

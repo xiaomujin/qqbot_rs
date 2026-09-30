@@ -133,6 +133,11 @@ impl Event {
             n.event_id = event_id.clone();
             n
         };
+        // 互动事件的凭证同样来自外层 id，与 notice 同风格。
+        let with_interaction_id = |mut i: InteractionCreate| {
+            i.event_id = event_id.clone();
+            i
+        };
 
         let ev = match name {
             "READY" => Event::Ready(Box::new(serde_json::from_str::<Ready>(raw)?)),
@@ -162,9 +167,9 @@ impl Event {
                 notice: Box::new(with_id(serde_json::from_str(raw).unwrap_or_default())),
             },
 
-            "INTERACTION_CREATE" => {
-                Event::Interaction(Box::new(serde_json::from_str::<InteractionCreate>(raw)?))
-            }
+            "INTERACTION_CREATE" => Event::Interaction(Box::new(with_interaction_id(
+                serde_json::from_str::<InteractionCreate>(raw)?,
+            ))),
 
             other => Event::Unknown { name: other.to_string() },
         };
@@ -237,6 +242,25 @@ mod tests {
             Event::GroupAddRobot(notice) => {
                 assert_eq!(notice.event_id.as_deref(), Some("EVENT-123"));
                 assert_eq!(notice.group_openid.as_deref(), Some("G1"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// 按钮回调的被动回复凭证同样来自 payload 外层 id，必须被保留。
+    #[test]
+    fn interaction_keeps_outer_event_id() {
+        let d = raw(
+            r#"{"id":"I1","interaction_type":1,"chat_type":1,"group_openid":"G1","data":{"button_data":"task:x:page:2"}}"#,
+        );
+        let ev = Event::parse(Some("INTERACTION_CREATE"), Some(&d), Some("EVENT-456"))
+            .unwrap()
+            .unwrap();
+        match ev {
+            Event::Interaction(i) => {
+                assert_eq!(i.event_id.as_deref(), Some("EVENT-456"));
+                assert_eq!(i.id, "I1");
+                assert_eq!(i.button_data().as_deref(), Some("task:x:page:2"));
             }
             other => panic!("unexpected: {other:?}"),
         }

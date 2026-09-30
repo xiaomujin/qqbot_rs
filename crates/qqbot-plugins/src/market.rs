@@ -7,7 +7,7 @@
 //! 而 tarkov-market.com 已经死了（403 + 加密载荷），GraphQL 后端也挂着。
 //! 所以这里用同一张表：参数是 **24 位十六进制 id** 就给详情，否则当关键词搜。
 //!
-//! ⚠️ 名字是英文 slug 而不是中文，原因同 `ammo.rs`。
+//! 中文名来自 `regular/items_zh` 语言包（键 `<物品 id> Name`），原因同 `ammo.rs`。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use qqbot_store::{ResourceStore, TarkovItem};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::ammo::{has_non_ascii, query_tokens};
+use crate::ammo::{ItemLangPack, item_name, parse_item_lang, query_tokens};
 
 /// 一次最多列几件。
 const MAX_ROWS: usize = 12;
@@ -27,12 +27,18 @@ const MAX_ROWS: usize = 12;
 #[derive(Clone)]
 pub struct MarketConfig {
     pub items_url: String,
+    /// 物品名语言包（`<id> Name`）。
+    pub items_zh_url: String,
     pub store: Option<Arc<ResourceStore>>,
 }
 
 impl Default for MarketConfig {
     fn default() -> Self {
-        Self { items_url: "https://json.tarkov.dev/regular/items".into(), store: None }
+        Self {
+            items_url: "https://json.tarkov.dev/regular/items".into(),
+            items_zh_url: "https://json.tarkov.dev/regular/items_zh".into(),
+            store: None,
+        }
     }
 }
 
@@ -68,7 +74,7 @@ struct ItemEntry {
 }
 
 /// 解析物品。没有 slug 的条目会被丢掉 —— 它们没法被检索到。
-pub fn parse_items(body: &str) -> Result<Vec<TarkovItem>, String> {
+pub fn parse_items(body: &str, pack: &ItemLangPack) -> Result<Vec<TarkovItem>, String> {
     let parsed: ItemsResponse =
         serde_json::from_str(body).map_err(|err| format!("解析物品数据失败：{err}"))?;
     let items = parsed.data.ok_or("物品响应缺少 data")?.items;
@@ -80,9 +86,11 @@ pub fn parse_items(body: &str) -> Result<Vec<TarkovItem>, String> {
             if normalized_name.is_empty() {
                 return None;
             }
+            let name_zh = item_name(pack, &id);
             Some(TarkovItem {
                 id,
                 normalized_name,
+                name_zh,
                 base_price: item.base_price,
                 last_low_price: item.last_low_price,
                 avg24h_price: item.avg24h_price,
@@ -135,7 +143,12 @@ fn price_summary(item: &TarkovItem) -> String {
 pub fn format_rows(items: &[TarkovItem]) -> Vec<serde_json::Value> {
     items
         .iter()
-        .map(|it| json!({ "label": it.normalized_name, "value": price_summary(it) }))
+        .map(|it| {
+            json!({
+                "label": it.name_zh.as_deref().unwrap_or(&it.normalized_name),
+                "value": price_summary(it),
+            })
+        })
         .collect()
 }
 
@@ -143,7 +156,10 @@ pub fn format_rows(items: &[TarkovItem]) -> Vec<serde_json::Value> {
 pub fn detail_rows(item: &TarkovItem) -> Vec<serde_json::Value> {
     let opt = |v: Option<i64>| v.map_or("-".to_string(), format_price);
     let mut rows = vec![
-        json!({ "label": "物品", "value": item.normalized_name }),
+        json!({
+            "label": "物品",
+            "value": item.name_zh.as_deref().unwrap_or(&item.normalized_name),
+        }),
         json!({ "label": "商人基础价", "value": format_price(item.base_price) }),
         json!({ "label": "最低挂牌", "value": opt(item.last_low_price) }),
         json!({ "label": "24 小时均价", "value": opt(item.avg24h_price) }),
@@ -184,15 +200,26 @@ impl MarketPlugin {
             return Handled::Consumed;
         };
 
-        let body = match self.fetch().await {
-            Ok(body) => body,
+        let (body, lang) = match tokio::try_join!(
+            self.fetch(&self.config.items_url),
+            self.fetch(&self.config.items_zh_url)
+        ) {
+            Ok(pair) => pair,
             Err(reason) => {
                 tracing::warn!(error = %reason, "下载物品数据失败");
                 let _ = ctx.reply_text(format!("下载失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
-        let items = match parse_items(&body) {
+        let pack = match parse_item_lang(&lang) {
+            Ok(pack) => pack,
+            Err(reason) => {
+                tracing::warn!(error = %reason, "物品语言包解析失败");
+                let _ = ctx.reply_text(format!("语言包解析失败：{reason}")).await;
+                return Handled::Consumed;
+            }
+        };
+        let items = match parse_items(&body, &pack) {
             Ok(items) if !items.is_empty() => items,
             Ok(_) => {
                 let _ = ctx.reply_text("解析出 0 件物品，上游格式可能变了").await;
@@ -240,7 +267,10 @@ impl MarketPlugin {
                 }
             };
             match found {
-                Some(item) => (format!("跳蚤 · {}", item.normalized_name), detail_rows(&item)),
+                Some(item) => {
+                    let name = item.name_zh.as_deref().unwrap_or(&item.normalized_name);
+                    (format!("跳蚤 · {name}"), detail_rows(&item))
+                }
                 None => {
                     let _ = ctx.reply_text(self.empty_hint(store, "没有这个 id 对应的物品", raw).await).await;
                     return Handled::Consumed;
@@ -279,23 +309,17 @@ impl MarketPlugin {
     }
 
     /// 查不到时的话术。空表与「关键词不对」要给不同的话。
-    /// 查不到时的话术。空表、「打了中文」与「关键词不对」是三件不同的事。
-    async fn empty_hint(&self, store: &ResourceStore, miss: &str, query: &str) -> String {
+    async fn empty_hint(&self, store: &ResourceStore, miss: &str, _query: &str) -> String {
         match store.item_count().await {
             Ok(0) => "物品数据还没导入，请管理员发「更新物品」".to_string(),
-            // 数据里只有英文 slug，打了中文要说明白。
-            _ if has_non_ascii(query) => {
-                "物品名只有英文 slug（如 colt-m4a1-556x45-assault-rifle）—— 上游静态数据里没有中文"
-                    .to_string()
-            }
             _ => format!("{miss}，换个关键词试试"),
         }
     }
 
-    async fn fetch(&self) -> Result<String, String> {
+    async fn fetch(&self, url: &str) -> Result<String, String> {
         let res = self
             .http
-            .get(&self.config.items_url)
+            .get(url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
             .send()
             .await
@@ -337,7 +361,7 @@ mod tests {
 
     #[test]
     fn keeps_items_with_a_slug_and_sorts() {
-        let items = parse_items(FIXTURE).unwrap();
+        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
         assert_eq!(items.len(), 2, "没有 slug 的条目没法被检索到: {items:?}");
         assert_eq!(items[0].normalized_name, "colt-m4a1-556x45-assault-rifle");
         assert_eq!(items[1].normalized_name, "slick-body-armor");
@@ -346,7 +370,7 @@ mod tests {
     #[test]
     fn missing_flea_prices_stay_none() {
         // 关键：缺价不能变成 0，否则会显示成「不值钱」。
-        let items = parse_items(FIXTURE).unwrap();
+        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
         let slick = &items[1];
         assert_eq!(slick.last_low_price, None);
         assert_eq!(slick.avg24h_price, None);
@@ -355,7 +379,7 @@ mod tests {
 
     #[test]
     fn maps_the_price_fields() {
-        let items = parse_items(FIXTURE).unwrap();
+        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
         let m4 = &items[0];
         assert_eq!(m4.base_price, 18397);
         assert_eq!(m4.last_low_price, Some(23932));
@@ -385,7 +409,7 @@ mod tests {
             .text()
             .await
             .expect("读取失败");
-        let items = parse_items(&body).expect("解析失败");
+        let items = parse_items(&body, &ItemLangPack::new()).expect("解析失败");
         assert!(items.len() > 5000, "应当解析出五千件以上物品，实际 {}", items.len());
         let priced = items.iter().filter(|i| i.avg24h_price.is_some()).count();
         assert!(priced > 3000, "应当有三千件以上带跳蚤价，实际 {priced}");
@@ -396,8 +420,8 @@ mod tests {
 
     #[test]
     fn broken_input_is_an_error_not_a_panic() {
-        assert!(parse_items("不是 JSON").is_err());
-        assert!(parse_items(r#"{"data":null}"#).is_err());
+        assert!(parse_items("不是 JSON", &ItemLangPack::new()).is_err());
+        assert!(parse_items(r#"{"data":null}"#, &ItemLangPack::new()).is_err());
     }
 
     #[test]
@@ -418,7 +442,7 @@ mod tests {
 
     #[test]
     fn search_rows_say_when_there_is_no_flea_data() {
-        let items = parse_items(FIXTURE).unwrap();
+        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
         let rows = format_rows(&items);
         assert_eq!(rows[0]["value"], "跳蚤 9.36万 · 商人 1.84万", "均价优先于最低挂牌");
         assert_eq!(rows[1]["value"], "无跳蚤数据", "缺价要说清楚，不能显示 0");
@@ -426,7 +450,7 @@ mod tests {
 
     #[test]
     fn detail_rows_cover_every_field() {
-        let items = parse_items(FIXTURE).unwrap();
+        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
         let rows = detail_rows(&items[0]);
         let labels: Vec<&str> = rows.iter().map(|r| r["label"].as_str().unwrap()).collect();
         assert_eq!(
@@ -439,7 +463,7 @@ mod tests {
 
     #[test]
     fn detail_rows_use_a_dash_for_missing_values() {
-        let items = parse_items(FIXTURE).unwrap();
+        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
         let rows = detail_rows(&items[1]);
         assert_eq!(rows[2]["value"], "-");
         assert_eq!(rows[4]["value"], "-", "只有一边有价也算缺");

@@ -19,7 +19,9 @@ pub use ctx::{Ctx, Services};
 pub use dispatch::{DispatchConfig, Dispatcher};
 pub use error::CoreError;
 pub use message::{Body, SendRequest};
-pub use plugin::{FnHandler, Handled, Handler, Matcher, RouteInfo, Router, Rule, Scope};
+pub use plugin::{
+    FnHandler, Handled, Handler, InteractionCtx, Matcher, RouteInfo, Router, Rule, Scope,
+};
 pub use session::{
     recommended_shards, Quota, QuotaRules, SessionMsg, SessionRegistry, SessionState, WindowRules,
 };

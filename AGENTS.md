@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 bin（`src/`） |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 438 项，全绿 |
+| 测试基线 | 459 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -250,6 +250,7 @@ edition 2024 起 `env::set_var` 是 unsafe，而本 workspace 禁 unsafe，
 | 改了什么 | 同步哪里 |
 |---|---|
 | 协议行为 / 端点 / 频控 | `docs/qq-bot-api-v2-protocol.md`（端点表在 §11，约束要点在 §12） |
+| Markdown 消息排版 | `docs/qq-bot-api-v2-protocol.md` §13（官方语法：图片必须公网 URL、分割线用 `***`、群聊只有 `qqbot-cmd-input` 可点） |
 | 测试数量、命令、部署要求 | `README.md` |
 | actor 边界、硬性禁令、命令清单 | 本文件自身 |
 | 新增接口 | 协议文档 §11 表格 + `client.rs` + 类型模块 + `lib.rs` re-export |

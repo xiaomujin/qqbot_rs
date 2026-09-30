@@ -39,7 +39,8 @@ use anyhow::{Context, Result};
 pub use model::{fmt_unix, now_unix, NewMessage, Scope, MAX_CONTENT_CHARS};
 pub use reader::{MAX_TEXT_CHARS, MAX_TEXT_ROWS};
 pub use resource::{
-    Ammo, TarkovItem, TarkovTask,
+    Ammo, TarkovItem, TarkovObjective, TarkovPrereq, TarkovReward, TarkovSuccessor, TarkovTask,
+    TarkovTaskDetail, TarkovTaskFail, TarkovTaskKey,
     KeywordEntry, Resource, ResourceScope, ResourceSpec, ResourceStore, DEFAULT_SYSTEM_CONTROLLER,
     SYSTEM_CONTROLLERS_KEY, SYSTEM_OWNER,
 };

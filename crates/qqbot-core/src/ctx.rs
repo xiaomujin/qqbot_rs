@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use qqbot_api::{ApiClient, MessageEvent, SendResult, Target};
+use qqbot_api::{ApiClient, Keyboard, MessageEvent, SendResult, Target};
 use qqbot_media::{FileType, MediaUploader};
 use qqbot_render::RenderService;
 use qqbot_store::MessageStore;
@@ -164,6 +164,22 @@ impl Ctx {
     pub async fn reply_markdown(&self, md: impl Into<String>) -> Result<SendResult, CoreError> {
         self.services
             .send(SendRequest::markdown(self.target.clone(), md).replying_to(self.message.id.clone()))
+            .await
+    }
+
+    /// Markdown 正文 + 内嵌键盘（按钮）回复。
+    ///
+    /// 正文与按钮同一条消息发出，省一次被动回复配额（群聊一共只有 5 次）。
+    pub async fn reply_markdown_with_keyboard(
+        &self,
+        md: impl Into<String>,
+        keyboard: Keyboard,
+    ) -> Result<SendResult, CoreError> {
+        self.services
+            .send(
+                SendRequest::markdown_with_keyboard(self.target.clone(), md, keyboard)
+                    .replying_to(self.message.id.clone()),
+            )
             .await
     }
 

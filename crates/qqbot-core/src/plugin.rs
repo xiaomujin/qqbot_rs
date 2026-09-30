@@ -4,9 +4,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use qqbot_api::{Keyboard, SendResult, Target};
 use regex::Regex;
 
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, Services};
+use crate::error::CoreError;
+use crate::message::SendRequest;
 
 /// 处理结果，对应 Shiro 的 `MESSAGE_BLOCK` / `MESSAGE_IGNORE`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,10 +20,57 @@ pub enum Handled {
     Next,
 }
 
+/// 按钮 / 菜单回调（互动事件）的处理上下文。
+pub struct InteractionCtx {
+    pub services: Arc<Services>,
+    pub target: Target,
+    pub sender_openid: Option<String>,
+    /// 被动回复凭证；为空时只能发主动消息。
+    pub event_id: Option<String>,
+    /// 回调按钮的 data，形如 `task:59c512ad86f7741f0d09de9b:page:2`。
+    pub button_data: String,
+}
+
+impl InteractionCtx {
+    /// 发送 Markdown：有 `event_id` 走事件被动回复，否则走主动消息。
+    pub async fn send_markdown(&self, md: impl Into<String>) -> Result<SendResult, CoreError> {
+        self.send(SendRequest::markdown(self.target.clone(), md)).await
+    }
+
+    /// 发送 Markdown + 内嵌键盘（按钮）。
+    pub async fn send_markdown_with_keyboard(
+        &self,
+        md: impl Into<String>,
+        keyboard: Keyboard,
+    ) -> Result<SendResult, CoreError> {
+        self.send(SendRequest::markdown_with_keyboard(self.target.clone(), md, keyboard)).await
+    }
+
+    /// 统一挂被动回复凭证。
+    ///
+    /// `msg_seq` 与配额校验都在 [`Services::send`] 里由会话 actor 完成，
+    /// 这里只决定「带不带 event_id」。
+    async fn send(&self, request: SendRequest) -> Result<SendResult, CoreError> {
+        let request = match &self.event_id {
+            Some(id) => request.responding_to_event(id.clone()),
+            None => request,
+        };
+        self.services.send(request).await
+    }
+}
+
 /// 命令处理器。
 #[async_trait]
 pub trait Handler: Send + Sync + 'static {
     async fn handle(&self, ctx: &Ctx) -> Handled;
+
+    /// 处理按钮 / 菜单回调事件。
+    ///
+    /// 默认不处理（[`Handled::Next`]）—— 只有关心互动的插件才覆盖它，
+    /// 其余插件的实现不受影响。
+    async fn on_interaction(&self, _ctx: &InteractionCtx) -> Handled {
+        Handled::Next
+    }
 
     /// 插件名，用于日志与指标。
     fn name(&self) -> &str {
@@ -258,6 +308,31 @@ impl Router {
                 outcome = ?outcome,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "插件执行完成"
+            );
+
+            if outcome == Handled::Consumed {
+                return Handled::Consumed;
+            }
+        }
+        Handled::Next
+    }
+
+    /// 把互动事件按注册顺序交给各插件的 [`Handler::on_interaction`]。
+    ///
+    /// 与 [`Router::dispatch`] 不同，这里**不做 matcher / scope 过滤**：
+    /// 按钮回调没有「消息全文」可匹配，是否处理由插件自己按 `button_data` 判断。
+    pub async fn dispatch_interaction(&self, ctx: &InteractionCtx) -> Handled {
+        for rule in &self.rules {
+            let started = Instant::now();
+            let outcome = rule.handler.on_interaction(ctx).await;
+            metrics::histogram!("qqbot_plugin_duration_seconds", "plugin" => rule.name.clone())
+                .record(started.elapsed().as_secs_f64());
+
+            tracing::debug!(
+                plugin = %rule.name,
+                outcome = ?outcome,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "互动事件处理完成"
             );
 
             if outcome == Handled::Consumed {

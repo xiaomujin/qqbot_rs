@@ -4,12 +4,12 @@ use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use moka::sync::Cache;
-use qqbot_api::Event;
+use qqbot_api::{Event, InteractionResponse};
 use qqbot_store::{now_unix, NewMessage, Scope};
 use tokio::sync::Semaphore;
 
 use crate::ctx::{Ctx, Services};
-use crate::plugin::{Handled, Router};
+use crate::plugin::{Handled, InteractionCtx, Router};
 
 #[derive(Debug, Clone)]
 pub struct DispatchConfig {
@@ -33,7 +33,9 @@ impl Default for DispatchConfig {
 
 /// 事件分发器：去重 → 登记被动窗口 → 路由。
 pub struct Dispatcher {
-    router: Router,
+    /// 用 `Arc` 持有：互动事件必须派生到独立任务里处理，
+    /// 而派生要求 `'static`，不能借用 `&self`。
+    router: Arc<Router>,
     services: Arc<Services>,
     dedup: Cache<String, ()>,
     sem: Arc<Semaphore>,
@@ -46,7 +48,7 @@ impl Dispatcher {
             .time_to_live(cfg.dedup_ttl)
             .build();
         Self {
-            router,
+            router: Arc::new(router),
             services,
             dedup,
             sem: Arc::new(Semaphore::new(cfg.concurrency.max(1))),
@@ -81,8 +83,29 @@ impl Dispatcher {
             Event::C2cMessage(m) | Event::GroupAtMessage(m) | Event::GroupMessage(m) => {
                 self.handle_message(event.name(), m.clone()).await;
             }
+            Event::Interaction(i) => {
+                // 1) 幂等：同一个 interaction_id 只能回应一次，重推直接丢弃。
+                //    去重放在派生**之前** —— `dedup` 的 get/insert 不是原子操作，
+                //    放进 spawn 里两个重推事件可能同时通过检查。
+                let key = format!("{}:{}", event.name(), i.id);
+                if self.dedup.get(&key).is_some() {
+                    metrics::counter!("qqbot_events_dedup_total").increment(1);
+                    tracing::debug!(interaction_id = %i.id, "重复互动事件，已忽略");
+                    return;
+                }
+                self.dedup.insert(key, ());
+
+                // 2) 官方给互动事件的回应超时只有 3 秒，这条路径要先走一次 HTTP。
+                //    派生出去：事件循环立刻返回，也不占用 dispatch 的并发许可。
+                let services = self.services.clone();
+                let router = self.router.clone();
+                let interaction = i.clone();
+                tokio::spawn(async move {
+                    handle_interaction(services, router, interaction).await;
+                });
+            }
             other => {
-                // 非消息事件（加群、被撤回、按钮回调等）在排障时同样需要可见
+                // 其余事件（加群、被撤回、开关变更等）在排障时同样需要可见
                 tracing::info!(name = other.name(), "收到非消息事件");
             }
         }
@@ -171,6 +194,68 @@ impl Dispatcher {
             }
         }
         metrics::histogram!("qqbot_dispatch_duration_seconds").record(started.elapsed().as_secs_f64());
+    }
+}
+
+/// 处理按钮回调：先回应官方（3 秒超时），再交给插件责任链。
+///
+/// ⚠️ 调用方必须把它 `tokio::spawn` 出去 —— 这条路径有网络往返，
+/// 在事件循环里 `await` 会拖住所有消息处理（AGENTS.md 的硬约束）。
+async fn handle_interaction(
+    services: Arc<Services>,
+    router: Arc<Router>,
+    event: Box<qqbot_api::event::notice::InteractionCreate>,
+) {
+    // 1) 官方要求 3 秒内回应，否则用户端一直转圈。失败只告警：
+    //    回应失败不该中断后续的消息发送。
+    if let Err(err) = services
+        .api
+        .respond_interaction(&event.id, InteractionResponse::default())
+        .await
+    {
+        tracing::warn!(interaction_id = %event.id, error = %err, "回应互动事件失败");
+    }
+
+    // 2) 推导发送目标。
+    let Some(target) = event.target() else {
+        tracing::warn!(interaction_id = %event.id, "无法推导互动事件目标，跳过");
+        return;
+    };
+
+    let ctx = InteractionCtx {
+        services,
+        target,
+        sender_openid: event.sender_openid().map(str::to_string),
+        event_id: event.event_id.clone(),
+        // 取不到就退化成空串：插件按前缀匹配自然不会命中，
+        // 但事件本身仍会走完责任链（便于日志排查）。
+        button_data: event.button_data().unwrap_or_default(),
+    };
+
+    tracing::info!(
+        interaction_id = %event.id,
+        target = %ctx.target.key(),
+        sender = ctx.sender_openid.as_deref().unwrap_or("-"),
+        button_data = %truncate_for_log(&ctx.button_data, 60),
+        "收到互动事件"
+    );
+
+    // 3) 责任链。用 catch_unwind 隔离插件 panic，与消息路径一致。
+    match AssertUnwindSafe(router.dispatch_interaction(&ctx)).catch_unwind().await {
+        Ok(Handled::Consumed) => {
+            metrics::counter!("qqbot_dispatch_total", "result" => "consumed").increment(1);
+        }
+        Ok(Handled::Next) => {
+            metrics::counter!("qqbot_dispatch_total", "result" => "unhandled").increment(1);
+            tracing::debug!("没有插件处理该互动事件");
+        }
+        Err(_) => {
+            metrics::counter!("qqbot_plugin_panic_total").increment(1);
+            tracing::error!(
+                button_data = %truncate_for_log(&ctx.button_data, 60),
+                "插件 panic 已被隔离"
+            );
+        }
     }
 }
 
@@ -324,6 +409,52 @@ mod tests {
         let d = Dispatcher::new(router, services(), DispatchConfig::default());
         // 不应把测试进程带崩
         d.handle(event("C2C_MESSAGE_CREATE", r#"{"id":"M7","author":{"user_openid":"U"},"content":"x"}"#)).await;
+    }
+
+    /// 互动事件按注册顺序走 `on_interaction`，遇到 Consumed 立刻停下。
+    #[tokio::test]
+    async fn interaction_chain_stops_on_consumed() {
+        use crate::plugin::InteractionCtx;
+        use qqbot_api::Target;
+
+        struct Probe {
+            name: &'static str,
+            seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
+            consume: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::plugin::Handler for Probe {
+            async fn handle(&self, _ctx: &Ctx) -> Handled {
+                Handled::Next
+            }
+
+            async fn on_interaction(&self, ctx: &InteractionCtx) -> Handled {
+                assert_eq!(ctx.button_data, "task:x:page:2");
+                assert_eq!(ctx.event_id.as_deref(), Some("EV"));
+                self.seen.lock().unwrap().push(self.name);
+                if self.consume { Handled::Consumed } else { Handled::Next }
+            }
+
+            fn name(&self) -> &str {
+                self.name
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let mut router = Router::new();
+        router.on_any(Matcher::Any, Probe { name: "first", seen: seen.clone(), consume: true });
+        router.on_any(Matcher::Any, Probe { name: "second", seen: seen.clone(), consume: false });
+
+        let ctx = InteractionCtx {
+            services: services(),
+            target: Target::group("G1"),
+            sender_openid: Some("U1".into()),
+            event_id: Some("EV".into()),
+            button_data: "task:x:page:2".into(),
+        };
+        assert_eq!(router.dispatch_interaction(&ctx).await, Handled::Consumed);
+        assert_eq!(*seen.lock().unwrap(), vec!["first"]);
     }
 
     #[tokio::test]

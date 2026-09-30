@@ -15,7 +15,30 @@ use rusqlite::Connection;
 /// v7 增加 `tarkov_task`（塔科夫任务数据，同一来源）。
 /// v8 增加 `tarkov_item`（塔科夫物品与跳蚤价格，同一来源）。
 /// v9 给 `tarkov_task` 加 `name_zh`（GraphQL `lang: zh` 的中文名）。
-pub const SCHEMA_VERSION: i64 = 9;
+/// v10 重写任务：`tarkov_task` 补图/地图/商人中文名，去掉 `objectives` 计数列，
+/// 并拆出 `tarkov_task_objective` / `tarkov_task_reward` / `tarkov_task_prereq`。
+/// v11 塔科夫全模块改走**静态语言包**（`json.tarkov.dev/regular/<资源>_zh`）：
+/// 新增 `tarkov_task_successor`（由 `taskRequirements` 反转得到），
+/// 任务补英文名/地图中文名/导入时间，目标补 `detail_json`，
+/// `ammo` 与 `tarkov_item` 补 `name_zh`。
+/// v12 去掉 `detail_json` 这条「结构化字段塞进 JSON、渲染时再解析回来」的链路。
+///
+/// 它的问题不是性能，而是**语义在两端各实现一次**：导入时把字段序列化成 JSON，
+/// 渲染时又 `from_str::<Value>(..).ok()` 解析回来，于是「数量该摆在正文还是块引用」
+/// 「×1 要不要显示」这类判断散落在渲染函数里，每加一条排版规则就多一个 `if`。
+/// v12 把这条链路整条删掉：
+///
+///   - 目标的**正文与标记在导入时拼好**（`display_text` / `marks`），
+///     渲染层拿到什么印什么，不再判断数量与标记该怎么摆；
+///   - 任务级的阵营 / 可重复接取落成列，需要钥匙 / 商人要求 / 失败条件落成三张子表。
+///     名字类字段一律在导入时用语言包解析好 —— 它们是数据，不是状态快照。
+///
+/// 这与项目早就定下的做法一致：`name_zh` 也是导入时解析好存下来的，
+/// 而不是渲染时再查语言包。
+///
+/// 旧库的塔科夫缓存会在升级时清空 —— 正文只能由上游数据重算，库里的行救不回来。
+/// 它是上游的副本，系统控制者发一次「更新任务」就重建。
+pub const SCHEMA_VERSION: i64 = 12;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -112,9 +135,11 @@ CREATE TABLE IF NOT EXISTS pending_captions (
 -- 静态 JSON 里真实存在、且玩家真正会看的那几项。
 CREATE TABLE IF NOT EXISTS ammo (
     id                  TEXT PRIMARY KEY,
-    -- 可读的 slug（`556x45mm-m855`）。静态 JSON 里的 `name` 是**翻译键**，
-    -- 只有 GraphQL 的 `lang: zh` 能解析它，所以这里用 normalizedName 做检索与显示。
+    -- 可读的 slug（`556x45mm-m855`）。静态 JSON 里的 `name` 是**翻译键**
+    -- （形如 `<id> Name`），由 `regular/items_zh` 语言包解析成中文。
     normalized_name     TEXT NOT NULL,
+    -- 语言包里的中文名。解析不到时为 NULL，检索与显示退回 slug。
+    name_zh             TEXT,
     caliber             TEXT NOT NULL DEFAULT '',
     damage              INTEGER NOT NULL DEFAULT 0,
     penetration_power   INTEGER NOT NULL DEFAULT 0,
@@ -128,24 +153,140 @@ CREATE TABLE IF NOT EXISTS ammo (
 
 CREATE INDEX IF NOT EXISTS idx_ammo_normalized_name ON ammo(normalized_name);
 
--- 塔科夫任务。字段对齐 cq-bot 的 `tkf_task`（MIT），但只保留静态 JSON
--- 里真实有值的项 —— 它没有 `finish_reward` / `pre_task` 这些。
+-- 塔科夫任务。对齐 cq-bot 的 `tkf_task`（MIT），但**不照抄它的两处做法**：
+--
+--   1. 它的 `id` 是自增整数，而每次更新都是 `remove(null)` 全删重插 ——
+--      id 会漂，`pre_task_id` 里存的就是旧 id，跨版本直接失效。
+--      这里用 24 位 hex 的**上游 id**，重导多少次都不变。
+--   2. 它把奖励与前置任务**渲染成 Markdown 字符串**塞进 `finish_reward` /
+--      `pre_task` 两列。查询时零计算，但改了渲染格式要全量重导，
+--      而且 `pre_task` 里的「(进行中)/(完成)」是**导出那一刻**的快照，
+--      之后永远不会更新。这里拆成下面三张表。
 CREATE TABLE IF NOT EXISTS tarkov_task (
     id              TEXT PRIMARY KEY,
     -- 可读 slug（`gunsmith-part-1`）。与弹药同理：`name` 是翻译键。
     normalized_name TEXT NOT NULL,
-    -- 中文名，来自 GraphQL 的 `tasks(lang: zh)`。
-    -- **可为空**：那个后端挂着的时候只有 slug 可用。
+    -- 中文名，来自 `regular/tasks_zh` 语言包的 `<id> name`。
+    -- 实测 515/515 命中，导入时**强制非空**；列仍可空只为兼容旧库。
     name_zh         TEXT,
+    -- 英文名（`The Punisher - Part 1`），从 `normalizedName` 反推。
+    name_en         TEXT,
     -- 商人的可读 slug（`prapor`），由 traders 表解析而来。
     trader          TEXT NOT NULL DEFAULT '',
+    -- 商人的中文名与头像。头像来自静态 JSON 的 `imageLink`，
+    -- 是渲染卡片时要用的（cq-bot 也存了）。
+    trader_name_zh  TEXT,
+    trader_image    TEXT NOT NULL DEFAULT '',
+    -- 任务自己的图标。
+    task_image      TEXT NOT NULL DEFAULT '',
+    -- 任务发生的地图 slug，来自 `map` 字段。
+    map             TEXT NOT NULL DEFAULT '',
+    -- 地图中文名（`regular/maps_zh` 的 `<mapId> Name`）。
+    map_name_zh     TEXT,
     min_level       INTEGER NOT NULL DEFAULT 0,
     is_kappa        INTEGER NOT NULL DEFAULT 0,
     is_lightkeeper  INTEGER NOT NULL DEFAULT 0,
     experience      INTEGER NOT NULL DEFAULT 0,
-    -- 目标条数。目标的**文字**也是翻译键，所以只存个数。
-    objectives      INTEGER NOT NULL DEFAULT 0,
-    wiki_link       TEXT NOT NULL DEFAULT ''
+    wiki_link       TEXT NOT NULL DEFAULT '',
+    -- 阵营（USEC / BEAR）。上游的 `Any` 在导入时就被过滤掉，存进来的一定有意义。
+    faction         TEXT,
+    -- 是否可重复接取。
+    restartable     INTEGER NOT NULL DEFAULT 0,
+    -- 本次导入的 unix 秒。卡片底部显示「数据更新于」，也用于判断是否需要重导。
+    updated_at      INTEGER NOT NULL DEFAULT 0
+);
+
+-- 任务目标。对应 cq-bot 的 `tkf_task_target`，三处改进：
+--
+--   1. 用**稳定的 `task_id`** 而不是自增整数 `parent_id`；
+--   2. 显式存 `ordinal` —— 它靠插入顺序，而 `saveBatch` 不保证顺序；
+--   3. 把「翻译键」与「解析出的中文」分成两列。静态 JSON 里 `description`
+--      就是目标自己的 id（一个翻译键），由 `regular/tasks_zh` 解析。
+--      实测 1441/1441 命中；万一新目标还没进语言包，
+--      渲染退回按 `objective_type` 写的通用文案，而不是显示一串 hex。
+CREATE TABLE IF NOT EXISTS tarkov_task_objective (
+    task_id         TEXT NOT NULL,
+    ordinal         INTEGER NOT NULL,
+    -- 上游的 `type`（`visit` / `shoot` / …）。渲染已经不用它，
+    -- 留着是排障：能看出某条目标是「语言包缺了」还是「上游换了类型」。
+    objective_type  TEXT NOT NULL DEFAULT '',
+    -- 语言包里的翻译键（实测就是目标自己的 id）。覆盖率统计与重新解析要用。
+    description_key TEXT NOT NULL DEFAULT '',
+    -- **导入时拼好的正文**：「在海关使用 AKS-74U 消灭 Scav ×25」。
+    -- 数量并进正文、×1 省掉、语言包缺失时退回按 `objective_type` 写的通用文案 ——
+    -- 全都在导入时决定一次。渲染层拿到什么印什么，不再判断数量该怎么摆。
+    display_text    TEXT NOT NULL DEFAULT '',
+    -- **导入时拼好的附加标记**，`|` 分隔（`可选|战局内|21:00-6:00`），空串表示没有。
+    -- 分隔符用 `|` 而不是 ` · `：标记怎么呈现是排版的事 ——
+    -- 目标少时走块引用，目标多时整段塞进代码块、标记只能写在行内。
+    marks           TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (task_id, ordinal)
+);
+
+-- 任务奖励。cq-bot 把它渲染成文本塞进 `finish_reward`，这里拆成行。
+CREATE TABLE IF NOT EXISTS tarkov_task_reward (
+    task_id     TEXT NOT NULL,
+    ordinal     INTEGER NOT NULL,
+    -- standing（商人声望）/ item（物品）/ skill（技能）/ unlock（解锁）。
+    kind        TEXT NOT NULL,
+    -- 商人或物品的上游 id，用来在解析出中文名后回填。
+    ref_id      TEXT NOT NULL DEFAULT '',
+    name_zh     TEXT,
+    -- 声望是小数（0.1），物品是整数，用 REAL 通吃。
+    amount      REAL NOT NULL DEFAULT 0,
+    -- 结构化补充：工艺解锁的 `{station, level}`、起始奖励标记等。
+    extra       TEXT,
+    PRIMARY KEY (task_id, ordinal)
+);
+
+-- 前置任务。cq-bot 存 `pre_task_id`（`|` 分隔的**旧自增 id**）
+-- 与 `pre_task`（带状态的中文文本快照）。这里两者都结构化，
+-- 状态可以每次刷新，而不是永远停在导出那一刻。
+CREATE TABLE IF NOT EXISTS tarkov_task_prereq (
+    task_id     TEXT NOT NULL,
+    ordinal     INTEGER NOT NULL,
+    prereq_id   TEXT NOT NULL,
+    -- complete / active / failed。上游给的是数组，这里拍平成逗号分隔。
+    status      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (task_id, ordinal)
+);
+
+-- 后续任务。上游**没有**这个方向的数据，由 `taskRequirements` 反转得到：
+-- A 的前置里有 B ⇒ B 的后续里就有 A。
+-- 单独建表而不是查询时反转：卡片要显示「后续任务」，而反转得扫全表的前置。
+CREATE TABLE IF NOT EXISTS tarkov_task_successor (
+    task_id      TEXT NOT NULL,
+    ordinal      INTEGER NOT NULL,
+    successor_id TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (task_id, ordinal)
+);
+
+-- 任务需要钥匙。一行 = 一张地图 + 这张地图上要的钥匙。
+-- 钥匙名在导入时就用语言包解析好、`、` 连接 —— 渲染层只管加 `- `。
+CREATE TABLE IF NOT EXISTS tarkov_task_key (
+    task_id  TEXT NOT NULL,
+    ordinal  INTEGER NOT NULL,
+    map_name TEXT NOT NULL DEFAULT '',
+    keys     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (task_id, ordinal)
+);
+
+-- 商人的接取门槛。一行 = 一句人话（「大老板 忠诚等级 >= 2」），导入时拼好。
+CREATE TABLE IF NOT EXISTS tarkov_task_requirement (
+    task_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    text    TEXT NOT NULL,
+    PRIMARY KEY (task_id, ordinal)
+);
+
+-- 失败条件。一行 = 一个会把任务判失败的任务 + 触发它的状态。
+CREATE TABLE IF NOT EXISTS tarkov_task_fail (
+    task_id   TEXT NOT NULL,
+    ordinal   INTEGER NOT NULL,
+    task_name TEXT NOT NULL,
+    status    TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (task_id, ordinal)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tarkov_task_name ON tarkov_task(normalized_name);
@@ -155,6 +296,8 @@ CREATE TABLE IF NOT EXISTS tarkov_item (
     id              TEXT PRIMARY KEY,
     -- 可读 slug（`colt-m4a1-556x45-assault-rifle`）。理由同 ammo / tarkov_task。
     normalized_name TEXT NOT NULL,
+    -- 语言包里的中文名（`regular/items_zh` 的 `<id> Name`）。
+    name_zh         TEXT,
     base_price      INTEGER NOT NULL DEFAULT 0,
     -- 跳蚤市场价：最低挂牌 / 24 小时均价 / 24 小时最低 / 24 小时最高。
     last_low_price  INTEGER,
@@ -211,23 +354,99 @@ fn upgrade(conn: &Connection, from: i64) -> Result<()> {
         // 可空：GraphQL 挂着时这一列全是 NULL，检索要能接受。
         add_column_if_missing(conn, "tarkov_task", "name_zh", "TEXT")?;
     }
+    if from < 10 {
+        // 三张子表由 `DDL` 的 `CREATE TABLE IF NOT EXISTS` 建好，不用管。
+        // 这里只补 `tarkov_task` 自己新增的列。
+        add_column_if_missing(conn, "tarkov_task", "trader_name_zh", "TEXT")?;
+        add_column_if_missing(conn, "tarkov_task", "trader_image", "TEXT NOT NULL DEFAULT ''")?;
+        add_column_if_missing(conn, "tarkov_task", "task_image", "TEXT NOT NULL DEFAULT ''")?;
+        add_column_if_missing(conn, "tarkov_task", "map", "TEXT NOT NULL DEFAULT ''")?;
+        // `objectives` 那个计数列被 `tarkov_task_objective` 取代了。
+        // 留着它就是「两处真相」，迟早有人读错那一处。
+        drop_column_if_present(conn, "tarkov_task", "objectives")?;
+    }
+    if from < 11 {
+        // 塔科夫全模块改用静态语言包，理由见 `SCHEMA_VERSION` 的注释。
+        // `tarkov_task_successor` 由 `DDL` 建好，这里只补已存在表的新列。
+        add_column_if_missing(conn, "tarkov_task", "name_en", "TEXT")?;
+        add_column_if_missing(conn, "tarkov_task", "map_name_zh", "TEXT")?;
+        add_column_if_missing(conn, "tarkov_task", "updated_at", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(conn, "tarkov_task", "detail_json", "TEXT")?;
+        add_column_if_missing(conn, "tarkov_task_objective", "detail_json", "TEXT")?;
+        add_column_if_missing(conn, "tarkov_task_reward", "extra", "TEXT")?;
+        add_column_if_missing(conn, "ammo", "name_zh", "TEXT")?;
+        add_column_if_missing(conn, "tarkov_item", "name_zh", "TEXT")?;
+    }
+    if from < 12 {
+        // 三张子表由 `DDL` 建好（它跑在本函数之前），这里只动已存在的表。
+        add_column_if_missing(conn, "tarkov_task", "faction", "TEXT")?;
+        add_column_if_missing(conn, "tarkov_task", "restartable", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(
+            conn,
+            "tarkov_task_objective",
+            "display_text",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        add_column_if_missing(conn, "tarkov_task_objective", "marks", "TEXT NOT NULL DEFAULT ''")?;
+        drop_column_if_present(conn, "tarkov_task", "detail_json")?;
+        for column in ["description_zh", "is_optional", "count", "is_raid", "detail_json"] {
+            drop_column_if_present(conn, "tarkov_task_objective", column)?;
+        }
+        // 旧行的 `display_text` / `marks` 只能是空的，而它们**只能由上游数据重算** ——
+        // 库里的行救不回来。与其留一张渲染出来目标全空的卡片，不如清掉缓存：
+        // 它是上游的副本，系统控制者发一次「更新任务」就重建。
+        for table in [
+            "tarkov_task_objective",
+            "tarkov_task_reward",
+            "tarkov_task_prereq",
+            "tarkov_task_successor",
+            "tarkov_task_key",
+            "tarkov_task_requirement",
+            "tarkov_task_fail",
+            "tarkov_task",
+        ] {
+            conn.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        tracing::info!("塔科夫缓存已清空（v12 去 JSON 化），等下一次「更新任务」重建");
+    }
+    Ok(())
+}
+
+/// 删列。`ALTER TABLE DROP COLUMN` 没有 IF EXISTS（SQLite 3.35+ 才有 DROP COLUMN），
+/// 所以同样要先查 `PRAGMA table_info`。
+///
+/// 比加列危险：列一旦删掉，里面的数据就没了。只在**确认没有别的读法**时才用。
+fn drop_column_if_present(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    if !has_column(conn, table, column)? {
+        return Ok(());
+    }
+    tracing::info!(table, column, "已删除列");
+    conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+        .with_context(|| format!("删除列 {table}.{column} 失败"))?;
     Ok(())
 }
 
 fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
     // 先查一遍再 ALTER：`ALTER TABLE ADD COLUMN` 没有 IF NOT EXISTS，
     // 重复执行会直接报错。
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let exists = stmt
-        .query_map([], |r| r.get::<_, String>(1))?
-        .filter_map(std::result::Result::ok)
-        .any(|name| name == column);
-    if !exists {
+    if !has_column(conn, table, column)? {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
             .with_context(|| format!("给 {table} 增加列 {column} 失败"))?;
         tracing::info!(table, column, "已增加列");
     }
     Ok(())
+}
+
+/// 表里有没有这一列。
+///
+/// 加列与删列都靠它 —— SQLite 的 `ALTER TABLE` 两个方向都没有 `IF EXISTS`。
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let found = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == column);
+    Ok(found)
 }
 
 /// 建表并写入 schema 版本。
@@ -293,9 +512,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // 这个 bug 测试没抓到：测试都建新库，新库的 `CREATE TABLE` 里本来就有那一列。
     // 是实跑重启时才炸出来的。
     conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_tarkov_task_name_zh ON tarkov_task(name_zh);",
+        "CREATE INDEX IF NOT EXISTS idx_tarkov_task_name_zh ON tarkov_task(name_zh);
+         CREATE INDEX IF NOT EXISTS idx_tarkov_task_prereq_pre ON tarkov_task_prereq(prereq_id);
+         CREATE INDEX IF NOT EXISTS idx_tarkov_task_successor_succ
+             ON tarkov_task_successor(successor_id);",
     )
-    .context("建 tarkov_task.name_zh 索引失败")?;
+    .context("建 tarkov_task 相关索引失败")?;
     Ok(())
 }
 
@@ -323,6 +545,74 @@ mod tests {
         // 列真的加上了。
         conn.execute("INSERT INTO tarkov_task(id, normalized_name, name_zh) VALUES('x','y','彻夜难眠')", [])
             .expect("新列可用");
+    }
+
+    /// 回归：v11 的塔科夫库必须能升到 v12 —— 这一步要**真的删列**。
+    ///
+    /// 删列比加列危险（`ALTER TABLE DROP COLUMN` 在列被索引时会直接失败），
+    /// 而这条路径只有**旧库**才走得到：新库的 `CREATE TABLE` 里本来就没有那些列，
+    /// 所以「新库一切正常」说明不了任何问题。实跑的 `data/qqbot.db` 正是这么升上来的。
+    #[test]
+    fn upgrades_a_v11_database_and_clears_the_tarkov_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta(key, value) VALUES('schema_version', '11');
+            CREATE TABLE tarkov_task (
+                id TEXT PRIMARY KEY, normalized_name TEXT NOT NULL, name_zh TEXT,
+                name_en TEXT, trader TEXT NOT NULL DEFAULT '', trader_name_zh TEXT,
+                trader_image TEXT NOT NULL DEFAULT '', task_image TEXT NOT NULL DEFAULT '',
+                map TEXT NOT NULL DEFAULT '', map_name_zh TEXT,
+                min_level INTEGER NOT NULL DEFAULT 0, is_kappa INTEGER NOT NULL DEFAULT 0,
+                is_lightkeeper INTEGER NOT NULL DEFAULT 0, experience INTEGER NOT NULL DEFAULT 0,
+                wiki_link TEXT NOT NULL DEFAULT '', detail_json TEXT,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE tarkov_task_objective (
+                task_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                objective_type TEXT NOT NULL DEFAULT '', description_key TEXT NOT NULL DEFAULT '',
+                description_zh TEXT, is_optional INTEGER NOT NULL DEFAULT 0, count INTEGER,
+                is_raid INTEGER NOT NULL DEFAULT 0, detail_json TEXT,
+                PRIMARY KEY (task_id, ordinal)
+            );
+            INSERT INTO tarkov_task(id, normalized_name, detail_json)
+                VALUES('x', 'y', '{"faction":"BEAR"}');
+            INSERT INTO tarkov_task_objective(task_id, ordinal, description_zh, count)
+                VALUES('x', 0, '击杀 Scav', 25);
+            "#,
+        )
+        .unwrap();
+
+        migrate(&conn).expect("v11 必须能升到 v12");
+
+        // 新列与新表到位。
+        assert!(has_column(&conn, "tarkov_task", "faction").unwrap());
+        assert!(has_column(&conn, "tarkov_task", "restartable").unwrap());
+        assert!(has_column(&conn, "tarkov_task_objective", "display_text").unwrap());
+        assert!(has_column(&conn, "tarkov_task_objective", "marks").unwrap());
+        for table in ["tarkov_task_key", "tarkov_task_requirement", "tarkov_task_fail"] {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0))
+                .unwrap_or_else(|err| panic!("{table} 应当存在: {err}"));
+        }
+
+        // 旧列没了 —— 留着就是「两处真相」，早晚有人读错那一处。
+        assert!(
+            !has_column(&conn, "tarkov_task", "detail_json").unwrap(),
+            "tarkov_task.detail_json 该被删掉"
+        );
+        for column in ["description_zh", "is_optional", "count", "is_raid", "detail_json"] {
+            assert!(
+                !has_column(&conn, "tarkov_task_objective", column).unwrap(),
+                "tarkov_task_objective.{column} 该被删掉"
+            );
+        }
+
+        // 缓存清空：正文只能由上游数据重算，库里的旧行救不回来。
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tarkov_task", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "升级时该清空塔科夫缓存，等下一次「更新任务」重建");
     }
 
     #[test]

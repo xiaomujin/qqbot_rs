@@ -410,7 +410,7 @@ async fn handle_send(
 
     // 先算 mode，`msg_id` 就能直接 move 进 message，省一次堆分配。
     let mode = if msg_id.is_some() { "passive" } else { "active" };
-    let mut message = request.body.to_out_message();
+    let mut message = request.to_out_message();
     message.msg_id = msg_id;
     message.msg_seq = msg_seq;
     message.event_id = request.event_id.clone();
@@ -436,7 +436,7 @@ async fn handle_send(
             return Err(CoreError::QuotaExceeded);
         }
 
-        let mut retry = request.body.to_out_message();
+        let mut retry = request.to_out_message();
         retry.event_id = request.event_id.clone();
         metrics::counter!("qqbot_send_total", "mode" => "active_retry", "kind" => request.body.kind())
             .increment(1);

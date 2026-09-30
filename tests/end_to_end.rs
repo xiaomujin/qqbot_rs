@@ -252,6 +252,19 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/test-image") {
         return ("200 OK", "FAKE-IMAGE-BYTES".to_string());
     }
+    // 物品名语言包。**必须排在 `/regular/items` 之前** —— 前缀匹配会把它吃掉。
+    if path == "/regular/items_zh" {
+        return (
+            "200 OK",
+            json!({"data": {
+                "a1 Name": "M855", "a2 Name": "BP", "a3 Name": "F-1 手雷",
+                "i1 Name": "卢布",
+                "5447a9cd4bdc2dbd208b4567 Name": "柯尔特 M4A1",
+                "5c0e53c886f7744a13f54933 Name": "Slick 防弹衣",
+            }})
+            .to_string(),
+        );
+    }
     // 塔科夫静态 JSON：弹药数据。
     if path.starts_with("/regular/items") {
         return (
@@ -313,11 +326,18 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path == "/daily-long.png" {
         return ("200 OK", "FAKE-DAILY-LONG-IMAGE".to_string());
     }
-    // 塔科夫 GraphQL：只用来取任务中文名（cq-bot 的 `tasks(lang: zh)`）。
-    if path == "/graphql" {
+    // 任务名 / 目标描述 / 技能名的语言包。同样要排在前缀路由之前。
+    if path == "/regular/tasks_zh" {
         return (
             "200 OK",
-            json!({ "data": { "tasks": [{ "id": "k1", "name": "彻夜难眠" }] } }).to_string(),
+            json!({"data": {
+                "k1 name": "彻夜难眠",
+                "k2 name": "第一梯队",
+                "o1": "在海关击杀 5 个 Scav",
+                "o2": "探访海关",
+                "Strength": "力量",
+            }})
+            .to_string(),
         );
     }
     // 塔科夫静态 JSON：任务与商人。
@@ -326,11 +346,29 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
             "200 OK",
             concat!(
                 r#"{"data":{"tasks":{"#,
-                r#""k1":{"normalizedName":"gunsmith-part-1","trader":"t1","minPlayerLevel":5,"kappaRequired":true,"lightkeeperRequired":false,"experience":3000,"objectives":[{},{}],"wikiLink":"https://x/1"},"#,
-                r#""k2":{"normalizedName":"first-in-line","trader":"t2","minPlayerLevel":1,"kappaRequired":false,"lightkeeperRequired":true,"experience":500,"objectives":[]}"#,
+                // 形状照真实数据：目标带 `type`（渲染兜底要用）、`description` 是翻译键，
+                // 奖励与前置任务都在；`map` 特意给 null —— 实测 252 条是这样的。
+                r#""k1":{"name":"k1 name","normalizedName":"gunsmith-part-1","trader":"t1","minPlayerLevel":5,"#,
+                r#""kappaRequired":true,"lightkeeperRequired":false,"experience":3000,"#,
+                r#""taskImageLink":"https://img/k1.webp","wikiLink":"https://x/1","#,
+                r#""objectives":[{"id":"o1","description":"o1","type":"shoot","count":5,"foundInRaid":true},"#,
+                r#"{"id":"o2","description":"o2","type":"visit","optional":true}],"#,
+                r#""finishRewards":{"traderStanding":[{"trader":"t1","standing":0.1}],"#,
+                r#""items":[{"item":"i1","count":80000}],"#,
+                r#""skillLevelReward":[{"skill":"Strength","level":3}]},"#,
+                r#""taskRequirements":[{"task":"k2","status":["complete"]}]},"#,
+                r#""k2":{"name":"k2 name","normalizedName":"first-in-line","trader":"t2","minPlayerLevel":1,"#,
+                r#""kappaRequired":false,"lightkeeperRequired":true,"experience":500,"#,
+                r#""map":null,"objectives":[]}"#,
                 r#"}}}"#,
             )
             .to_string(),
+        );
+    }
+    if path == "/regular/traders_zh" {
+        return (
+            "200 OK",
+            json!({"data": {"t1 Nickname": "机械师", "t2 Nickname": "大老板"}}).to_string(),
         );
     }
     if path.starts_with("/regular/traders") {
@@ -436,6 +474,9 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     }
     // 塔科夫 BOSS 刷新率：形状照 `json.tarkov.dev/regular/maps`。
     // `maps` 是**按 id 键控的对象**，不是数组。
+    if path == "/regular/maps_zh" {
+        return ("200 OK", json!({"data": {"m1 Name": "海关"}}).to_string());
+    }
     if path.starts_with("/regular/maps") {
         if inner.fail_maps.load(Ordering::Relaxed) {
             return ("503 Service Unavailable", json!({"error": "down"}).to_string());
@@ -549,10 +590,12 @@ async fn build_stack_with(
             },
             ammo: qqbot_plugins::AmmoConfig {
                 items_url: format!("{}/regular/items", mock.base_url()),
+                items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
                 store: None,
             },
             market: qqbot_plugins::MarketConfig {
                 items_url: format!("{}/regular/items", mock.base_url()),
+                items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
                 store: None,
             },
             delta: qqbot_plugins::DeltaConfig {
@@ -564,7 +607,10 @@ async fn build_stack_with(
             task: qqbot_plugins::TaskConfig {
                 tasks_url: format!("{}/regular/tasks", mock.base_url()),
                 traders_url: format!("{}/regular/traders", mock.base_url()),
-                graphql_url: format!("{}/graphql", mock.base_url()),
+                tasks_zh_url: format!("{}/regular/tasks_zh", mock.base_url()),
+                items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
+                traders_zh_url: format!("{}/regular/traders_zh", mock.base_url()),
+                maps_zh_url: format!("{}/regular/maps_zh", mock.base_url()),
                 store: None,
             },
         },
@@ -595,6 +641,16 @@ async fn feed(dispatcher: &Arc<Dispatcher>, name: &str, payload: &str) {
     tokio::time::timeout(Duration::from_secs(20), handle)
         .await
         .expect("事件处理超时");
+}
+
+/// 把消息体里的 `%CTRL%` 换成真正的系统控制者 openid。
+///
+/// 管理命令（`更新任务` / `系统收录`）只认系统控制者，所以入站消息的
+/// `member_openid` 必须是它。写字面量会把测试与一个**真实的人的 openid**
+/// 绑死：默认控制者一换，这里只会表现成「命令被权限挡掉」，
+/// 看不出是测试数据过期了。占位符让这层关系显式。
+fn as_controller(payload: &str) -> String {
+    payload.replace("%CTRL%", qqbot_store::DEFAULT_SYSTEM_CONTROLLER)
 }
 
 // ---------------------------------------------------------------- tests
@@ -1207,6 +1263,25 @@ async fn non_resource_keyword_falls_through() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 等异步写线程把消息落库（最多 3 秒）。
+///
+/// 原来这里是固定的 80ms sleep。全量并行跑测试时，十几个 resvg 渲染用例
+/// 会把 CPU 占满，写线程可能排不上队 —— 实测「单独跑必过、全量跑偶尔挂」。
+/// 改成有界轮询：既不会假失败，也不会真的卡住。
+async fn wait_for_message(messages: &MessageStore, target: &str, needle: &str) {
+    for _ in 0..300 {
+        let rows = messages
+            .recent_raw(qqbot_store::Scope::Group, target, 0, 5)
+            .await
+            .unwrap_or_default();
+        if rows.iter().any(|row| row.contains(needle)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("等了 3 秒，含 {needle} 的消息仍未落库");
+}
+
 /// 用户的实际用法：**先发图片，再发命令**（两条独立消息）。
 ///
 /// 图片消息的 content 是空的，命令消息本身没有附件 —— 两者靠
@@ -1237,7 +1312,7 @@ async fn collect_picks_up_an_image_from_a_previous_message() {
         basepath: dir.join("collected"),
         controllers: None,
     };
-    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+    let dispatcher = build_stack_with(&mock, Some(Arc::clone(&messages)), Some(cfg)).await;
 
     // 1) 先发图片：content 为空，图片在 attachments 里。
     let url = format!("{}/test-image.png", mock.base_url());
@@ -1246,8 +1321,8 @@ async fn collect_picks_up_an_image_from_a_previous_message() {
     );
     feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
     // 入库是**异步批量**的（写线程每 flush_interval 提交一次），
-    // 不等一下的话命令会跑在图片落库之前。
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // 要等它真的落库，命令才不会跑在图片前面。
+    wait_for_message(&messages, "GCOL", "IN_IMG").await;
 
     // 2) 再发命令：本身没有附件，必须回消息库找回上一条的图。
     feed(
@@ -1298,7 +1373,7 @@ async fn collect_accepts_another_senders_image() {
         basepath: dir.join("collected"),
         controllers: None,
     };
-    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+    let dispatcher = build_stack_with(&mock, Some(Arc::clone(&messages)), Some(cfg)).await;
 
     // U1 发图，U2 收录。
     let img = format!(
@@ -1306,7 +1381,7 @@ async fn collect_accepts_another_senders_image() {
         mock.base_url()
     );
     feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_for_message(&messages, "GST", "IN_IMG2").await;
 
     feed(
         &dispatcher,
@@ -1998,7 +2073,9 @@ async fn task_import_then_search_renders_a_card() {
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        r#"{"id":"TK_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新任务","group_openid":"GTK"}"#,
+        &as_controller(
+            r#"{"id":"TK_1","author":{"member_openid":"%CTRL%"},"content":"更新任务","group_openid":"GTK"}"#,
+        ),
     )
     .await;
 
@@ -2018,11 +2095,28 @@ async fn task_import_then_search_renders_a_card() {
         .into_iter()
         .find(|h| {
             let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
-            body["msg_type"] == 7
+            body["msg_type"] == 2
         })
-        .expect("应当回一张卡片");
+        .expect("应当回一条 Markdown 卡片");
     let body: serde_json::Value = serde_json::from_str(&card.body).unwrap();
-    assert!(body["media"]["file_info"].is_string(), "应当走富媒体上传: {body}");
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.contains("彻夜难眠"), "卡片要有中文任务名: {md}");
+    assert!(md.contains("任务目标"), "卡片要有目标段: {md}");
+    assert!(md.contains("在海关击杀 5 个 Scav"), "目标要用语言包里的中文: {md}");
+    assert!(md.contains("力量 技能 +3"), "技能奖励要读上游的 skill 字段: {md}");
+    // 前置任务名进了指令标签，取值按官方要求 urlencode 过。
+    assert!(
+        md.contains("%E7%AC%AC%E4%B8%80%E6%A2%AF%E9%98%9F"),
+        "前置任务要换成中文名并放进可点指令: {md}"
+    );
+    assert!(
+        md.contains("<qqbot-cmd-input "),
+        "前置/后续任务要渲染成可点击的指令文本: {md}"
+    );
+    assert!(
+        body["keyboard"].is_null(),
+        "不该再带内嵌键盘（按钮在客户端会显示不全）: {body}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2475,9 +2569,9 @@ async fn bare_map_name_does_not_send_an_image() {
 ///
 /// 曾经的 bug：`query_tokens` 用 `is_ascii_alphanumeric` 过滤，
 /// 中文被整个滤掉 → token 为空 → 用户收到「用法：查任务 <名称片段>」，
-/// 好像他没打参数一样。而实际上他打了，只是上游数据里没有中文。
+/// 中文查不到时，要说的是「没有匹配」，而不是「你用法错了」。
 #[tokio::test]
-async fn chinese_query_explains_the_english_only_data() {
+async fn chinese_query_that_misses_says_so() {
     let mock = MockServer::start().await;
     let (dispatcher, _store, dir) = bili_stack(&mock).await;
 
@@ -2485,14 +2579,16 @@ async fn chinese_query_explains_the_english_only_data() {
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        r#"{"id":"ZH_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新任务","group_openid":"GZH"}"#,
+        &as_controller(
+            r#"{"id":"ZH_1","author":{"member_openid":"%CTRL%"},"content":"更新任务","group_openid":"GZH"}"#,
+        ),
     )
     .await;
 
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        // 用一个**确实不存在**的中文名：mock 的 GraphQL 会给 k1 中文名，
+        // 用一个**确实不存在**的中文名：语言包里有 k1 的中文名，
         // 打那个名字是查得到的，测不到这条分支。
         r#"{"id":"ZH_2","author":{"member_openid":"U1"},"content":"查任务 完全不存在的中文名","group_openid":"GZH"}"#,
     )
@@ -2501,35 +2597,44 @@ async fn chinese_query_explains_the_english_only_data() {
     let send = mock
         .all(|h| h.path == "/v2/groups/GZH/messages")
         .into_iter()
-        .find(|h| h.body.contains("英文") || h.body.contains("不存在"))
+        .find(|h| h.body.contains("没有匹配") || h.body.contains("用法"))
         .expect("中文查询应当有回复");
     let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
     let text = body["content"].as_str().unwrap_or_default();
-    assert!(text.contains("英文"), "要说清楚上游只有英文: {text}");
+    assert!(text.contains("没有匹配"), "查不到就说查不到: {text}");
+    assert!(!text.contains("英文"), "中文现在是支持的，不该再甩锅给上游: {text}");
     assert!(!text.contains("用法"), "他打了参数，不能说用法错误: {text}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 任务中文名：cq-bot 的 `QUERY_TASKS` 就是 `tasks(lang: zh)`，这里走同一条路。
+/// 任务中文名来自 `regular/tasks_zh` 语言包（不再是 GraphQL）。
 #[tokio::test]
-async fn task_chinese_names_come_from_graphql_and_are_searchable() {
+async fn task_chinese_names_come_from_the_language_pack() {
     let mock = MockServer::start().await;
     let (dispatcher, store, dir) = bili_stack(&mock).await;
 
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        r#"{"id":"ZH_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新任务","group_openid":"GZH"}"#,
+        &as_controller(
+            r#"{"id":"ZH_1","author":{"member_openid":"%CTRL%"},"content":"更新任务","group_openid":"GZH"}"#,
+        ),
     )
     .await;
 
-    // 结构化数据来自静态 JSON，中文名来自 GraphQL —— 两者都到位。
+    // 结构化数据与中文名都来自静态端点 —— 一个语言包都不少。
     let imported = store.search_tasks(vec!["彻夜".into()], 10).await.unwrap();
     assert_eq!(imported.len(), 1, "中文名应当写进库: {imported:?}");
     assert_eq!(imported[0].normalized_name, "gunsmith-part-1");
     assert_eq!(imported[0].name_zh.as_deref(), Some("彻夜难眠"));
     assert_eq!(imported[0].trader, "mechanic", "结构化字段一个都不能少");
+    assert_eq!(
+        imported[0].trader_name_zh.as_deref(),
+        Some("机械师"),
+        "商人名也要走语言包"
+    );
+    assert_eq!(imported[0].map_name_zh, None, "k1 没有地图，不该硬造一个");
 
     // 用户发中文也能查到。
     feed(
@@ -2543,9 +2648,9 @@ async fn task_chinese_names_come_from_graphql_and_are_searchable() {
         .into_iter()
         .any(|h| {
             let b: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
-            b["msg_type"] == 7
+            b["msg_type"] == 2
         });
-    assert!(hit, "中文查询应当出卡片，而不是「查不到」");
+    assert!(hit, "中文查询应当出 Markdown 卡片，而不是「查不到」");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

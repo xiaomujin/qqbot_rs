@@ -476,6 +476,19 @@ POST /v2/users/{user_openid}/files
 { "msg_type": 7, "media": { "file_info": "{上一步返回的 file_info}" } }
 ```
 
+**可以同时带 `content`**（见 §8 的表格），图与文字进同一个气泡：
+
+```json
+{
+  "msg_type": 7,
+  "content": "这是配文",
+  "media": { "file_info": "{上一步返回的 file_info}" }
+}
+```
+
+**能用一条就别拆成两条。** 群聊一条入站消息只有 5 次被动回复配额，
+「先发文字再发图」会白占一次。图语（F3）与所有卡片都走这个形式。
+
 `srv_send_msg=true` 可在上传同时直接发送，但**会占用主动消息频次**。
 
 ### 9.5 注意事项

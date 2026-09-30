@@ -41,6 +41,8 @@ struct MockInner {
     fail_maps: AtomicBool,
     /// 三角洲接口是否返回上游的 `code=-101`（模拟未握手 / 系统繁忙）。
     delta_busy: AtomicBool,
+    /// 日报接口是否返回 `code != 200`。
+    daily_broken: AtomicBool,
     /// BA 图片接口是否返回「模糊搜索」（code 101）。
     ba_fuzzy: AtomicBool,
     /// 番剧更新页是否返回一个解析不出条目的页面（模拟站点改版）。
@@ -63,6 +65,7 @@ impl MockServer {
         fail_first_sends: 0,
         fail_maps: false,
         delta_busy: false,
+        daily_broken: false,
         ba_fuzzy: false,
         bangumi_empty: false,
     }
@@ -89,6 +92,7 @@ struct MockBuilder {
     fail_first_sends: usize,
     fail_maps: bool,
     delta_busy: bool,
+    daily_broken: bool,
     ba_fuzzy: bool,
     bangumi_empty: bool,
 }
@@ -106,6 +110,11 @@ impl MockBuilder {
 
     fn delta_busy(mut self, on: bool) -> Self {
         self.delta_busy = on;
+        self
+    }
+
+    fn daily_broken(mut self, on: bool) -> Self {
+        self.daily_broken = on;
         self
     }
 
@@ -128,6 +137,7 @@ impl MockBuilder {
             fail_first_sends: self.fail_first_sends,
             fail_maps: AtomicBool::new(self.fail_maps),
             delta_busy: AtomicBool::new(self.delta_busy),
+            daily_broken: AtomicBool::new(self.daily_broken),
             ba_fuzzy: AtomicBool::new(self.ba_fuzzy),
             bangumi_empty: AtomicBool::new(self.bangumi_empty),
         });
@@ -283,6 +293,25 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     // 握手的前两步：只要求 200。
     if path == "/overview" {
         return ("200 OK", "<html>overview</html>".to_string());
+    }
+    // 日报：上游返回 JSON，里面是长图地址。
+    if path.starts_with("/daily-api") {
+        if inner.daily_broken.load(Ordering::Relaxed) {
+            // 上游失败时 HTTP 仍是 200，只在 body 里带 code —— 与官方 API 同一个坑。
+            return ("200 OK", json!({"code": 500, "message": "服务异常"}).to_string());
+        }
+        return (
+            "200 OK",
+            json!({
+                "code": 200,
+                // 用 addr 拼回自己 —— mock 服务器不知道自己的对外地址。
+                "data": { "image": format!("http://{addr}/daily-long.png") },
+            })
+            .to_string(),
+        );
+    }
+    if path == "/daily-long.png" {
+        return ("200 OK", "FAKE-DAILY-LONG-IMAGE".to_string());
     }
     // 塔科夫静态 JSON：任务与商人。
     if path.starts_with("/regular/tasks") {
@@ -457,8 +486,15 @@ async fn build_stack_with(
     };
     let api = ApiClient::new(cfg).expect("api client");
     let media = MediaUploader::new(api.clone());
+    // 超时给得很宽，是因为**这个测试进程本身**会把渲染服务挤爆：
+    // 几十个测试并行跑，每个都可能触发渲染，而 debug 构建的 resvg
+    // 比 release 慢 25~31 倍（见 AGENTS.md）。10 秒会被偶发超过，
+    // 表现为「渲染超时 → 插件降级成文字」，于是断言图片的测试随机失败。
+    //
+    // 这不是产品问题：release 下一张卡片 47ms，超时是 5 秒，余量 100 倍。
+    // 但测试必须稳定，所以这里不按产品的预算来。
     let render = RenderService::new(RenderConfig {
-        timeout: Duration::from_secs(10),
+        timeout: Duration::from_secs(120),
         ..RenderConfig::default()
     });
     let sessions = Arc::new(SessionRegistry::new(api.clone(), 2, 64, Duration::from_secs(10)));
@@ -475,7 +511,13 @@ async fn build_stack_with(
         store,
         &qqbot_plugins::PluginsConfig {
             wordcloud_window: Duration::from_secs(30 * 24 * 3600),
-            daily: None,
+            // 指向 mock：日报要下载长图再转成 file_info 发送，
+            // 这正是「涉及发送链路」的那一类，必须有端到端覆盖。
+            daily: Some(qqbot_plugins::DailyConfig {
+                api_url: format!("{}/daily-api", mock.base_url()),
+                token: "test-token".to_string(),
+                cache: Duration::from_secs(3600),
+            }),
             resources,
             // 指向 mock，否则塔科夫的 GraphQL 会真的打出去。
             tarkov: qqbot_plugins::TarkovConfig {
@@ -2159,7 +2201,7 @@ async fn delta_overview_renders_one_sectioned_card() {
             body["msg_type"] == 7
         })
         .count();
-    assert_eq!(media, 1, "应当只发一张卡片");
+    assert_eq!(media, 1, "应当只发一张卡片（一图流 = 一张，不是每段一张）");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2240,6 +2282,102 @@ async fn system_collect_rejects_non_controllers() {
         !entries.iter().any(|e| e.keyword == "不该有"),
         "非控制者不该写进库: {entries:?}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// E5 日报：下载上游长图 → 转成 file_info → 以富媒体发送。
+///
+/// 这条链路此前**完全没有端到端覆盖**：`DailyConfig` 在测试配置里是 `None`，
+/// 而 token 为空时插件根本不注册 —— 所以「日报」这个命令在测试里从未存在过。
+/// 它偏偏是「涉及发送链路」的典型（下载 → 上传 → 发富媒体），
+/// 正是 AGENTS.md §9 要求端到端覆盖的那一类。
+#[tokio::test]
+async fn daily_downloads_and_resends_the_image() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DL_1","author":{"member_openid":"U1"},"content":"日报","group_openid":"GDL"}"#,
+    )
+    .await;
+
+    // 必须真的去下载了那张长图 —— 只回一句文字不算。
+    assert!(
+        !mock.all(|h| h.path == "/daily-long.png").is_empty(),
+        "应当下载上游图片"
+    );
+
+    let card = mock
+        .all(|h| h.path == "/v2/groups/GDL/messages")
+        .into_iter()
+        .find(|h| {
+            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            body["msg_type"] == 7
+        })
+        .expect("日报应当以富媒体发出");
+    let body: serde_json::Value = serde_json::from_str(&card.body).unwrap();
+    assert!(body["media"]["file_info"].is_string(), "应当走上传: {body}");
+    // 文件名按扩展名推断：`.png` → `daily.png`。猜错会让平台拒收。
+    assert!(!body["media"]["file_info"].as_str().unwrap_or_default().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 上游用 `code` 表达失败时要回话，不能静默。
+#[tokio::test]
+async fn daily_reports_upstream_failure() {
+    let mock = MockServer::builder().daily_broken(true).start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DL_2","author":{"member_openid":"U1"},"content":"日报","group_openid":"GDL2"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GDL2/messages")
+        .expect("失败也要回话，静默会让用户以为没收到命令");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("失败"), "要说清楚失败了: {text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 带 `三角洲` 前缀的四个别名也要能触发。
+///
+/// 它们是隐藏监听器（不进帮助），存在的意义是避免与其它插件的词撞车 ——
+/// 所以「不显示」不等于「不工作」，这两件事都要有测试兜着。
+#[tokio::test]
+async fn delta_prefixed_aliases_work() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    for (id, cmd, group) in [
+        ("DFA_1", "三角洲集市", "GDFA"),
+        ("DFA_2", "三角洲脑机", "GDFA2"),
+        ("DFA_3", "三角洲密码", "GDFA3"),
+        ("DFA_4", "三角洲一图流", "GDFA4"),
+    ] {
+        let msg = format!(
+            r#"{{"id":"{id}","author":{{"member_openid":"U1"}},"content":"{cmd}","group_openid":"{group}"}}"#
+        );
+        feed(&dispatcher, "GROUP_MESSAGE_CREATE", &msg).await;
+
+        let hit = mock
+            .all(|h| h.path == format!("/v2/groups/{group}/messages"))
+            .into_iter()
+            .any(|h| {
+                let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+                body["msg_type"] == 7
+            });
+        assert!(hit, "{cmd} 应当回一张卡片");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

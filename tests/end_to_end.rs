@@ -2462,3 +2462,41 @@ async fn bare_map_name_does_not_send_an_image() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 用中文查塔科夫数据时，要说清楚「上游只有英文」，而不是「用法：...」。
+///
+/// 曾经的 bug：`query_tokens` 用 `is_ascii_alphanumeric` 过滤，
+/// 中文被整个滤掉 → token 为空 → 用户收到「用法：查任务 <名称片段>」，
+/// 好像他没打参数一样。而实际上他打了，只是上游数据里没有中文。
+#[tokio::test]
+async fn chinese_query_explains_the_english_only_data() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    // 先导入，排除「没导入」那条分支。
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"ZH_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新任务","group_openid":"GZH"}"#,
+    )
+    .await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"ZH_2","author":{"member_openid":"U1"},"content":"查任务 彻夜难眠","group_openid":"GZH"}"#,
+    )
+    .await;
+
+    let send = mock
+        .all(|h| h.path == "/v2/groups/GZH/messages")
+        .into_iter()
+        .find(|h| h.body.contains("彻夜难眠") || h.body.contains("英文"))
+        .expect("中文查询应当有回复");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("英文"), "要说清楚上游只有英文: {text}");
+    assert!(!text.contains("用法"), "他打了参数，不能说用法错误: {text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

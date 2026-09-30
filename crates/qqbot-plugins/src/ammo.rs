@@ -128,16 +128,30 @@ pub fn parse_ammo(body: &str) -> Result<Vec<Ammo>, String> {
 ///
 /// 去掉点、连字符、空格并转小写：`5.45 BP` → `["545", "bp"]`。
 /// 检索时要求**全部命中**，所以多打一个词只会缩小范围，不会引入误报。
+///
+/// ⚠️ 用 `is_alphanumeric` 而不是 `is_ascii_alphanumeric` ——
+/// 后者会把**中文整个滤掉**，于是 `查任务 彻夜难眠` 变成空 token，
+/// 用户收到的是「用法：查任务 <名称片段>」，好像他没打参数一样。
+/// 上游数据确实只有英文 slug，但那是**查不到**，不是**用错**，
+/// 两者的提示必须不一样。
 pub fn query_tokens(raw: &str) -> Vec<String> {
     raw.split_whitespace()
         .map(|part| {
             part.chars()
-                .filter(char::is_ascii_alphanumeric)
+                .filter(|c: &char| c.is_alphanumeric())
                 .collect::<String>()
                 .to_lowercase()
         })
         .filter(|token| !token.is_empty())
         .collect()
+}
+
+/// 查询里有没有非 ASCII 字符。
+///
+/// 用来区分「关键词不对」与「打了中文，但上游数据只有英文 slug」——
+/// 后者是上游缺语言包，不该让用户以为自己打错了。
+pub fn has_non_ascii(raw: &str) -> bool {
+    !raw.is_ascii()
 }
 
 
@@ -236,6 +250,8 @@ impl AmmoPlugin {
             // 空表与「查不到」要给不同的话：前者是没导入，后者是关键词不对。
             let hint = match store.ammo_count().await {
                 Ok(0) => "弹药数据还没导入，请管理员发「更新子弹」",
+                // 数据里只有英文 slug，打了中文要说明白。
+                _ if has_non_ascii(query) => "弹药名只有英文 slug（如 545x39mm-bp）—— 上游静态数据里没有中文",
                 _ => "没有匹配的弹药，换个关键词试试",
             };
             let _ = ctx.reply_text(hint).await;
@@ -348,6 +364,22 @@ mod tests {
         assert_eq!(query_tokens("m855"), vec!["m855"]);
         assert_eq!(query_tokens("   "), Vec::<String>::new());
         assert_eq!(query_tokens("545x39mm-bp"), vec!["545x39mmbp"]);
+    }
+
+    #[test]
+    fn chinese_is_kept_not_silently_dropped() {
+        // 曾经用 is_ascii_alphanumeric，中文被整个滤掉 → 空 token →
+        // 用户收到「用法：...」，好像他没打参数。那是 bug，不是限制。
+        assert_eq!(query_tokens("彻夜难眠"), vec!["彻夜难眠"]);
+        assert_eq!(query_tokens("5.45 弹"), vec!["545", "弹"]);
+    }
+
+    #[test]
+    fn detects_non_ascii_queries() {
+        assert!(has_non_ascii("彻夜难眠"));
+        assert!(has_non_ascii("m855 弹"));
+        assert!(!has_non_ascii("m855"));
+        assert!(!has_non_ascii("first-in-line"));
     }
 
     #[test]

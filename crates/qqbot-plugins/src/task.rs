@@ -16,7 +16,7 @@ use qqbot_store::{ResourceStore, TarkovTask};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::ammo::query_tokens;
+use crate::ammo::{has_non_ascii, query_tokens};
 
 /// 一次最多列几条。
 const MAX_ROWS: usize = 14;
@@ -237,6 +237,12 @@ impl TaskPlugin {
         if items.is_empty() {
             let hint = match store.task_count().await {
                 Ok(0) => "任务数据还没导入，请管理员发「更新任务」",
+                // 上游静态数据里**没有中文**（`name` 是翻译键），只有 GraphQL
+                // 的 `lang: zh` 会解析它，而那个后端挂着。打了中文要说明白，
+                // 否则用户会以为是自己打错了。
+                _ if has_non_ascii(query) => {
+                    "任务名只有英文 slug（如 first-in-line）—— 上游静态数据里没有中文，"
+                }
                 _ => "没有匹配的任务，换个关键词试试",
             };
             let _ = ctx.reply_text(hint).await;

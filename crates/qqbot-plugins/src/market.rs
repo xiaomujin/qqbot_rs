@@ -18,7 +18,7 @@ use qqbot_store::{ResourceStore, TarkovItem};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::ammo::query_tokens;
+use crate::ammo::{has_non_ascii, query_tokens};
 
 /// 一次最多列几件。
 const MAX_ROWS: usize = 12;
@@ -242,7 +242,7 @@ impl MarketPlugin {
             match found {
                 Some(item) => (format!("跳蚤 · {}", item.normalized_name), detail_rows(&item)),
                 None => {
-                    let _ = ctx.reply_text(self.empty_hint(store, "没有这个 id 对应的物品").await).await;
+                    let _ = ctx.reply_text(self.empty_hint(store, "没有这个 id 对应的物品", raw).await).await;
                     return Handled::Consumed;
                 }
             }
@@ -257,7 +257,7 @@ impl MarketPlugin {
                 }
             };
             if items.is_empty() {
-                let _ = ctx.reply_text(self.empty_hint(store, "没有匹配的物品").await).await;
+                let _ = ctx.reply_text(self.empty_hint(store, "没有匹配的物品", raw).await).await;
                 return Handled::Consumed;
             }
             (format!("跳蚤 · {raw}"), format_rows(&items))
@@ -279,9 +279,15 @@ impl MarketPlugin {
     }
 
     /// 查不到时的话术。空表与「关键词不对」要给不同的话。
-    async fn empty_hint(&self, store: &ResourceStore, miss: &str) -> String {
+    /// 查不到时的话术。空表、「打了中文」与「关键词不对」是三件不同的事。
+    async fn empty_hint(&self, store: &ResourceStore, miss: &str, query: &str) -> String {
         match store.item_count().await {
             Ok(0) => "物品数据还没导入，请管理员发「更新物品」".to_string(),
+            // 数据里只有英文 slug，打了中文要说明白。
+            _ if has_non_ascii(query) => {
+                "物品名只有英文 slug（如 colt-m4a1-556x45-assault-rifle）—— 上游静态数据里没有中文"
+                    .to_string()
+            }
             _ => format!("{miss}，换个关键词试试"),
         }
     }

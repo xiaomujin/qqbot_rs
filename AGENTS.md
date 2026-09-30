@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 bin（`src/`） |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 437 项，全绿 |
+| 测试基线 | 438 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -226,7 +226,7 @@ cargo check -p qqbot
 | 路由表与插件 trait | `crates/qqbot-core/src/plugin.rs` |
 | 业务插件 | `crates/qqbot-plugins/src/{help,dice,wordcloud,daily,resource,tarkov,ba,bili,bangumi,caption,ammo,task,market,delta,tarkov_image,timewin}.rs`，注册在 `lib.rs::register` |
 | 资源管理（关键词→素材） | `crates/qqbot-plugins/src/resource.rs` + `crates/qqbot-store/src/resource.rs` |
-| 数据库表结构 / schema 版本 | `crates/qqbot-store/src/schema.rs`（加表要提 `SCHEMA_VERSION`；**加列必须显式 ALTER**，`CREATE TABLE IF NOT EXISTS` 对已存在的表无效） |
+| 数据库表结构 / schema 版本 | `crates/qqbot-store/src/schema.rs`（加表要提 `SCHEMA_VERSION`；**加列必须显式 ALTER**，`CREATE TABLE IF NOT EXISTS` 对已存在的表无效）。**新列的索引不能写进 `DDL`** —— 它在 `upgrade()` 之前跑，旧库上会 `no such column` |
 | 插件对外 HTTP | `crates/qqbot-plugins/src/http.rs`（统一 20s 超时，**不要在插件里自建 `reqwest::Client`**） |
 | 插件配置 | 各插件自带 `XxxConfig`（如 `DailyConfig`），由 `PluginsConfig` 汇总传入 `register` |
 | 富媒体分片上传 / 秒传缓存 | `crates/qqbot-media/src/uploader.rs` |

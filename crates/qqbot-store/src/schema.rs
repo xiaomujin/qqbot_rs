@@ -150,8 +150,6 @@ CREATE TABLE IF NOT EXISTS tarkov_task (
 
 CREATE INDEX IF NOT EXISTS idx_tarkov_task_name ON tarkov_task(normalized_name);
 
-CREATE INDEX IF NOT EXISTS idx_tarkov_task_name_zh ON tarkov_task(name_zh);
-
 -- 塔科夫物品与跳蚤价格。价格字段可为 NULL —— 实测 5442 件里只有 3525 件有价。
 CREATE TABLE IF NOT EXISTS tarkov_item (
     id              TEXT PRIMARY KEY,
@@ -285,12 +283,47 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             crate::resource::seed_defaults(conn)?;
         }
     }
+
+    // ⚠️ 这条索引**必须**放在版本判定之后，不能写进 `DDL`。
+    //
+    // `DDL` 在 `upgrade()` **之前**执行，而旧库的 `tarkov_task` 还没有
+    // `name_zh` 那一列 —— 在它上面建索引会直接报 `no such column`，
+    // 而错误信息只有「建表失败」四个字，看不出是哪张表哪一列。
+    //
+    // 这个 bug 测试没抓到：测试都建新库，新库的 `CREATE TABLE` 里本来就有那一列。
+    // 是实跑重启时才炸出来的。
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_tarkov_task_name_zh ON tarkov_task(name_zh);",
+    )
+    .context("建 tarkov_task.name_zh 索引失败")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧库（v8，`tarkov_task` 还没有 `name_zh`）必须能升上来。
+    ///
+    /// 这条测试是**事后补的**：真正的 bug 是 `name_zh` 的索引写进了 `DDL`，
+    /// 而 `DDL` 跑在加列之前 —— 旧库上必然 `no such column`，
+    /// 表现却是「建表失败」，整个消息存储被降级掉。
+    /// 测试原先只建新库，所以完全没覆盖到这条路径。
+    #[test]
+    fn upgrades_a_v8_database_without_name_zh() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 造一个 v8 形状的库：tarkov_task 没有 name_zh。
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\nINSERT INTO meta(key, value) VALUES('schema_version', '8');\nCREATE TABLE tarkov_task (\n    id TEXT PRIMARY KEY,\n    normalized_name TEXT NOT NULL,\n    trader TEXT NOT NULL DEFAULT '',\n    min_level INTEGER NOT NULL DEFAULT 0,\n    is_kappa INTEGER NOT NULL DEFAULT 0,\n    is_lightkeeper INTEGER NOT NULL DEFAULT 0,\n    experience INTEGER NOT NULL DEFAULT 0,\n    objectives INTEGER NOT NULL DEFAULT 0,\n    wiki_link TEXT NOT NULL DEFAULT ''\n);").unwrap();
+
+        migrate(&conn).expect("旧库必须能升级");
+        let v: String = conn
+            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION.to_string());
+        // 列真的加上了。
+        conn.execute("INSERT INTO tarkov_task(id, normalized_name, name_zh) VALUES('x','y','彻夜难眠')", [])
+            .expect("新列可用");
+    }
 
     #[test]
     fn migrate_is_idempotent() {

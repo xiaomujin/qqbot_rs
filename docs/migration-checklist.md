@@ -90,7 +90,7 @@
       而本项目**禁止引入 Chromium**（AGENTS.md 硬性禁令第 7 条，纯 Rust 光栅化是
       刻意的硬约束）。改成用同一份数据自己渲染 —— 内容一样，排版由我们决定
       ｜ 空段落整段不出现：只留一个孤零零的小标题比缺一段更难看
-- ✅ **测试基线** —— 413 项，clippy 零警告
+- ✅ **测试基线** —— 415 项，clippy 零警告
 
 ---
 
@@ -220,10 +220,16 @@
 
 ### B9–B15 塔科夫静态图（7 项）—— 等图片文件
 
-**零代码。** 收录 → 关键词触发的整条链路已经实现并有 4 条端到端测试覆盖
+**零代码。** 收录 → 关键词触发的整条链路已经实现并有 **6** 条端到端测试覆盖
 （`resource_keyword_sends_the_file_passively` / `group_resource_is_invisible_to_other_groups` /
-`system_resource_is_visible_everywhere` / `non_resource_keyword_falls_through`），
+`system_resource_is_visible_everywhere` / `non_resource_keyword_falls_through` /
+`system_collect_then_keyword_triggers` / `system_collect_rejects_non_controllers`），
 图片到位就能用。
+
+其中后两条是本轮补的：此前只测过「库里已经有资源」，
+而那条路是**直接往库里塞**的，绕过了整个 `系统收录` 命令处理 ——
+参数解析、权限、落盘、索引重建全都没被端到端验证过。
+补上之后，用户实际要走的那条路才算真的验过。
 
 文件名与关键词**照抄 cq-bot 的 `TarKovMapPlugin`**（`keywordToImageMap` + 各分支），
 所以直接拿它原来的图就行。共 **19 个文件**。

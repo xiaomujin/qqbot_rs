@@ -954,14 +954,14 @@ async fn active_quota_is_enforced_before_hitting_the_api() {
 
 // ------------------------------------------------------------ 资源管理
 
-/// 造一个带资源库的栈，并放一条群资源。返回 (dispatcher, 临时目录)。
-async fn stack_with_resource(
-    mock: &MockServer,
-    group: &str,
-    keyword: &str,
-    scope: qqbot_store::ResourceScope,
+/// 造一个带**空**资源库的栈。返回 (dispatcher, 临时目录, 资源库)。
+///
+/// 与 `stack_with_resource` 分开，是为了能测「先收录再触发」这条路 ——
+/// 那条路才是用户实际要走的（`系统收录 <关键词> <路径>`），
+/// 而预先塞好资源的写法绕过了整个命令处理。
+async fn resource_dir_and_store(
     tag: &str,
-) -> (Arc<Dispatcher>, std::path::PathBuf) {
+) -> (std::path::PathBuf, Arc<qqbot_store::ResourceStore>) {
     let dir = std::env::temp_dir().join(format!("qqbot-res-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("建临时目录");
@@ -971,6 +971,59 @@ async fn stack_with_resource(
             .await
             .expect("打开资源库"),
     );
+    (dir, store)
+}
+
+/// 用给定的资源库装配一个栈。
+///
+/// **必须在插入资源之后再调用** —— 插件在构造时就把关键词建成内存索引，
+/// 先装配后插入的话，资源永远进不了索引。
+async fn build_resource_stack(
+    mock: &MockServer,
+    dir: &std::path::Path,
+    store: Arc<qqbot_store::ResourceStore>,
+) -> Arc<Dispatcher> {
+    let dir = dir.to_path_buf();
+
+    // 资源管理依赖消息库（收录时要回查上一条带图片的消息），所以两个都要建。
+    let messages = MessageStore::open_async(StoreConfig {
+        path: dir.join("msg.db"),
+        flush_interval: Duration::from_millis(10),
+        sweep_interval: Duration::from_secs(3600),
+        ..StoreConfig::default()
+    })
+    .await
+    .expect("打开消息库");
+
+    let cfg = qqbot_plugins::ResourcesConfig {
+        store,
+        messages: Arc::clone(&messages),
+        basepath: dir.join("collected"),
+        controllers: None,
+    };
+    build_stack_with(mock, Some(messages), Some(cfg)).await
+}
+
+/// 造一个带**空**资源库的栈。返回 (dispatcher, 临时目录, 资源库)。
+async fn stack_with_resources(
+    mock: &MockServer,
+    tag: &str,
+) -> (Arc<Dispatcher>, std::path::PathBuf, Arc<qqbot_store::ResourceStore>) {
+    let (dir, store) = resource_dir_and_store(tag).await;
+    let dispatcher = build_resource_stack(mock, &dir, Arc::clone(&store)).await;
+    (dispatcher, dir, store)
+}
+
+/// 造一个带资源库的栈，并放一条资源。返回 (dispatcher, 临时目录)。
+async fn stack_with_resource(
+    mock: &MockServer,
+    group: &str,
+    keyword: &str,
+    scope: qqbot_store::ResourceScope,
+    tag: &str,
+) -> (Arc<Dispatcher>, std::path::PathBuf) {
+    // 先建库、写资源，**再**装配 —— 顺序反了资源就进不了索引。
+    let (dir, store) = resource_dir_and_store(tag).await;
 
     // 内容无所谓：测试断言的是「读到了文件并作为富媒体发出」。
     let img = dir.join("map.png");
@@ -993,23 +1046,7 @@ async fn stack_with_resource(
         .await
         .expect("写入资源");
 
-    // 资源管理依赖消息库（收录时要回查上一条带图片的消息），所以两个都要建。
-    let messages = MessageStore::open_async(StoreConfig {
-        path: dir.join("msg.db"),
-        flush_interval: Duration::from_millis(10),
-        sweep_interval: Duration::from_secs(3600),
-        ..StoreConfig::default()
-    })
-    .await
-    .expect("打开消息库");
-
-    let cfg = qqbot_plugins::ResourcesConfig {
-        store,
-        messages: Arc::clone(&messages),
-        basepath: dir.join("collected"),
-        controllers: None,
-    };
-    (build_stack_with(mock, Some(messages), Some(cfg)).await, dir)
+    (build_resource_stack(mock, &dir, store).await, dir)
 }
 
 /// 关键词触发：应当读到磁盘上的文件、上传富媒体、并走**被动回复**。
@@ -2123,6 +2160,86 @@ async fn delta_overview_renders_one_sectioned_card() {
         })
         .count();
     assert_eq!(media, 1, "应当只发一张卡片");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B9–B15 走的正是这条路：`系统收录 <关键词> <路径>` → 关键词触发。
+///
+/// 之前只测了「库里已经有资源」的情况，那条路绕过了整个命令处理，
+/// 所以收录命令本身（参数解析、权限、落盘、索引重建）一直没被端到端验证过。
+#[tokio::test]
+async fn system_collect_then_keyword_triggers() {
+    let mock = MockServer::start().await;
+    let (dispatcher, dir, store) = stack_with_resources(&mock, "collect").await;
+
+    // 用户手上就是这样一个文件，路径由他提供。
+    let img = dir.join("Customs.jpg");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nfake-map").expect("写素材");
+    let cmd = format!(
+        "{{\"id\":\"IN_C1\",\"author\":{{\"member_openid\":\"{}\"}},\"content\":\"系统收录 海关地图 {}\",\"group_openid\":\"GCOL\"}}",
+        qqbot_store::DEFAULT_SYSTEM_CONTROLLER,
+        // Windows 路径里的反斜杠是非法 JSON 转义（`\U`），必须转义后再塞进消息体。
+        img.display().to_string().replace('\\', "\\\\")
+    );
+    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &cmd).await;
+
+    let ack = mock
+        .find(|h| h.path == "/v2/groups/GCOL/messages")
+        .expect("收录应当有回执");
+    let ack_body: serde_json::Value = serde_json::from_str(&ack.body).unwrap();
+    // 资源插件走的是 Markdown（`msg_type: 2`），文字在 `markdown.content` 里，
+    // 不是纯文本的 `content`。
+    let text = ack_body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(text.contains("已收录"), "回执要说清楚结果: {ack_body}");
+
+    // 库里真的有了，而且关键词是整串。
+    let entries = store.keywords().await.expect("读关键词");
+    assert!(
+        entries.iter().any(|e| e.keyword == "海关地图"),
+        "应当收录为关键词「海关地图」: {entries:?}"
+    );
+
+    // 现在发这个关键词，应当把图发出来。
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_C2","author":{"member_openid":"U1"},"content":"海关地图","group_openid":"GCOL"}"#,
+    )
+    .await;
+
+    let sent = mock
+        .all(|h| h.path == "/v2/groups/GCOL/messages")
+        .into_iter()
+        .find(|h| {
+            let b: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            b["msg_type"] == 7
+        })
+        .expect("收录过的关键词应当把图发出来");
+    assert!(serde_json::from_str::<serde_json::Value>(&sent.body).is_ok());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 收录是系统控制者的权限；别人发同样的命令不该写进库。
+#[tokio::test]
+async fn system_collect_rejects_non_controllers() {
+    let mock = MockServer::start().await;
+    let (dispatcher, dir, store) = stack_with_resources(&mock, "deny").await;
+
+    let img = dir.join("x.jpg");
+    std::fs::write(&img, b"fake").expect("写素材");
+    let cmd = format!(
+        "{{\"id\":\"IN_C3\",\"author\":{{\"member_openid\":\"U9\"}},\"content\":\"系统收录 不该有 {}\",\"group_openid\":\"GCOL2\"}}",
+        img.display().to_string().replace('\\', "\\\\")
+    );
+    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &cmd).await;
+
+    let entries = store.keywords().await.expect("读关键词");
+    assert!(
+        !entries.iter().any(|e| e.keyword == "不该有"),
+        "非控制者不该写进库: {entries:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -524,6 +524,8 @@ async fn build_stack_with(
                 graphql_url: String::new(),
                 maps_url: format!("{}/regular/maps", mock.base_url()),
                 status_base: mock.base_url(),
+                // 静态图从目录读，所以测试里造一个目录放两张假图。
+                images_dir: Some(tarkov_image_dir()),
                 ..Default::default()
             },
             ba: qqbot_plugins::BaConfig {
@@ -563,6 +565,16 @@ async fn build_stack_with(
     .expect("初始化插件失败");
 
     Arc::new(Dispatcher::new(router, services, DispatchConfig::default()))
+}
+
+/// 塔科夫静态图的临时目录。内容无所谓：断言的是「读到了文件并作为富媒体发出」。
+fn tarkov_image_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("qqbot-tkf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("建图目录");
+    for name in ["Customs.jpg", "TaskProcess.jpg", "headset.png"] {
+        std::fs::write(dir.join(name), b"\x89PNG\r\n\x1a\nfake").expect("写图");
+    }
+    dir
 }
 
 fn event(name: &str, payload: &str) -> Arc<Event> {
@@ -1434,7 +1446,9 @@ async fn boss_chance_aggregates_by_map_and_averages() {
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        r#"{"id":"BOSS_1","author":{"member_openid":"U1"},"content":"boss刷新率","group_openid":"GB"}"#,
+        // 用 `boss刷` 而不是 `boss刷新率`：后者是 B9–B15 的静态图命令
+        // （cq-bot 里也是），这里要测的是实时数据那条路。
+        r#"{"id":"BOSS_1","author":{"member_openid":"U1"},"content":"boss刷","group_openid":"GB"}"#,
     )
     .await;
 
@@ -2378,6 +2392,73 @@ async fn delta_prefixed_aliases_work() {
             });
         assert!(hit, "{cmd} 应当回一张卡片");
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B9–B15：三种地图写法 + 速查图，都应当把图发出来。
+#[tokio::test]
+async fn tarkov_images_accept_the_three_map_forms() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    // cq-bot 的原样写法带空格，另两种是不带空格的变体。
+    for (id, cmd, group) in [
+        ("TI_1", "地图 海关", "GTI1"),
+        ("TI_2", "地图海关", "GTI2"),
+        ("TI_3", "海关地图", "GTI3"),
+    ] {
+        let msg = format!(
+            r#"{{"id":"{id}","author":{{"member_openid":"U1"}},"content":"{cmd}","group_openid":"{group}"}}"#
+        );
+        feed(&dispatcher, "GROUP_MESSAGE_CREATE", &msg).await;
+
+        let hit = mock
+            .all(|h| h.path == format!("/v2/groups/{group}/messages"))
+            .into_iter()
+            .any(|h| {
+                let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+                body["msg_type"] == 7
+            });
+        assert!(hit, "{cmd} 应当把图发出来");
+    }
+
+    // 7 个速查图走整串精确匹配。
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"TI_4","author":{"member_openid":"U1"},"content":"任务流程图","group_openid":"GTI4"}"#,
+    )
+    .await;
+    let hit = mock
+        .all(|h| h.path == "/v2/groups/GTI4/messages")
+        .into_iter()
+        .any(|h| {
+            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
+            body["msg_type"] == 7
+        });
+    assert!(hit, "速查图应当把图发出来");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 地图名单独出现**不该**发图 —— cq-bot 是子串匹配，那在群里太吵。
+#[tokio::test]
+async fn bare_map_name_does_not_send_an_image() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"TI_5","author":{"member_openid":"U1"},"content":"今天海关真难打","group_openid":"GTI5"}"#,
+    )
+    .await;
+
+    assert!(
+        mock.all(|h| h.path == "/v2/groups/GTI5/messages").is_empty(),
+        "闲聊不该触发静态图"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

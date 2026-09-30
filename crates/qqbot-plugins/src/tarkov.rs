@@ -45,6 +45,11 @@ pub struct TarkovConfig {
     pub status_base: String,
     /// 服务器状态缓存时长。源项目是 20 分钟。
     pub status_cache: Duration,
+    /// 静态图目录（B9–B15）。`None` 表示不注册那个插件。
+    ///
+    /// 与 cq-bot 一致：它读 `Constant.BASE_IMG_PATH + "tarkov_map/"`。
+    /// 这批图是固定的 19 个，不走资源系统。
+    pub images_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for TarkovConfig {
@@ -55,6 +60,7 @@ impl Default for TarkovConfig {
             boss_cache: Duration::from_secs(600),
             status_base: "https://status.escapefromtarkov.com".into(),
             status_cache: Duration::from_secs(1200),
+            images_dir: None,
         }
     }
 }

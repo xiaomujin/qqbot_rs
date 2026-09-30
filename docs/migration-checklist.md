@@ -6,7 +6,7 @@
 > 完整功能盘点见 [cq-bot-feature-catalog.md](cq-bot-feature-catalog.md)，
 > 优先级论证见 [cq-bot-migration-plan.md](cq-bot-migration-plan.md)。
 
-**进度：24 / 36 完成**
+**进度：31 / 36 完成**
 
 > 勾选框计数说明：阶段 1 的「B9–B15 静态图」一条含 **7 项**功能，
 > 所以勾选框总数（4 + 26）会小于功能总数（36）。
@@ -78,7 +78,7 @@
 - ✅ **引用消息解析** —— 从 `msg_elements` 的 `message_type = 103` 取被引用附件
 - ✅ **资源管理** —— 关键词 → 素材，群/系统两级作用域，
       **B9–B15 的静态图直接用它收录，不需要写代码**
-- ✅ **测试基线** —— 418 项，clippy 零警告
+- ✅ **测试基线** —— 428 项，clippy 零警告
 
 ---
 
@@ -86,7 +86,7 @@
 
 成本口径：🟢 直接 ｜ 🔵 接口 ｜ 🟡 需写模板 ｜ 🟠 外部依赖 ｜ 🔴 阻塞
 
-### 已完成（24 / 36）
+### 已完成（31 / 36）
 
 - [x] **A1 帮助** —— `帮助` ｜ 已有，且是**自动生成**的（读路由表），比源项目的硬编码列表好
 - [x] **A4 群消息记录** —— 无命令，`messages` 表全量落库（v3 起连原始 JSON 一起存）
@@ -135,6 +135,18 @@
       ｜ ⚠️ **名字是英文 slug 而不是中文**：静态 JSON 的 `name` 是翻译键，
       只有 GraphQL 的 `lang: zh` 会解析它。用 `normalizedName`（`556x45mm-m855`）
       做检索与显示，`5.45 bp` / `m855` 都能命中。**拿到语言包后只需改一处名称来源**
+- [x] **B9–B15 塔科夫静态图（7 项）** —— `地图 <名>` + 7 张速查图 ｜ 新插件 `tarkov_image.rs`
+      ｜ 🔑 **必须写代码，不能用资源系统**：资源关键词是**整条消息精确相等**，
+      而 `系统收录` 按空格切分参数 —— cq-bot 的 `地图 海关` 带空格，**存不进关键词表**。
+      cq-bot 自己是对整条消息做 `contains`，也就是子串匹配
+      ｜ 三种写法都认：`地图 海关`（cq-bot 原样）/ `地图海关` / `海关地图`。
+      **但不做子串匹配** —— 否则群里说「今天海关真难打」也会蹦出一张图
+      ｜ 图直接从 `[tarkov] images_dir` 读，与 cq-bot 读 `BASE_IMG_PATH` 一致：
+      这 19 张是固定集合，走资源系统只会让用户多敲 19 次 `系统收录`
+      ｜ ⚠️ **解开了 cq-bot 自己的一处歧义**：它的实时刷新率正则 `^(?i)(boss(刷|概))`
+      会连 `boss刷新率` 一起吞掉，而 `TarKovMapPlugin` 又用 `startsWith("boss刷新率")`
+      发静态图 —— 谁先跑谁赢。这里按「两个功能都可达」解：`boss刷新率` → 静态图，
+      `boss刷` / `boss概率` → 实时数据
 - [x] **B4 / B5 查任务与更新任务库** —— `查任务 <片段>` + `更新任务`（管理员）
       ｜ 新表 `tarkov_task`（schema v7），同一套「静态 JSON + 本地表」管线
       ｜ 同时拉 `/regular/traders` 把商人的**裸 id** 换成可读 slug（`prapor`）——
@@ -173,9 +185,6 @@
       `api.j4u.ink/.../moyu.json` → `{"code":403,"message":"接口更新"}`，
       同站日历图片路径返回公益 404 页。三个源都出自 cq-bot，无一可用。
       **等有可用源再接**，届时只需照 `daily.rs` 写一个下载转发的插件
-- [ ] **B9–B15 静态图（这一条含 7 项）** —— `地图` / `任务流程图` / `任务物品图` /
-      `信誉栏位图` / `boss丢包时间` / `3x4道具` / `耳机强度`
-      ｜ **零代码**：准备好图片后用 `系统收录` 收进去即可
 
 ### 阶段 2 · 接口类 🔵
 
@@ -218,70 +227,52 @@
 
 下面这些**不是代码问题**，卡在外部条件上。每一行都写了「你能做什么」。
 
-### B9–B15 塔科夫静态图（7 项）—— 等图片文件
+### B9–B15 塔科夫静态图（7 项）—— 已完成，只剩配置
 
-**零代码。** 收录 → 关键词触发的整条链路已经实现并有 **6** 条端到端测试覆盖
-（`resource_keyword_sends_the_file_passively` / `group_resource_is_invisible_to_other_groups` /
-`system_resource_is_visible_everywhere` / `non_resource_keyword_falls_through` /
-`system_collect_then_keyword_triggers` / `system_collect_rejects_non_controllers`），
-图片到位就能用。
+图已经有了（`/opt/bot_img/tarkov_map`，19 个文件，文件名与 cq-bot 一致），
+插件也写完了。**只差在 `config.toml` 里指一下目录**：
 
-其中后两条是本轮补的：此前只测过「库里已经有资源」，
-而那条路是**直接往库里塞**的，绕过了整个 `系统收录` 命令处理 ——
-参数解析、权限、落盘、索引重建全都没被端到端验证过。
-补上之后，用户实际要走的那条路才算真的验过。
+```toml
+[tarkov]
+images_dir = "E:/opt/bot_img/tarkov_map"
+```
 
-文件名与关键词**照抄 cq-bot 的 `TarKovMapPlugin`**（`keywordToImageMap` + 各分支），
-所以直接拿它原来的图就行。共 **19 个文件**。
+或环境变量 `QQBOT_TARKOV_IMAGES_DIR`。**留空则该插件不注册** ——
+没放图时注册了也只会报「读取失败」。
+
+#### 三种地图写法都认
+
+| 输入 | 说明 |
+|---|---|
+| `地图 海关` | cq-bot 的原样写法 |
+| `地图海关` | 不带空格 |
+| `海关地图` | 名字在前 |
+
+**不做子串匹配**：cq-bot 是 `contains("地图")` + `contains("海关")`，
+那会让「今天海关真难打」也蹦出一张图。这里只认上面三种确定写法。
+
+#### 7 张速查图（整串精确匹配）
+
+`任务流程图` / `任务物品图` / `信誉栏位图` / `boss刷新率` / `boss丢包时间` /
+`3x4道具` / `耳机强度`
 
 #### 12 张地图
 
-| 关键词 | cq-bot 文件名 |
+`储备站` `灯塔` `工厂` `海岸线` `海关` `街区` `立交桥` `森林` `实验室`
+`疗养院` `中心区` `迷宫`
+
+#### ⚠️ `boss刷新率` 归谁
+
+**cq-bot 自己在这里是歧义的**：它的实时刷新率正则 `^(?i)(boss(刷|概))`
+会连 `boss刷新率` 一起吞掉，而 `TarKovMapPlugin` 又用
+`startsWith("boss刷新率")` 发静态图 —— 谁先跑谁赢。
+
+这里按「两个功能都可达」解：
+
+| 输入 | 结果 |
 |---|---|
-| `储备站地图` | `tarkov_map/Reserve.jpg` |
-| `灯塔地图` | `tarkov_map/Lighthouse.jpg` |
-| `工厂地图` | `tarkov_map/Factory.jpg` |
-| `海岸线地图` | `tarkov_map/Shoreline.jpg` |
-| `海关地图` | `tarkov_map/Customs.jpg` |
-| `街区地图` | `tarkov_map/StreetsOfTarKov.jpg` |
-| `立交桥地图` | `tarkov_map/Interchange.jpg` |
-| `森林地图` | `tarkov_map/Woods.jpg` |
-| `实验室地图` | `tarkov_map/TheLab.jpg` |
-| `疗养院地图` | `tarkov_map/ShorelineHose.jpg` |
-| `中心区地图` | `tarkov_map/Center.jpg` |
-| `迷宫地图` | `tarkov_map/Maze.jpg` |
-
-#### 7 张静态图
-
-| 关键词（= 整条消息） | cq-bot 文件名 |
-|---|---|
-| `任务流程图` | `tarkov_map/TaskProcess.jpg` |
-| `任务物品图` | `tarkov_map/TaskItem.png` |
-| `信誉栏位图` | `tarkov_map/reputation.png` |
-| `boss刷新率` | `tarkov_map/bossRefreshRate.png` |
-| `boss丢包时间` | `tarkov_map/bossLossWrap.png` |
-| `3x4道具` | `tarkov_map/3x4.png` |
-| `耳机强度` | `tarkov_map/headset.png` |
-
-#### 收录命令
-
-```
-系统收录 海关地图 /opt/bot_img/tarkov_map/Customs.jpg
-系统收录 任务流程图 /opt/bot_img/tarkov_map/TaskProcess.jpg
-```
-
-#### ⚠️ 与 cq-bot 的一处命令差异，必须知道
-
-cq-bot 是 `地图 海关`，我们这里是 `海关地图`。原因是**关键词是单 token**：
-`系统收录` 按空格切分参数，`地图 海关` 存不进去；
-而资源触发的匹配是**整条消息精确相等**，不是子串包含。
-
-cq-bot 那边是对整条消息做 `contains("地图")` + `contains("海关")`，
-也就是**子串**匹配。照搬会带来误触发（「今天海关真难打」也会发图），
-所以这里保留了精确匹配，改用 `海关地图` 这种关键词。
-
-另外 7 张静态图**不需要 `地图` 前缀**，关键词就是命令本身，与 cq-bot 完全一致。
-
+| `boss刷新率` | **静态图**（cq-bot 的文件名就叫 `bossRefreshRate.png`） |
+| `boss刷` / `boss概率` / `boss概览` | **实时数据**（B7） |
 
 ### 塔科夫数据的**名称来源**（影响 B2–B7 的显示，不影响功能）
 

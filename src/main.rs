@@ -294,7 +294,12 @@ async fn run(cfg: Config) -> Result<()> {
             wordcloud_window: cfg.wordcloud_window,
             daily: cfg.daily.clone(),
             resources: resources.clone(),
-            tarkov: qqbot_plugins::TarkovConfig::default(),
+            tarkov: qqbot_plugins::TarkovConfig {
+                // 没配就不注册那个插件：这批图是固定的 19 个，
+                // 没放图时注册了也只会报「读取失败」。
+                images_dir: cfg.tarkov_images_dir.clone(),
+                ..Default::default()
+            },
             ba: qqbot_plugins::BaConfig::default(),
             bili: qqbot_plugins::BiliConfig::default(),
             bangumi: qqbot_plugins::BangumiConfig::default(),

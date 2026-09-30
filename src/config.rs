@@ -93,6 +93,8 @@ pub struct Config {
     pub daily: Option<DailyConfig>,
     /// 从消息收录的素材落盘根目录。
     pub resources_basepath: PathBuf,
+    /// 塔科夫静态图目录（B9–B15）。`None` 表示不注册那个插件。
+    pub tarkov_images_dir: Option<PathBuf>,
     /// 系统控制者。`None` 表示沿用数据库里的值（首次建库会播种默认值）。
     pub system_controllers: Option<Vec<String>>,
     /// 日志级别。`RUST_LOG` 未设置时生效。
@@ -239,6 +241,12 @@ impl Config {
                 .or_else(|| file.and_then(|f| non_empty(f.resources.basepath.as_deref())))
                 .unwrap_or_else(|| DEFAULT_RESOURCES_BASEPATH.to_string()),
         );
+        // ---- 塔科夫静态图（B9–B15） ----
+        // 没配就不注册：这批图是固定的 19 个，没放图时注册了也只会报「读取失败」。
+        let tarkov_images_dir = non_empty(env.get("QQBOT_TARKOV_IMAGES_DIR"))
+            .or_else(|| file.and_then(|f| non_empty(f.tarkov.images_dir.as_deref())))
+            .map(PathBuf::from);
+
         // 显式配置时**覆盖数据库**，这也是控制者列表被改坏后的恢复通道。
         let system_controllers = match non_empty(env.get("QQBOT_SYSTEM_CONTROLLERS")) {
             Some(raw) => Some(split_list(&raw)),
@@ -267,6 +275,7 @@ impl Config {
             wordcloud_window: Duration::from_secs(window_days * DAY_SECS),
             daily,
             resources_basepath,
+            tarkov_images_dir,
             system_controllers,
             log_level,
             sources: describe_sources(env, found),
@@ -385,6 +394,8 @@ struct FileConfig {
     daily: DailySection,
     #[serde(default)]
     resources: ResourcesSection,
+    #[serde(default)]
+    tarkov: TarkovSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -400,6 +411,14 @@ struct DailySection {
     api_url: Option<String>,
     token: Option<String>,
     cache_secs: Option<u64>,
+}
+
+/// `[tarkov]` 段。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TarkovSection {
+    /// 静态图目录（B9–B15）。留空则该插件不注册。
+    images_dir: Option<String>,
 }
 
 /// `[resources]` 段。
@@ -548,12 +567,29 @@ mod tests {
             [resources]
             basepath = "data/x"
             system_controllers = ["abc"]
+            [tarkov]
+            images_dir = "D:/img/tarkov_map"
         "#;
         let parsed: FileConfig = toml::from_str(text).expect("所有已暴露的键都必须被接受");
         assert_eq!(parsed.retention_days, Some(1));
         assert_eq!(parsed.render.timeout_secs, Some(1));
         assert_eq!(parsed.daily.cache_secs, Some(1));
         assert_eq!(parsed.resources.basepath.as_deref(), Some("data/x"));
+        assert_eq!(parsed.tarkov.images_dir.as_deref(), Some("D:/img/tarkov_map"));
+    }
+
+    /// 塔科夫静态图目录：默认不注册，环境变量优先于文件。
+    #[test]
+    fn tarkov_images_dir_defaults_to_none_and_env_wins() {
+        let cfg = resolve(&creds(&[]), None).unwrap();
+        assert!(cfg.tarkov_images_dir.is_none(), "没配就不该注册那个插件");
+
+        let cfg = resolve(&creds(&[("QQBOT_TARKOV_IMAGES_DIR", "D:/maps")]), None).unwrap();
+        assert_eq!(cfg.tarkov_images_dir, Some(PathBuf::from("D:/maps")));
+
+        // 显式空串与未设置同义 —— 否则用户没法用环境变量关掉文件里的配置。
+        let cfg = resolve(&creds(&[("QQBOT_TARKOV_IMAGES_DIR", "  ")]), None).unwrap();
+        assert!(cfg.tarkov_images_dir.is_none());
     }
 
     #[test]

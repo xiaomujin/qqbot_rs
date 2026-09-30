@@ -15,6 +15,7 @@ pub mod bili;
 pub mod caption;
 pub mod resource;
 pub mod tarkov;
+pub mod tarkov_image;
 pub mod task;
 pub mod timewin;
 pub mod wordcloud;
@@ -162,6 +163,21 @@ pub async fn register(
     let market = market::MarketPlugin::new(market_cfg, http.clone());
     router.on_any(Matcher::Command("跳蚤".into()), market.clone());
     router.on_any(Matcher::Command("更新物品".into()), market.clone());
+
+    // 塔科夫静态图（B9–B15）。只在配了目录时注册 ——
+    // 没配就说明用户没放这批图，注册了也只会报「读取失败」。
+    if let Some(dir) = &cfg.tarkov.images_dir {
+        let images = tarkov_image::TarkovImagePlugin::new(dir.clone());
+        // `地图 海关` 与 `地图海关` 都以前缀命中；`海关地图` 逐个注册。
+        router.on_any(Matcher::Prefix("地图".into()), images.clone());
+        for (name, _) in tarkov_image::MAPS {
+            router.on_listener(Matcher::Exact(format!("{name}地图")), images.clone());
+        }
+        // 7 个速查图：整串精确匹配，且进帮助。
+        for (cmd, _) in tarkov_image::STATIC {
+            router.on_any(Matcher::Exact((*cmd).into()), images.clone());
+        }
+    }
 
     // 三角洲行动：集市 / 脑机 / 密码（D1–D3）。一图流见下。
     let delta = delta::DeltaPlugin::new(cfg.delta.clone(), http.clone());

@@ -57,6 +57,18 @@ basepath = "data/resources"
 # 环境变量：QQBOT_SYSTEM_CONTROLLERS（逗号或空格分隔）。
 # system_controllers = ["0123456789ABCDEF0123456789ABCDEF"]
 
+# ---- 塔科夫静态图（B9–B15）----
+# 12 张地图 + 7 张速查图的目录。文件名与 cq-bot 的 `tarkov_map/` 完全一致：
+#   Reserve.jpg Lighthouse.jpg Factory.jpg Shoreline.jpg Customs.jpg
+#   StreetsOfTarKov.jpg Interchange.jpg Woods.jpg TheLab.jpg
+#   ShorelineHose.jpg Center.jpg Maze.jpg
+#   TaskProcess.jpg TaskItem.png reputation.png bossRefreshRate.png
+#   bossLossWrap.png 3x4.png headset.png
+# **留空或注释掉则该插件不注册**（没放图时注册了也只会报「读取失败」）。
+# 环境变量：QQBOT_TARKOV_IMAGES_DIR
+# [tarkov]
+# images_dir = "/opt/bot_img/tarkov_map"
+
 # ---- 按需打开（默认值随机器规格而定，所以默认注释掉）----
 # 接口基址（调试 / 私有化部署用）
 # api_base = "https://api.bot.qq.com"

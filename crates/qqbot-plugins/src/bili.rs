@@ -1,5 +1,10 @@
 //! B 站链接解析：发视频卡片。
 //!
+//! 卡片是 Markdown（`msg_type=2`）：封面直接写 B 站的公网 URL，由平台自己下载转存 ——
+//! 我们不再下载再上传，因为 `msg_type=7` 的 `content` 是纯文本，塞不进 markdown，
+//! 而 `msg_type=2` 又不能带富媒体 `file_info`，两者只能二选一。
+//! 版式约定见 `docs/qq-bot-api-v2-protocol.md` 的「Markdown 消息」一节。
+//!
 //! 从 cq-bot 的 `BLPlugin` 迁移。源项目同时处理动态 / 专栏，但那两个靠
 //! Chromium 截图，归 C2（需要先写 resvg 模板）；这里只做视频卡片。
 
@@ -21,8 +26,6 @@ use crate::timewin::{format_datetime, SHANGHAI_OFFSET};
 const DEDUP_TTL: Duration = Duration::from_secs(300);
 /// 最多记住多少个会话，防止 `HashMap` 只增不减。
 const DEDUP_MAX_TARGETS: usize = 2048;
-/// 封面图大小上限。
-const MAX_COVER_BYTES: usize = 32 * 1024 * 1024;
 
 /// B 站插件配置。
 // 不派生 Debug：里面的 ResourceStore 没有有意义的 Debug 表示。
@@ -203,42 +206,108 @@ pub fn format_count(n: i64) -> String {
     }
 }
 
-/// 卡片正文。
+/// 卡片正文（Markdown）。
+///
+/// 版式：二级标题 → 封面 → `UP：昵称` → 六个数据分三行（每行左右两个）
+/// → 行内链接 → BV 号一行 → 块引用收尾的投稿时间。
+///
+/// 每一条都是为**手机屏**定的（约定见 `docs/qq-bot-api-v2-protocol.md`
+/// 的「Markdown 消息」一节）：手机一行大约只放得下 30 个显示单位（汉字算 2），
+/// 超了就会折行，而断点多半落在分隔符上，看着像被截断 —— 所以数据每行只放两个，
+/// UP 与时间不合成一行，长 URL 改成行内链接。
 pub fn format_card(video: &BiliVideo) -> String {
+    let title = sanitize_title(&video.title);
     let mut out = String::new();
-    let _ = writeln!(out, "{}", video.title);
-    let _ = writeln!(out, "UP：{}", video.owner.name);
-    let _ = writeln!(
-        out,
-        "播放：{} 弹幕：{}",
-        format_count(video.stat.view),
-        format_count(video.stat.danmaku)
-    );
-    let _ = writeln!(
-        out,
-        "投币：{} 点赞：{}",
-        format_count(video.stat.coin),
-        format_count(video.stat.like)
-    );
-    let _ = writeln!(
-        out,
-        "评论：{} 分享：{}",
-        format_count(video.stat.reply),
-        format_count(video.stat.share)
-    );
-    if video.pubdate > 0 {
-        let _ = writeln!(out, "{}", format_datetime(video.pubdate, SHANGHAI_OFFSET));
+    let _ = writeln!(out, "## {title}");
+
+    let cover = https_url(&video.pic);
+    if !cover.is_empty() {
+        let _ = writeln!(out, "![{title} #320px #180px]({cover})");
     }
-    let _ = writeln!(out, "av{}", video.aid);
-    let _ = write!(out, "https://www.bilibili.com/video/{}", video.bvid);
+
+    // 空一行：markdown 里单个换行不保证断段。
+    out.push('\n');
+    let name = video.owner.name.trim();
+    if !name.is_empty() {
+        let _ = writeln!(out, "UP：{name}");
+    }
+    // 六个数据每行两个：一行三个是 30 个单位上下，手机上必然折行。
+    let stat = &video.stat;
+    let _ = writeln!(
+        out,
+        "播放 {} · 弹幕 {}",
+        format_count(stat.view),
+        format_count(stat.danmaku)
+    );
+    let _ = writeln!(
+        out,
+        "投币 {} · 点赞 {}",
+        format_count(stat.coin),
+        format_count(stat.like)
+    );
+    let _ = writeln!(
+        out,
+        "评论 {} · 分享 {}",
+        format_count(stat.reply),
+        format_count(stat.share)
+    );
+
+    // 正文里不再出现长 URL（它在手机上要占两行）：链接走行内语法，
+    // BV 号另起一行，方便直接复制去 App 里搜。
+    out.push('\n');
+    let _ = writeln!(out, "[在 B 站观看](https://www.bilibili.com/video/{})", video.bvid);
+    let _ = writeln!(out, "{}", video.bvid);
+
+    // 投稿时间收在最底下，用块引用压住。
+    if video.pubdate > 0 {
+        out.push('\n');
+        let _ = writeln!(out, "> {}", format_minute(video.pubdate, SHANGHAI_OFFSET));
+    }
+
+    // 末尾不留换行：多一个空行没有意义，还会让「最后一行是什么」不好断言。
+    if out.ends_with('\n') {
+        out.pop();
+    }
     out
 }
 
-/// 从封面地址里取文件名。
-fn cover_name(url: &str) -> String {
-    let path = url.split(['?', '#']).next().unwrap_or_default();
-    let base = path.rsplit('/').next().unwrap_or("").trim();
-    if base.is_empty() || !base.contains('.') { "cover.jpg".to_string() } else { base.to_string() }
+/// 标题里的半角方括号会把 `![标题 …](url)` 提前闭合，整张图就不渲染了。
+///
+/// 换成全角而不是反斜杠转义：官方文档没写支持 `\[` 转义，而全角在中文标题里
+/// 视觉几乎无差别。`*` `_` `~` 不处理 —— 它们顶多让几个字变斜体，弄不坏结构。
+fn sanitize_title(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .map(|c| match c {
+            '[' => '［',
+            ']' => '］',
+            // 标题里真出现换行会把卡片切成两段，压成空格。
+            '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+/// 封面地址升到 https。
+///
+/// 接口给的是 `http://`（实测 9 个真实稿件全是），而平台转存发生在 https 会话里，
+/// 混合内容被拦的概率不为零；`https://` 变体实测同样 200，改写零成本。
+fn https_url(raw: &str) -> String {
+    let raw = raw.trim();
+    match raw.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None => raw.to_string(),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM`。
+///
+/// 秒对「什么时候投的稿」没有信息量，还多占手机屏三个字符。
+/// `format_datetime` 固定输出 19 个 ASCII 字节，截断安全；格式若变，下面的单测会先炸。
+fn format_minute(ts: i64, offset: i64) -> String {
+    let mut text = format_datetime(ts, offset);
+    text.truncate(16);
+    text
 }
 
 /// B 站插件：链接展开 + 订阅管理。
@@ -444,32 +513,6 @@ impl BiliPlugin {
         parsed.data.ok_or_else(|| "接口没有返回稿件数据".to_string())
     }
 
-    async fn download_cover(&self, url: &str) -> Result<Vec<u8>, String> {
-        let res = self
-            .http
-            .get(url)
-            .header("Referer", "https://www.bilibili.com/")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
-            .send()
-            .await
-            .map_err(|err| format!("下载封面失败：{err}"))?;
-        let status = res.status();
-        if !status.is_success() {
-            return Err(format!("封面返回 HTTP {status}"));
-        }
-        let bytes = res
-            .bytes()
-            .await
-            .map_err(|err| format!("读取封面失败：{err}"))?
-            .to_vec();
-        if bytes.is_empty() {
-            return Err("封面内容为空".to_string());
-        }
-        if bytes.len() > MAX_COVER_BYTES {
-            return Err(format!("封面过大（{} 字节）", bytes.len()));
-        }
-        Ok(bytes)
-    }
 }
 
 #[async_trait]
@@ -517,24 +560,12 @@ impl Handler for BiliPlugin {
             }
         };
 
-        let text = format_card(&video);
-        // 封面拿不到不算失败：文字部分照样有价值。
-        match self.download_cover(&video.pic).await {
-            Ok(bytes) => {
-                let name = cover_name(&video.pic);
-                if let Err(err) = ctx
-                    .reply_media_with_text(qqbot_media::FileType::Image, &name, &bytes, &text)
-                    .await
-                {
-                    tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "B 站卡片发送失败");
-                }
-            }
-            Err(reason) => {
-                tracing::warn!(error = %reason, "封面下载失败，退化为纯文本");
-                if let Err(err) = ctx.reply_text(text).await {
-                    tracing::warn!(error = %err, "B 站卡片发送失败");
-                }
-            }
+        // 一条 markdown 消息搞定：封面是正文里的一行，平台转存失败也不会
+        // 影响标题/数据/链接（`force_verify_image_resource` 默认 false），
+        // 所以这里**不做**兜底重发 —— 与其它 markdown 插件一致。
+        let md = format_card(&video);
+        if let Err(err) = ctx.reply_markdown(md).await {
+            tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "B 站卡片发送失败");
         }
         Handled::Consumed
     }
@@ -606,31 +637,81 @@ mod tests {
         assert_eq!(format_count(123_456_789), "1.2亿");
     }
 
-    #[test]
-    fn renders_the_card_text() {
-        let video = BiliVideo {
+    /// 1700000000 = 2023-11-14 22:13:20 UTC，+8 小时即上海时区的次日清晨。
+    fn sample() -> BiliVideo {
+        BiliVideo {
             bvid: "BV1mokxBtEZh".into(),
             aid: 115914909417877,
             title: "标题".into(),
             pic: "https://i0.hdslb.com/bfs/archive/abc.jpg".into(),
-            pubdate: 0,
+            pubdate: 1_700_000_000,
             owner: BiliOwner { name: "UP主".into() },
             stat: BiliStat { view: 12_345, danmaku: 67, coin: 8, like: 9, reply: 10, share: 11 },
-        };
-        let text = format_card(&video);
-        assert!(text.starts_with("标题\nUP：UP主\n"), "{text}");
-        assert!(text.contains("播放：1.2万 弹幕：67"), "{text}");
-        assert!(text.contains("投币：8 点赞：9"), "{text}");
-        assert!(text.ends_with("https://www.bilibili.com/video/BV1mokxBtEZh"), "{text}");
-        // pubdate 为 0 时不该打出一个 1970 年的时间。
-        assert!(!text.contains("1970"), "{text}");
+        }
     }
 
     #[test]
-    fn takes_the_cover_file_name() {
-        assert_eq!(cover_name("https://i0.hdslb.com/bfs/archive/abc.jpg"), "abc.jpg");
-        assert_eq!(cover_name("https://x/y.jpg?x=1"), "y.jpg");
-        assert_eq!(cover_name(""), "cover.jpg");
-        assert_eq!(cover_name("https://x/noext"), "cover.jpg");
+    fn renders_the_card_as_markdown() {
+        assert_eq!(
+            format_card(&sample()),
+            "## 标题\n\
+             ![标题 #320px #180px](https://i0.hdslb.com/bfs/archive/abc.jpg)\n\
+             \n\
+             UP：UP主\n\
+             播放 1.2万 · 弹幕 67\n\
+             投币 8 · 点赞 9\n\
+             评论 10 · 分享 11\n\
+             \n\
+             [在 B 站观看](https://www.bilibili.com/video/BV1mokxBtEZh)\n\
+             BV1mokxBtEZh\n\
+             \n\
+             > 2023-11-15 06:13"
+        );
+    }
+
+    #[test]
+    fn formats_the_time_to_the_minute() {
+        assert_eq!(format_minute(1_700_000_000, SHANGHAI_OFFSET), "2023-11-15 06:13");
+    }
+
+    #[test]
+    fn rewrites_the_http_cover_to_https() {
+        // 接口给的封面是 http://（实测 9 个真实稿件全是），必须升到 https。
+        let mut video = sample();
+        video.pic = "http://i1.hdslb.com/bfs/archive/x.jpg".into();
+        assert!(format_card(&video).contains("(https://i1.hdslb.com/bfs/archive/x.jpg)"));
+        // 已经是 https 的不能被降级成 http。
+        video.pic = "https://i1.hdslb.com/x.jpg".into();
+        assert!(format_card(&video).contains("(https://i1.hdslb.com/x.jpg)"));
+    }
+
+    #[test]
+    fn omits_the_image_line_when_the_cover_is_missing() {
+        let mut video = sample();
+        video.pic = "  ".into();
+        let text = format_card(&video);
+        assert!(!text.contains("!["), "{text}");
+        assert!(text.starts_with("## 标题\n\nUP："), "{text}");
+    }
+
+    #[test]
+    fn brackets_in_the_title_cannot_break_the_image_line() {
+        // `[教程] xxx` 里的 `]` 会把 `![标题 …](url)` 提前闭合，图片就不渲染了。
+        let mut video = sample();
+        video.title = "[教程] 如何 [白嫖]".into();
+        let text = format_card(&video);
+        assert!(text.contains("## ［教程］ 如何 ［白嫖］"), "{text}");
+        assert!(text.contains("![［教程］ 如何 ［白嫖］ #320px #180px]("), "{text}");
+    }
+
+    #[test]
+    fn drops_the_time_when_pubdate_is_unknown() {
+        let mut video = sample();
+        video.pubdate = 0;
+        let text = format_card(&video);
+        assert!(text.contains("UP：UP主\n"), "{text}");
+        // pubdate 为 0 时不该打出一个 1970 年的时间，也不该留下空的块引用。
+        assert!(!text.contains("1970"), "{text}");
+        assert!(!text.contains("> "), "{text}");
     }
 }

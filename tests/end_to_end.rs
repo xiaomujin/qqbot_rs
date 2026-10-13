@@ -1693,8 +1693,12 @@ async fn tarkov_server_status_lists_services_in_chinese() {
     assert!(text.contains("信息：正在维护"), "{text}");
 }
 
-/// C1：链接消息自动展开成卡片，且图与文字在**同一条**消息里 ——
+/// C1：链接消息自动展开成 markdown 卡片，且是**一条**消息 ——
 /// 拆成两条会白占一次被动回复配额（群聊一共只有 5 次）。
+///
+/// 卡片只能是 `msg_type=2`：封面作为公网 URL 写在正文里由平台转存，
+/// 不能再走富媒体（`msg_type=7` 的 content 是纯文本，放不下 markdown）。
+/// 夹具给的封面是 `http://`（与真实接口一致），所以这里顺带盯住 http→https 改写。
 #[tokio::test]
 async fn bilibili_link_expands_into_one_card_message() {
     let mock = MockServer::start().await;
@@ -1708,14 +1712,22 @@ async fn bilibili_link_expands_into_one_card_message() {
     .await;
 
     let sends = mock.all(|h| h.path == "/v2/groups/GBL/messages");
-    assert_eq!(sends.len(), 1, "图与文字必须在同一条消息里，不能拆开");
+    assert_eq!(sends.len(), 1, "卡片必须是一条消息，不能拆开");
     let body: serde_json::Value = serde_json::from_str(&sends[0].body).unwrap();
-    assert_eq!(body["msg_type"], 7, "卡片是富媒体: {body}");
-    assert!(body["media"]["file_info"].is_string(), "应当带 file_info: {body}");
-    let content = body["content"].as_str().unwrap_or_default();
-    assert!(content.contains("测试稿件"), "{content}");
-    assert!(content.contains("播放：1.2万 弹幕：67"), "{content}");
-    assert!(content.contains("UP：测试UP"), "{content}");
+    assert_eq!(body["msg_type"], 2, "卡片是 markdown: {body}");
+    assert!(body["content"].is_null(), "markdown 消息不能再带 content: {body}");
+
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.starts_with("## 测试稿件\n"), "{md}");
+    assert!(md.contains("![测试稿件 #320px #180px](https://"), "{md}");
+    assert!(!md.contains("](http://"), "封面必须升到 https: {md}");
+    assert!(md.contains("UP：测试UP"), "{md}");
+    assert!(md.contains("播放 1.2万 · 弹幕 67"), "{md}");
+    assert!(md.contains("投币 8 · 点赞 9"), "{md}");
+    assert!(md.contains("评论 10 · 分享 11"), "{md}");
+    assert!(md.contains("[在 B 站观看](https://www.bilibili.com/video/BV1mokxBtEZh)"), "{md}");
+    assert!(md.contains("\nBV1mokxBtEZh\n"), "BV 号要单独一行: {md}");
+    assert!(md.ends_with("> 2025-09-28 03:06"), "投稿时间用块引用收尾: {md}");
 }
 
 /// 同一条链接在一个会话里只展开一次 —— 群里常被几个人先后转发。

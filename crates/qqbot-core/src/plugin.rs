@@ -4,12 +4,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use qqbot_api::{Keyboard, SendResult, Target};
+use qqbot_api::Target;
 use regex::Regex;
 
 use crate::ctx::{Ctx, Services};
-use crate::error::CoreError;
-use crate::message::SendRequest;
+use crate::reply::Reply;
 
 /// 处理结果，对应 Shiro 的 `MESSAGE_BLOCK` / `MESSAGE_IGNORE`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,42 +20,20 @@ pub enum Handled {
 }
 
 /// 按钮 / 菜单回调（互动事件）的处理上下文。
+///
+/// 与 [`Ctx`] 的区别只在「消息上下文没有的东西」：按钮 data 与点击者 openid。
+/// 出站一律走 [`InteractionCtx::reply`] —— 构造时就挂好了事件凭证。
 pub struct InteractionCtx {
     pub services: Arc<Services>,
     pub target: Target,
     pub sender_openid: Option<String>,
-    /// 被动回复凭证；为空时只能发主动消息。
+    /// 互动事件 id。发送用的被动凭证由 [`InteractionCtx::reply`] 持有，
+    /// 这里保留原值供插件按需读取。
     pub event_id: Option<String>,
     /// 回调按钮的 data，形如 `task:59c512ad86f7741f0d09de9b:page:2`。
     pub button_data: String,
-}
-
-impl InteractionCtx {
-    /// 发送 Markdown：有 `event_id` 走事件被动回复，否则走主动消息。
-    pub async fn send_markdown(&self, md: impl Into<String>) -> Result<SendResult, CoreError> {
-        self.send(SendRequest::markdown(self.target.clone(), md)).await
-    }
-
-    /// 发送 Markdown + 内嵌键盘（按钮）。
-    pub async fn send_markdown_with_keyboard(
-        &self,
-        md: impl Into<String>,
-        keyboard: Keyboard,
-    ) -> Result<SendResult, CoreError> {
-        self.send(SendRequest::markdown_with_keyboard(self.target.clone(), md, keyboard)).await
-    }
-
-    /// 统一挂被动回复凭证。
-    ///
-    /// `msg_seq` 与配额校验都在 [`Services::send`] 里由会话 actor 完成，
-    /// 这里只决定「带不带 event_id」。
-    async fn send(&self, request: SendRequest) -> Result<SendResult, CoreError> {
-        let request = match &self.event_id {
-            Some(id) => request.responding_to_event(id.clone()),
-            None => request,
-        };
-        self.services.send(request).await
-    }
+    /// 用事件凭证构造的回复句柄；没有 `event_id` 时只能发主动消息。
+    pub reply: Reply,
 }
 
 /// 命令处理器。
@@ -88,7 +65,7 @@ pub type BoxedHandlerFuture<'a> = Pin<Box<dyn Future<Output = Handled> + Send + 
 ///
 /// ```ignore
 /// FnHandler::new("echo", |ctx| Box::pin(async move {
-///     ctx.reply_text("hi").await.ok();
+///     ctx.reply.text("hi").await.ok();
 ///     Handled::Consumed
 /// }))
 /// ```

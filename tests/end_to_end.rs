@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use qqbot_api::{ApiClient, ApiClientConfig, Event, Target};
-use qqbot_core::{CoreError, DispatchConfig, Dispatcher, Router, SendRequest, Services, SessionRegistry};
+use qqbot_core::{CoreError, DispatchConfig, Dispatcher, Reply, Router, Services, SessionRegistry};
 use qqbot_media::MediaUploader;
 use qqbot_render::{RenderConfig, RenderService};
 use qqbot_store::{MessageStore, Scope, StoreConfig};
@@ -703,7 +703,7 @@ async fn inbound_messages_are_persisted_for_both_scopes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 纯文本路径：ping 用 reply_text，必须是 msg_type=0 且内容在 content 字段。
+/// 纯文本路径：ping 用 `reply.text`，必须是 msg_type=0 且内容在 content 字段。
 #[tokio::test]
 async fn text_reply_carries_msg_id_and_incremented_msg_seq() {
     let mock = MockServer::start().await;
@@ -1032,11 +1032,8 @@ async fn event_reply_carries_event_id_instead_of_msg_id() {
     let dispatcher = build_stack(&mock).await;
     let services = dispatcher.services().clone();
 
-    services
-        .send(
-            SendRequest::text(Target::group("GEV"), "欢迎使用")
-                .responding_to_event("EVENT-777"),
-        )
+    Reply::for_event(services, Target::group("GEV"), Some("EVENT-777".into()))
+        .text("欢迎使用")
         .await
         .expect("事件回复应发送成功");
 
@@ -1059,10 +1056,12 @@ async fn active_quota_is_enforced_before_hitting_the_api() {
     let services = dispatcher.services().clone();
 
     let target = Target::group("GQ");
+    // 没有凭证 → 主动消息，正是配额规则要覆盖的那条路。
+    let reply = Reply::for_event(services, target.clone(), None);
     let mut accepted = 0usize;
     let mut rejected = 0usize;
     for _ in 0..25 {
-        match services.send(SendRequest::text(target.clone(), "hi")).await {
+        match reply.text("hi").await {
             Ok(_) => accepted += 1,
             Err(CoreError::QuotaExceeded) => rejected += 1,
             Err(err) => panic!("意外错误: {err}"),

@@ -329,7 +329,7 @@ impl DeltaPlugin {
     /// 卡片唯一的附注位置，默认值 `qqbot` 只适合没有附注的卡片。
     async fn render(&self, ctx: &Ctx, title: &str, rows: Vec<CardRow>, footer: Option<&str>) {
         if rows.is_empty() {
-            let _ = ctx.reply_text("上游没有返回数据，稍后再试").await;
+            let _ = ctx.reply.text("上游没有返回数据，稍后再试").await;
             return;
         }
         let mut card = Card::new(title);
@@ -342,9 +342,9 @@ impl DeltaPlugin {
         if let Some(text) = footer {
             card = card.footer(text);
         }
-        if let Err(err) = ctx.reply_card(&card).await {
+        if let Err(err) = ctx.reply.card(&card).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "三角洲卡片发送失败");
-            let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;
+            let _ = ctx.reply.text(format!("卡片生成失败：{err}")).await;
         }
     }
 
@@ -353,7 +353,7 @@ impl DeltaPlugin {
             Ok(data) => Some(data),
             Err(reason) => {
                 tracing::warn!(error = %reason, "三角洲数据获取失败");
-                let _ = ctx.reply_text(format!("获取数据失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("获取数据失败：{reason}")).await;
                 None
             }
         }

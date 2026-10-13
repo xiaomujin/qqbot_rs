@@ -122,12 +122,12 @@ impl Handler for TarkovImagePlugin {
                 // 只说「读取失败」用户无从下手。
                 tracing::warn!(error = %err, path = %path.display(), "读取塔科夫静态图失败");
                 let _ = ctx
-                    .reply_text(format!("图片读取失败：{}（{}）", err, path.display()))
+                    .reply.text(format!("图片读取失败：{}（{}）", err, path.display()))
                     .await;
                 return Handled::Consumed;
             }
         };
-        if let Err(err) = ctx.reply_media(FileType::Image, file, &bytes).await {
+        if let Err(err) = ctx.reply.media(FileType::Image, file, &bytes).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), file, "塔科夫静态图发送失败");
         }
         Handled::Consumed

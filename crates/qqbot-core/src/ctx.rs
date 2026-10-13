@@ -1,22 +1,26 @@
 use std::sync::{Arc, RwLock};
 
-use qqbot_api::{ApiClient, Keyboard, MessageEvent, SendResult, Target};
+use qqbot_api::{ApiClient, MessageEvent, SendResult, Target};
 use qqbot_media::{FileType, MediaUploader};
 use qqbot_render::{Card, RenderService};
 use qqbot_store::MessageStore;
 
 use crate::error::CoreError;
 use crate::message::SendRequest;
+use crate::reply::Reply;
 use crate::session::SessionRegistry;
 
-/// 共享服务集合。插件通过 [`Ctx`] 访问它们。
+/// 共享服务集合。
+///
+/// 字段收在 crate 内部（`pub(crate)` 或私有）：**发送链路的入口只有 [`Reply`]**，
+/// 插件面拿到的是 [`Ctx`] / [`Reply`]，以及 `bot_name()` 这类只读访问器。
 pub struct Services {
-    pub api: ApiClient,
-    pub media: MediaUploader,
-    pub render: RenderService,
-    pub sessions: Arc<SessionRegistry>,
+    pub(crate) api: ApiClient,
+    pub(crate) media: MediaUploader,
+    pub(crate) render: RenderService,
+    pub(crate) sessions: Arc<SessionRegistry>,
     /// 消息持久化。`None` 表示未启用（此时词云回退到内存语料）。
-    pub store: Option<Arc<MessageStore>>,
+    pub(crate) store: Option<Arc<MessageStore>>,
     bot_name: RwLock<String>,
 }
 
@@ -54,7 +58,10 @@ impl Services {
     }
 
     /// 发送（走会话 actor 分配 `msg_seq` 与配额校验）。
-    pub async fn send(&self, request: SendRequest) -> Result<SendResult, CoreError> {
+    ///
+    /// 只给 [`Reply`] 用 —— 被动凭证的挂载点在它内部，
+    /// 从别处调用等于直接发主动消息。
+    pub(crate) async fn send(&self, request: SendRequest) -> Result<SendResult, CoreError> {
         self.sessions.send(request).await
     }
 
@@ -62,17 +69,17 @@ impl Services {
     ///
     /// 插件只能走这条路：模板名与几何都在 `Card` 里，
     /// 通用的按名渲染（`RenderService::render_template`）不进插件面。
-    pub async fn render_card_png(&self, card: &Card) -> Result<Vec<u8>, CoreError> {
+    pub(crate) async fn render_card_png(&self, card: &Card) -> Result<Vec<u8>, CoreError> {
         Ok(self.render.render_card(card).await?.png)
     }
 
     /// 渲染 SVG 源码为 PNG 字节。
-    pub async fn render_svg_png(&self, svg: String) -> Result<Vec<u8>, CoreError> {
+    pub(crate) async fn render_svg_png(&self, svg: String) -> Result<Vec<u8>, CoreError> {
         Ok(self.render.render_svg(svg).await?.png)
     }
 
     /// 上传 PNG 并返回 `file_info`（带秒传缓存）。
-    pub async fn upload_png(&self, target: &Target, png: &[u8]) -> Result<String, CoreError> {
+    pub(crate) async fn upload_png(&self, target: &Target, png: &[u8]) -> Result<String, CoreError> {
         Ok(self.media.upload_png(target, png).await?)
     }
 
@@ -80,7 +87,7 @@ impl Services {
     ///
     /// 平台靠 `file_name` 判定格式，所以从上游转发来的 JPEG **不能**冒充
     /// `image.png` —— 这正是它比 `upload_png` 多一个参数的原因。
-    pub async fn upload_image(
+    pub(crate) async fn upload_image(
         &self,
         target: &Target,
         file_name: &str,
@@ -95,6 +102,8 @@ pub struct Ctx {
     pub services: Arc<Services>,
     pub message: Arc<MessageEvent>,
     pub target: Target,
+    /// 这条消息的回复句柄。凭证在构造时就已挂上，插件不必（也不能）再补。
+    pub reply: Reply,
     content: String,
     args: Vec<String>,
 }
@@ -105,7 +114,8 @@ impl Ctx {
         let target = message.target()?;
         let content = message.trimmed().to_string();
         let args = content.split_whitespace().skip(1).map(str::to_string).collect();
-        Some(Self { services, message, target, content, args })
+        let reply = Reply::for_message(services.clone(), target.clone(), message.id.clone());
+        Some(Self { services, message, target, reply, content, args })
     }
 
     /// 去掉首尾空白后的全文（路由匹配依据）。
@@ -150,112 +160,6 @@ impl Ctx {
     /// 入站消息 id（被动回复凭证）。
     pub fn message_id(&self) -> &str {
         &self.message.id
-    }
-
-    // ---------- 回复便捷方法 ----------
-
-    pub async fn reply_text(&self, text: impl Into<String>) -> Result<SendResult, CoreError> {
-        self.services
-            .send(SendRequest::text(self.target.clone(), text).replying_to(self.message.id.clone()))
-            .await
-    }
-
-    pub async fn reply_markdown(&self, md: impl Into<String>) -> Result<SendResult, CoreError> {
-        self.services
-            .send(SendRequest::markdown(self.target.clone(), md).replying_to(self.message.id.clone()))
-            .await
-    }
-
-    /// Markdown 正文 + 内嵌键盘（按钮）回复。
-    ///
-    /// 正文与按钮同一条消息发出，省一次被动回复配额（群聊一共只有 5 次）。
-    pub async fn reply_markdown_with_keyboard(
-        &self,
-        md: impl Into<String>,
-        keyboard: Keyboard,
-    ) -> Result<SendResult, CoreError> {
-        self.services
-            .send(
-                SendRequest::markdown_with_keyboard(self.target.clone(), md, keyboard)
-                    .replying_to(self.message.id.clone()),
-            )
-            .await
-    }
-
-    /// 直接发送 PNG 字节（内部完成上传 + 发送）。
-    pub async fn reply_image(&self, png: &[u8]) -> Result<SendResult, CoreError> {
-        let file_info = self.services.upload_png(&self.target, png).await?;
-        self.services
-            .send(SendRequest::media(self.target.clone(), file_info).replying_to(self.message.id.clone()))
-            .await
-    }
-
-    /// 发送任意格式的图片（`file_name` 决定格式，如 `daily.jpg`）。
-    pub async fn reply_image_named(
-        &self,
-        file_name: &str,
-        bytes: &[u8],
-    ) -> Result<SendResult, CoreError> {
-        self.reply_media(FileType::Image, file_name, bytes).await
-    }
-
-    /// 发送任意类型的素材（图片 / 视频 / 语音 / 文件）。
-    ///
-    /// file_type 与 file_name 都要对：平台按文件名判格式，
-    /// 而 file_type 决定走哪条上传通道。
-    pub async fn reply_media(
-        &self,
-        file_type: FileType,
-        file_name: &str,
-        bytes: &[u8],
-    ) -> Result<SendResult, CoreError> {
-        let file_info = self
-            .services
-            .media
-            .upload_bytes(&self.target, file_type, file_name, bytes)
-            .await?;
-        self.services
-            .send(SendRequest::media(self.target.clone(), file_info).replying_to(self.message.id.clone()))
-            .await
-    }
-
-    /// 发送素材并附上一段说明文字。
-    ///
-    /// 官方 API 的富媒体消息**可以**带 `content`，所以图和说明能一条发完，
-    /// 不必拆成两条 —— 那会白占一次被动回复配额（群聊一共只有 5 次）。
-    pub async fn reply_media_with_text(
-        &self,
-        file_type: FileType,
-        file_name: &str,
-        bytes: &[u8],
-        text: &str,
-    ) -> Result<SendResult, CoreError> {
-        let file_info = self
-            .services
-            .media
-            .upload_bytes(&self.target, file_type, file_name, bytes)
-            .await?;
-        self.services
-            .send(
-                SendRequest::media_with_text(self.target.clone(), file_info, text)
-                    .replying_to(self.message.id.clone()),
-            )
-            .await
-    }
-
-    /// 渲染一张卡片并作为图片回复。
-    ///
-    /// 调用方只管内容（标题 / 行 / 页脚 / 宽度），
-    /// 用哪个模板、高度多少都由 `Card` 决定。
-    pub async fn reply_card(&self, card: &Card) -> Result<SendResult, CoreError> {
-        let png = self.services.render_card_png(card).await?;
-        self.reply_image(&png).await
-    }
-
-    /// 渲染 SVG 源码并作为图片回复。
-    pub async fn reply_svg(&self, svg: String) -> Result<SendResult, CoreError> {
-        let png = self.services.render_svg_png(svg).await?;
-        self.reply_image(&png).await
     }
 }
 

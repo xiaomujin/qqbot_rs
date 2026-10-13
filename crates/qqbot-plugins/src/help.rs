@@ -63,7 +63,7 @@ impl HelpPlugin {
 impl Handler for HelpPlugin {
     async fn handle(&self, ctx: &Ctx) -> Handled {
         let text = self.render_markdown(&ctx.services.bot_name());
-        if let Err(err) = ctx.reply_markdown(text).await {
+        if let Err(err) = ctx.reply.markdown(text).await {
             tracing::warn!(error = %err, "帮助回复失败");
         }
         Handled::Consumed

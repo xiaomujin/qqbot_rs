@@ -140,7 +140,7 @@ pub struct SignInPlugin;
 impl Handler for SignInPlugin {
     async fn handle(&self, ctx: &Ctx) -> Handled {
         // ctx.arg(0) / ctx.content() / ctx.sender_name() / ctx.is_admin()
-        ctx.reply_text("签到成功 +1 天").await.ok();
+        ctx.reply.text("签到成功 +1 天").await.ok();
         Handled::Consumed   // 终止责任链；返回 Next 则继续交给下一个插件
     }
 
@@ -152,7 +152,7 @@ router.on_group(Matcher::Command("签到".into()), SignInPlugin);
 ```
 
 回复卡片只需给内容 —— 用哪个模板、高度多少都由 `Card` 算，
-渲染 → 上传 → 发送由 `Ctx` 一次完成：
+渲染 → 上传 → 发送由 `Reply` 一次完成：
 
 ```rust
 use qqbot_render::Card;
@@ -160,7 +160,7 @@ use qqbot_render::Card;
 let card = Card::new("签到成功")
     .row("小明", "+1 天")
     .footer("数据来自签到表");   // 不调用则用模板默认页脚
-ctx.reply_card(&card).await?;
+ctx.reply.card(&card).await?;
 ```
 
 `Card` 的几何是**唯一一处**定义（首行 y=156、行距 48、页脚余量 40，见
@@ -172,7 +172,7 @@ ctx.reply_card(&card).await?;
 
 ```rust
 let svg = qqbot_render::build_wordcloud_svg(&words, 900, 640, "群聊词云");
-ctx.reply_svg(svg).await?;
+ctx.reply.svg(svg).await?;
 ```
 
 **为什么用显式路由表而不是过程宏注解**：路由表是数据，可打印、可单测、
@@ -183,7 +183,7 @@ ctx.reply_svg(svg).await?;
 ## 测试与自检
 
 ```bash
-cargo test --workspace        # 493 项测试（含端到端）
+cargo test --workspace        # 496 项测试（含端到端）
 cargo test --test end_to_end  # 只跑收发链路端到端
 cargo test -p qqbot-gateway --test gateway_protocol  # 只跑网关协议（Identify/Resume/分片/op9）
 cargo test -p qqbot-store     # 只跑存储：幂等 / 隔离 / 保留期边界 / 不阻塞

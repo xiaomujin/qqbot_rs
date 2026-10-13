@@ -1125,11 +1125,11 @@ impl TaskPlugin {
     /// 「更新任务」：六个端点 → 语言包 → 反转后续 → 五表同事务替换。
     async fn reload(&self, ctx: &Ctx) -> Handled {
         let Some(store) = &self.config.store else {
-            let _ = ctx.reply_text("未启用持久化，任务功能不可用").await;
+            let _ = ctx.reply.text("未启用持久化，任务功能不可用").await;
             return Handled::Consumed;
         };
         if !is_system_controller(ctx, store).await {
-            let _ = ctx.reply_text("只有系统控制者能更新任务数据").await;
+            let _ = ctx.reply.text("只有系统控制者能更新任务数据").await;
             return Handled::Consumed;
         }
 
@@ -1145,7 +1145,7 @@ impl TaskPlugin {
             Ok(v) => v,
             Err(reason) => {
                 tracing::warn!(error = %reason, "下载任务数据失败");
-                let _ = ctx.reply_text(format!("下载失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("下载失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
@@ -1160,7 +1160,7 @@ impl TaskPlugin {
             (t, i, tr, m) => {
                 let reason = t.err().or(i.err()).or(tr.err()).or(m.err()).unwrap_or_default();
                 tracing::warn!(error = %reason, "语言包解析失败");
-                let _ = ctx.reply_text(format!("语言包解析失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("语言包解析失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
@@ -1169,12 +1169,12 @@ impl TaskPlugin {
             Ok(pair) => pair,
             Err(reason) => {
                 tracing::warn!(error = %reason, "解析任务数据失败");
-                let _ = ctx.reply_text(format!("解析失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("解析失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
         if items.is_empty() {
-            let _ = ctx.reply_text("解析出 0 条任务，上游格式可能变了").await;
+            let _ = ctx.reply.text("解析出 0 条任务，上游格式可能变了").await;
             return Handled::Consumed;
         }
         // 覆盖率不达标就**不写库**：留着旧数据总比换成一半英文的强。
@@ -1186,7 +1186,7 @@ impl TaskPlugin {
                 "中文覆盖率不达标，已放弃本次导入"
             );
             let _ = ctx
-                .reply_text(format!(
+                .reply.text(format!(
                     "中文覆盖率只有 {:.0}%，低于 {:.0}% 的底线，已放弃导入（旧数据保持不变）\n{}",
                     coverage.ratio() * 100.0,
                     MIN_COVERAGE * 100.0,
@@ -1201,7 +1201,7 @@ impl TaskPlugin {
         match store.replace_tasks(items).await {
             Ok(count) => {
                 let _ = ctx
-                    .reply_text(format!(
+                    .reply.text(format!(
                         "任务数据已更新，共 {count} 条（{}；前置 {prereqs} 条，后续 {successors} 条）",
                         coverage.summary()
                     ))
@@ -1209,7 +1209,7 @@ impl TaskPlugin {
             }
             Err(err) => {
                 tracing::warn!(error = %err, "写入任务数据失败");
-                let _ = ctx.reply_text("写入失败，稍后再试").await;
+                let _ = ctx.reply.text("写入失败，稍后再试").await;
             }
         }
         Handled::Consumed
@@ -1218,12 +1218,12 @@ impl TaskPlugin {
     /// 「查任务 <关键词>」/「任务 <关键词>」。
     async fn search(&self, ctx: &Ctx, query: &str) -> Handled {
         let Some(store) = &self.config.store else {
-            let _ = ctx.reply_text("未启用持久化，任务功能不可用").await;
+            let _ = ctx.reply.text("未启用持久化，任务功能不可用").await;
             return Handled::Consumed;
         };
         let query = query.trim();
         if query.is_empty() {
-            let _ = ctx.reply_text("用法：查任务 <名称片段>，例如 查任务 惩罚者").await;
+            let _ = ctx.reply.text("用法：查任务 <名称片段>，例如 查任务 惩罚者").await;
             return Handled::Consumed;
         }
 
@@ -1235,14 +1235,14 @@ impl TaskPlugin {
 
         let tokens = query_tokens(query);
         if tokens.is_empty() {
-            let _ = ctx.reply_text("用法：查任务 <名称片段>，例如 查任务 惩罚者").await;
+            let _ = ctx.reply.text("用法：查任务 <名称片段>，例如 查任务 惩罚者").await;
             return Handled::Consumed;
         }
         let mut items = match store.search_tasks(tokens, SEARCH_LIMIT).await {
             Ok(items) => items,
             Err(err) => {
                 tracing::warn!(error = %err, "检索任务失败");
-                let _ = ctx.reply_text("查询失败，稍后再试").await;
+                let _ = ctx.reply.text("查询失败，稍后再试").await;
                 return Handled::Consumed;
             }
         };
@@ -1252,7 +1252,7 @@ impl TaskPlugin {
                 Ok(0) => "任务数据还没导入，请系统控制者发「更新任务」",
                 _ => "没有匹配的任务，换个关键词试试",
             };
-            let _ = ctx.reply_text(hint).await;
+            let _ = ctx.reply.text(hint).await;
             return Handled::Consumed;
         }
 
@@ -1266,7 +1266,7 @@ impl TaskPlugin {
     async fn send_list(&self, ctx: &Ctx, query: &str, items: &[TarkovTask]) -> Handled {
         let total = items.len();
         let md = render_list(query, &items[..total.min(LIST_LIMIT)], total);
-        if let Err(err) = ctx.reply_markdown(md).await {
+        if let Err(err) = ctx.reply.markdown(md).await {
             tracing::warn!(error = %err, "任务列表发送失败");
         }
         Handled::Consumed
@@ -1278,12 +1278,12 @@ impl TaskPlugin {
             Ok(Some(detail)) => detail,
             Ok(None) => {
                 // 检索刚命中、详情却没了：只可能是并发重导。不是错误。
-                let _ = ctx.reply_text("任务数据正在更新，请稍后再试").await;
+                let _ = ctx.reply.text("任务数据正在更新，请稍后再试").await;
                 return Handled::Consumed;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "读取任务详情失败");
-                let _ = ctx.reply_text("查询失败，稍后再试").await;
+                let _ = ctx.reply.text("查询失败，稍后再试").await;
                 return Handled::Consumed;
             }
         };
@@ -1294,7 +1294,7 @@ impl TaskPlugin {
         let names = store.task_names(ids).await.unwrap_or_default();
 
         let md = render_detail(&detail, &names);
-        if let Err(err) = ctx.reply_markdown(md).await {
+        if let Err(err) = ctx.reply.markdown(md).await {
             tracing::warn!(error = %err, "任务详情发送失败");
         }
         Handled::Consumed

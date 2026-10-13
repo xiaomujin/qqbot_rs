@@ -13,6 +13,7 @@ pub mod dispatch;
 pub mod error;
 pub mod message;
 pub mod plugin;
+pub mod reply;
 pub mod session;
 
 pub use ctx::{Ctx, Services};
@@ -22,6 +23,7 @@ pub use message::{Body, SendRequest};
 pub use plugin::{
     FnHandler, Handled, Handler, InteractionCtx, Matcher, RouteInfo, Router, Rule, Scope,
 };
+pub use reply::Reply;
 pub use session::{
     recommended_shards, Quota, QuotaRules, SessionMsg, SessionRegistry, SessionState, WindowRules,
 };

@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 
 use crate::ctx::{Ctx, Services};
 use crate::plugin::{Handled, InteractionCtx, Router};
+use crate::reply::Reply;
 
 #[derive(Debug, Clone)]
 pub struct DispatchConfig {
@@ -222,6 +223,8 @@ async fn handle_interaction(
         return;
     };
 
+    // 凭证在构造时就挂上：拿不到 event_id 时 Reply 内部退化成主动消息。
+    let reply = Reply::for_event(services.clone(), target.clone(), event.event_id.clone());
     let ctx = InteractionCtx {
         services,
         target,
@@ -230,6 +233,7 @@ async fn handle_interaction(
         // 取不到就退化成空串：插件按前缀匹配自然不会命中，
         // 但事件本身仍会走完责任链（便于日志排查）。
         button_data: event.button_data().unwrap_or_default(),
+        reply,
     };
 
     tracing::info!(
@@ -446,9 +450,12 @@ mod tests {
         router.on_any(Matcher::Any, Probe { name: "first", seen: seen.clone(), consume: true });
         router.on_any(Matcher::Any, Probe { name: "second", seen: seen.clone(), consume: false });
 
+        let services = services();
+        let target = Target::group("G1");
         let ctx = InteractionCtx {
-            services: services(),
-            target: Target::group("G1"),
+            reply: Reply::for_event(services.clone(), target.clone(), Some("EV".into())),
+            services,
+            target,
             sender_openid: Some("U1".into()),
             event_id: Some("EV".into()),
             button_data: "task:x:page:2".into(),

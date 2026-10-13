@@ -43,11 +43,11 @@ impl CaptionPlugin {
     /// `图语 <文本>`：记下来，等下一张图。
     async fn remember(&self, ctx: &Ctx) -> Handled {
         let Some(text) = parse_caption(ctx.content()) else {
-            let _ = ctx.reply_text("用法：图语 <文字>，然后发一张图").await;
+            let _ = ctx.reply.text("用法：图语 <文字>，然后发一张图").await;
             return Handled::Consumed;
         };
         let Some(store) = &self.store else {
-            let _ = ctx.reply_text("未启用持久化，图语不可用").await;
+            let _ = ctx.reply.text("未启用持久化，图语不可用").await;
             return Handled::Consumed;
         };
         let Some(sender) = ctx.sender_openid() else {
@@ -55,11 +55,11 @@ impl CaptionPlugin {
         };
         match store.set_caption(ctx.target.id(), sender, text).await {
             Ok(()) => {
-                let _ = ctx.reply_text("好，发图吧").await;
+                let _ = ctx.reply.text("好，发图吧").await;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "记录图语失败");
-                let _ = ctx.reply_text("记录失败，稍后再试").await;
+                let _ = ctx.reply.text("记录失败，稍后再试").await;
             }
         }
         Handled::Consumed
@@ -97,7 +97,7 @@ impl CaptionPlugin {
         match self.download(url).await {
             Ok(bytes) => {
                 if let Err(err) = ctx
-                    .reply_media_with_text(FileType::Image, &name, &bytes, &caption)
+                    .reply.media_with_text(FileType::Image, &name, &bytes, &caption)
                     .await
                 {
                     tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "图语发送失败");
@@ -105,7 +105,7 @@ impl CaptionPlugin {
             }
             Err(reason) => {
                 tracing::warn!(error = %reason, "图语原图下载失败");
-                let _ = ctx.reply_text(format!("图片获取失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("图片获取失败：{reason}")).await;
             }
         }
         Handled::Consumed

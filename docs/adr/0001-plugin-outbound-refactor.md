@@ -26,7 +26,10 @@
    - 例外：`delta` 逐请求覆盖成**完整浏览器 UA**（kkrb 按 UA 拦），共享 client 上的默认 UA 不是给它的。这一条用 `cargo test -p qqbot-plugins --lib -- --ignored live_delta` 实跑验证过。
 
 5. **提交 2 —— `Card` 类型**：落在 `qqbot-render`（几何属于模板）。调用方只给标题 / 行 / 页脚 / 宽度，高度由 `Card` 自己算；「分段行」是行的一个变体，调用方不再需要知道 `section: true` 这个键，也不再需要选 `card.svg` 还是 `sections.svg`。通用 `render_template(name, data)` 留在 `RenderService` 上供 self-test 与未来模板使用，**不进插件面**。
-6. **提交 3 —— `Reply` module**：`Reply` 持有 target + 凭证 + services，凭证在**构造它**时确定（消息凭证 / 事件凭证两种构造）。**删掉 `Ctx` 的 8 个 `reply_*` 与 5 个零调用转发方法**（`send` / `render_template_png` / `render_svg_png` / `upload_png` / `upload_image`），18 个插件机械改成 `ctx.reply.text(...)`；`Services` 的字段收起来，只留只读访问器（`bot_name()` 等）。`InteractionCtx` 保留，但内部持有一个用事件凭证构造的 `Reply`。`Reply` **不留** `send(SendRequest)` 逃生口 —— 真需要时再加方法比现在留一个没人用的口子安全。
+6. **提交 3 —— `Reply` module**：落在 `crates/qqbot-core/src/reply.rs`，`Reply` 持有 `Arc<Services>` + target + 凭证，凭证在**构造它**时确定（`for_message` / `for_event` 两种构造；`for_event(None)` 退化成主动消息）。凭证只在私有 `attach(request, credential)` 一处挂上去，每个语义方法都走它。**删掉 `Ctx` 的 8 个 `reply_*`**，`Ctx` 改持有一个用消息凭证构造的 `pub reply: Reply`；18 个插件机械改成 `ctx.reply.text(...)`。
+   `Services` 的字段收成 `pub(crate)`，公开面只剩 `new` / `with_store` / `bot_name` / `set_bot_name`；`send` / `render_card_png` / `render_svg_png` / `upload_png` / `upload_image` 降为 `pub(crate)`，**只给 `Reply` 用**（`render_template_png` 已在提交 2 删除）。
+   - 订正：这几个方法本来就不在 `Ctx` 上，而在 `Services` 上；`Ctx` 要删的只有 8 个 `reply_*`。它们也不是「零调用」——`Reply` 的语义方法全靠它们（`upload_image` 原本确实没人调，本次由 `Reply::image_named` 接手）。本次只是把可见性降成 `pub(crate)`，把「只有 `Reply` 能发」交给编译器管。
+   `InteractionCtx` 保留（`button_data` / `sender_openid` 是消息上下文没有的），内部持有一个用事件凭证构造的 `Reply`，并删掉它的 `send_markdown` / `send_markdown_with_keyboard` / 私有 `send`。`Reply` **不留** `send(SendRequest)` 逃生口 —— 真需要时再加方法比现在留一个没人用的口子安全。
 
 ### 用户可见的变化（已确认）
 

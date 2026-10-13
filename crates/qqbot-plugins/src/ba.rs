@@ -149,7 +149,7 @@ impl Handler for BaPlugin {
             Ok(response) => response,
             Err(reason) => {
                 tracing::warn!(error = %reason, name, "BA 图片查询失败");
-                let _ = ctx.reply_text(format!("查询失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("查询失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
@@ -158,7 +158,7 @@ impl Handler for BaPlugin {
             // 命中：`file` 发图、`plain` 发文本。
             200 => {
                 for image in response.data.iter().filter(|i| i.kind.eq_ignore_ascii_case("plain")) {
-                    let _ = ctx.reply_text(&image.content).await;
+                    let _ = ctx.reply.text(&image.content).await;
                 }
                 let files: Vec<&BaImage> = response
                     .data
@@ -167,25 +167,25 @@ impl Handler for BaPlugin {
                     .take(MAX_IMAGES)
                     .collect();
                 if files.is_empty() {
-                    let _ = ctx.reply_text("爱丽丝什么都没有找到~").await;
+                    let _ = ctx.reply.text("爱丽丝什么都没有找到~").await;
                 }
                 for image in files {
                     match self.download(&image.content).await {
                         Ok((file_name, bytes)) => {
-                            if let Err(err) = ctx.reply_image_named(&file_name, &bytes).await {
+                            if let Err(err) = ctx.reply.image_named(&file_name, &bytes).await {
                                 tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "BA 图片发送失败");
                             }
                         }
                         Err(reason) => {
                             tracing::warn!(error = %reason, "BA 图片下载失败");
-                            let _ = ctx.reply_text(format!("图片获取失败：{reason}")).await;
+                            let _ = ctx.reply.text(format!("图片获取失败：{reason}")).await;
                         }
                     }
                 }
             }
             // 101 = 模糊搜索，列出候选让人重问。
             101 => {
-                let _ = ctx.reply_text(format_candidates(&response.data)).await;
+                let _ = ctx.reply.text(format_candidates(&response.data)).await;
             }
             _ => {
                 let message = if response.message.is_empty() {
@@ -193,7 +193,7 @@ impl Handler for BaPlugin {
                 } else {
                     response.message.clone()
                 };
-                let _ = ctx.reply_text(message).await;
+                let _ = ctx.reply.text(message).await;
             }
         }
         Handled::Consumed

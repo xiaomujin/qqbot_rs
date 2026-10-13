@@ -191,7 +191,7 @@ impl Handler for DicePlugin {
         };
 
         // 必须用 Markdown（msg_type=2）：纯文本消息里 `**加粗**` 只会原样显示。
-        if let Err(err) = ctx.reply_markdown(text).await {
+        if let Err(err) = ctx.reply.markdown(text).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "骰子回复失败");
         }
         Handled::Consumed

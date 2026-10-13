@@ -210,11 +210,11 @@ impl AmmoPlugin {
     /// `更新子弹`：整表重导。
     async fn reload(&self, ctx: &Ctx) -> Handled {
         if !ctx.is_group() || !ctx.is_admin() {
-            let _ = ctx.reply_text("只有群管理员能更新弹药数据").await;
+            let _ = ctx.reply.text("只有群管理员能更新弹药数据").await;
             return Handled::Consumed;
         }
         let Some(store) = &self.config.store else {
-            let _ = ctx.reply_text("未启用持久化，弹药功能不可用").await;
+            let _ = ctx.reply.text("未启用持久化，弹药功能不可用").await;
             return Handled::Consumed;
         };
 
@@ -225,7 +225,7 @@ impl AmmoPlugin {
             Ok(pair) => pair,
             Err(reason) => {
                 tracing::warn!(error = %reason, "下载弹药数据失败");
-                let _ = ctx.reply_text(format!("下载失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("下载失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
@@ -233,30 +233,30 @@ impl AmmoPlugin {
             Ok(pack) => pack,
             Err(reason) => {
                 tracing::warn!(error = %reason, "弹药语言包解析失败");
-                let _ = ctx.reply_text(format!("语言包解析失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("语言包解析失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
         let items = match parse_ammo(&body, &pack) {
             Ok(items) if !items.is_empty() => items,
             Ok(_) => {
-                let _ = ctx.reply_text("解析出 0 条弹药，上游格式可能变了").await;
+                let _ = ctx.reply.text("解析出 0 条弹药，上游格式可能变了").await;
                 return Handled::Consumed;
             }
             Err(reason) => {
                 tracing::warn!(error = %reason, "解析弹药数据失败");
-                let _ = ctx.reply_text(format!("解析失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("解析失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
 
         match store.replace_ammo(items).await {
             Ok(count) => {
-                let _ = ctx.reply_text(format!("弹药数据已更新，共 {count} 条")).await;
+                let _ = ctx.reply.text(format!("弹药数据已更新，共 {count} 条")).await;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "写入弹药数据失败");
-                let _ = ctx.reply_text("写入失败，稍后再试").await;
+                let _ = ctx.reply.text("写入失败，稍后再试").await;
             }
         }
         Handled::Consumed
@@ -267,11 +267,11 @@ impl AmmoPlugin {
         let query = ctx.content().trim().strip_prefix("查子弹").unwrap_or("").trim();
         let tokens = query_tokens(query);
         if tokens.is_empty() {
-            let _ = ctx.reply_text("用法：查子弹 <名称片段>，例如 查子弹 m855").await;
+            let _ = ctx.reply.text("用法：查子弹 <名称片段>，例如 查子弹 m855").await;
             return Handled::Consumed;
         }
         let Some(store) = &self.config.store else {
-            let _ = ctx.reply_text("未启用持久化，弹药功能不可用").await;
+            let _ = ctx.reply.text("未启用持久化，弹药功能不可用").await;
             return Handled::Consumed;
         };
 
@@ -279,7 +279,7 @@ impl AmmoPlugin {
             Ok(items) => items,
             Err(err) => {
                 tracing::warn!(error = %err, "检索弹药失败");
-                let _ = ctx.reply_text("查询失败，稍后再试").await;
+                let _ = ctx.reply.text("查询失败，稍后再试").await;
                 return Handled::Consumed;
             }
         };
@@ -290,7 +290,7 @@ impl AmmoPlugin {
                 Ok(0) => "弹药数据还没导入，请管理员发「更新子弹」",
                 _ => "没有匹配的弹药，换个关键词试试",
             };
-            let _ = ctx.reply_text(hint).await;
+            let _ = ctx.reply.text(hint).await;
             return Handled::Consumed;
         }
 
@@ -302,9 +302,9 @@ impl AmmoPlugin {
                 CardRow::Section { label } => card.section(label),
             };
         }
-        if let Err(err) = ctx.reply_card(&card).await {
+        if let Err(err) = ctx.reply.card(&card).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "弹药卡片发送失败");
-            let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;
+            let _ = ctx.reply.text(format!("卡片生成失败：{err}")).await;
         }
         Handled::Consumed
     }

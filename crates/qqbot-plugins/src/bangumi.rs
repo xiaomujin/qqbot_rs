@@ -120,7 +120,7 @@ impl Handler for BangumiPlugin {
             Ok(html) => html,
             Err(reason) => {
                 tracing::warn!(error = %reason, "获取番剧更新失败");
-                let _ = ctx.reply_text(format!("获取番剧更新失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("获取番剧更新失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
@@ -130,7 +130,7 @@ impl Handler for BangumiPlugin {
             // 提取为空几乎只有一种原因：站点改版。给出可操作的提示，
             // 而不是回一张空卡片让人以为没更新。
             tracing::warn!(bytes = html.len(), "番剧页面没有解析出条目，站点结构可能变了");
-            let _ = ctx.reply_text("没有解析出番剧条目，页面结构可能变了").await;
+            let _ = ctx.reply.text("没有解析出番剧条目，页面结构可能变了").await;
             return Handled::Consumed;
         }
 
@@ -149,10 +149,10 @@ impl Handler for BangumiPlugin {
         };
         card = card.footer(footer);
 
-        if let Err(err) = ctx.reply_card(&card).await {
+        if let Err(err) = ctx.reply.card(&card).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "番剧卡片发送失败");
             // 渲染失败也要回话：静默失败会让用户以为机器人没收到命令。
-            let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;
+            let _ = ctx.reply.text(format!("卡片生成失败：{err}")).await;
         }
         Handled::Consumed
     }

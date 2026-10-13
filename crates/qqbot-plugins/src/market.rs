@@ -196,11 +196,11 @@ impl MarketPlugin {
     /// `更新物品`：整表重导。
     async fn reload(&self, ctx: &Ctx) -> Handled {
         if !ctx.is_group() || !ctx.is_admin() {
-            let _ = ctx.reply_text("只有群管理员能更新物品数据").await;
+            let _ = ctx.reply.text("只有群管理员能更新物品数据").await;
             return Handled::Consumed;
         }
         let Some(store) = &self.config.store else {
-            let _ = ctx.reply_text("未启用持久化，跳蚤功能不可用").await;
+            let _ = ctx.reply.text("未启用持久化，跳蚤功能不可用").await;
             return Handled::Consumed;
         };
 
@@ -211,7 +211,7 @@ impl MarketPlugin {
             Ok(pair) => pair,
             Err(reason) => {
                 tracing::warn!(error = %reason, "下载物品数据失败");
-                let _ = ctx.reply_text(format!("下载失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("下载失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
@@ -219,30 +219,30 @@ impl MarketPlugin {
             Ok(pack) => pack,
             Err(reason) => {
                 tracing::warn!(error = %reason, "物品语言包解析失败");
-                let _ = ctx.reply_text(format!("语言包解析失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("语言包解析失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
         let items = match parse_items(&body, &pack) {
             Ok(items) if !items.is_empty() => items,
             Ok(_) => {
-                let _ = ctx.reply_text("解析出 0 件物品，上游格式可能变了").await;
+                let _ = ctx.reply.text("解析出 0 件物品，上游格式可能变了").await;
                 return Handled::Consumed;
             }
             Err(reason) => {
                 tracing::warn!(error = %reason, "解析物品数据失败");
-                let _ = ctx.reply_text(format!("解析失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("解析失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
 
         match store.replace_items(items).await {
             Ok(count) => {
-                let _ = ctx.reply_text(format!("物品数据已更新，共 {count} 条")).await;
+                let _ = ctx.reply.text(format!("物品数据已更新，共 {count} 条")).await;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "写入物品数据失败");
-                let _ = ctx.reply_text("写入失败，稍后再试").await;
+                let _ = ctx.reply.text("写入失败，稍后再试").await;
             }
         }
         Handled::Consumed
@@ -252,11 +252,11 @@ impl MarketPlugin {
     async fn query(&self, ctx: &Ctx) -> Handled {
         let raw = ctx.content().trim().strip_prefix("跳蚤").unwrap_or("").trim();
         if raw.is_empty() {
-            let _ = ctx.reply_text("用法：跳蚤 <名称片段>，或 跳蚤 <24位物品id>").await;
+            let _ = ctx.reply.text("用法：跳蚤 <名称片段>，或 跳蚤 <24位物品id>").await;
             return Handled::Consumed;
         }
         let Some(store) = &self.config.store else {
-            let _ = ctx.reply_text("未启用持久化，跳蚤功能不可用").await;
+            let _ = ctx.reply.text("未启用持久化，跳蚤功能不可用").await;
             return Handled::Consumed;
         };
 
@@ -266,7 +266,7 @@ impl MarketPlugin {
                 Ok(found) => found,
                 Err(err) => {
                     tracing::warn!(error = %err, "按 id 取物品失败");
-                    let _ = ctx.reply_text("查询失败，稍后再试").await;
+                    let _ = ctx.reply.text("查询失败，稍后再试").await;
                     return Handled::Consumed;
                 }
             };
@@ -276,7 +276,7 @@ impl MarketPlugin {
                     (format!("跳蚤 · {name}"), detail_rows(&item))
                 }
                 None => {
-                    let _ = ctx.reply_text(self.empty_hint(store, "没有这个 id 对应的物品", raw).await).await;
+                    let _ = ctx.reply.text(self.empty_hint(store, "没有这个 id 对应的物品", raw).await).await;
                     return Handled::Consumed;
                 }
             }
@@ -286,12 +286,12 @@ impl MarketPlugin {
                 Ok(items) => items,
                 Err(err) => {
                     tracing::warn!(error = %err, "检索物品失败");
-                    let _ = ctx.reply_text("查询失败，稍后再试").await;
+                    let _ = ctx.reply.text("查询失败，稍后再试").await;
                     return Handled::Consumed;
                 }
             };
             if items.is_empty() {
-                let _ = ctx.reply_text(self.empty_hint(store, "没有匹配的物品", raw).await).await;
+                let _ = ctx.reply.text(self.empty_hint(store, "没有匹配的物品", raw).await).await;
                 return Handled::Consumed;
             }
             (format!("跳蚤 · {raw}"), format_rows(&items))
@@ -305,9 +305,9 @@ impl MarketPlugin {
                 CardRow::Section { label } => card.section(label),
             };
         }
-        if let Err(err) = ctx.reply_card(&card).await {
+        if let Err(err) = ctx.reply.card(&card).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "跳蚤卡片发送失败");
-            let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;
+            let _ = ctx.reply.text(format!("卡片生成失败：{err}")).await;
         }
         Handled::Consumed
     }

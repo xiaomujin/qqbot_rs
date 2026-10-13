@@ -273,7 +273,7 @@ pub struct PingPlugin;
 impl qqbot_core::Handler for PingPlugin {
     async fn handle(&self, ctx: &qqbot_core::Ctx) -> qqbot_core::Handled {
         let text = format!("pong · {}", ctx.services.bot_name());
-        if let Err(err) = ctx.reply_text(text).await {
+        if let Err(err) = ctx.reply.text(text).await {
             tracing::warn!(error = %err, "ping 回复失败");
         }
         qqbot_core::Handled::Consumed

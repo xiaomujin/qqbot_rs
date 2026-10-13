@@ -317,13 +317,13 @@ impl Handler for WordCloudPlugin {
                 let msg = format!(
                     "「{title}」的样本还太少（已收集 {samples} 条，需要至少 {MIN_DISTINCT} 个不同的词）。\n\n群里多聊几句即可；若群主没有开启「接收所有消息」，则需要 **@ 我** 说几句自然语言。"
                 );
-                let _ = ctx.reply_markdown(msg).await;
+                let _ = ctx.reply.markdown(msg).await;
                 return Handled::Consumed;
             }
 
             let svg = build_wordcloud_svg(&words, 900, 640, &title);
             tracing::info!(words = words.len(), "渲染词云");
-            if let Err(err) = ctx.reply_svg(svg).await {
+            if let Err(err) = ctx.reply.svg(svg).await {
                 tracing::warn!(
                     error = %err,
                     hint = err.hint().unwrap_or("-"),

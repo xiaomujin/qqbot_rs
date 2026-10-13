@@ -395,17 +395,17 @@ impl Handler for TarkovPlugin {
         if content == "塔科夫时间" {
             // 与源项目一致：两行裸时刻，不带标签。
             let (left, right) = tarkov_time(now_unix());
-            let _ = ctx.reply_text(format!("{left}\n{right}")).await;
+            let _ = ctx.reply.text(format!("{left}\n{right}")).await;
             return Handled::Consumed;
         }
 
         if is_server_query(content) {
-            let _ = ctx.reply_text(self.server_status_text().await).await;
+            let _ = ctx.reply.text(self.server_status_text().await).await;
             return Handled::Consumed;
         }
 
         if is_boss_query(content) {
-            let _ = ctx.reply_text(self.boss_chance_text().await).await;
+            let _ = ctx.reply.text(self.boss_chance_text().await).await;
             return Handled::Consumed;
         }
 

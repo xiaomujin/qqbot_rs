@@ -110,14 +110,14 @@ impl Handler for DailyPlugin {
     async fn handle(&self, ctx: &Ctx) -> Handled {
         match self.image().await {
             Ok((bytes, file_name)) => {
-                if let Err(err) = ctx.reply_image_named(&file_name, &bytes).await {
+                if let Err(err) = ctx.reply.image_named(&file_name, &bytes).await {
                     tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "日报发送失败");
                 }
             }
             Err(reason) => {
                 tracing::warn!(error = %reason, "日报获取失败");
                 // 失败也要回话：静默失败会让用户以为机器人没收到命令。
-                if let Err(err) = ctx.reply_text(format!("日报获取失败：{reason}")).await {
+                if let Err(err) = ctx.reply.text(format!("日报获取失败：{reason}")).await {
                     tracing::warn!(error = %err, "日报错误提示发送失败");
                 }
             }

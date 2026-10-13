@@ -350,7 +350,7 @@ content="我第一次下载给的6块<@28800DF7B8FE4F830E9FF7C6DB937E35>"
 > `msg_type=7` **可以同时带 `content`**，客户端把图和文字放在同一个气泡里。
 > 想发「封面图 + 说明」时用一条消息就够，拆成两条会白占一次被动回复配额
 > （群聊一条入站消息一共只有 5 次）。对应 `SendRequest::media_with_text` /
-> `Ctx::reply_media_with_text`。
+> `Reply::media_with_text`。
 
 ---
 
@@ -632,7 +632,7 @@ POST /v2/users/{user_openid}/files
   再把事件交给插件的 `Handler::on_interaction`（见 `crates/qqbot-core/src/dispatch.rs`），
   插件里不必再自己 ack。事件外层 payload 的 `id` 会回填进 `InteractionCreate::event_id`，
   后续消息用它作被动回复凭证，不占主动配额。
-- 内嵌键盘用 `OutMessage::with_keyboard` / `Ctx::reply_markdown_with_keyboard` 发送。
+- 内嵌键盘用 `OutMessage::with_keyboard` / `Reply::markdown_with_keyboard` 发送。
   `action.type`：`0` 跳转 / `1` 回调（产生 `INTERACTION_CREATE`）/ `2` 指令（点击等于用户发一条消息，
   **不产生回调**）。指令按钮的 `enter` 仅单聊可用，群聊里请勿依赖它。
 

@@ -354,15 +354,15 @@ impl BiliPlugin {
             return Handled::Consumed;
         }
         let Some(uid) = ctx.arg(0) else {
-            let _ = ctx.reply_text("用法：哔哩订阅 <UID>").await;
+            let _ = ctx.reply.text("用法：哔哩订阅 <UID>").await;
             return Handled::Consumed;
         };
         if !valid_uid(uid) {
-            let _ = ctx.reply_text("UID 必须是纯数字").await;
+            let _ = ctx.reply.text("UID 必须是纯数字").await;
             return Handled::Consumed;
         }
         let Some(store) = &self.config.store else {
-            let _ = ctx.reply_text("未启用持久化，订阅功能不可用").await;
+            let _ = ctx.reply.text("未启用持久化，订阅功能不可用").await;
             return Handled::Consumed;
         };
 
@@ -370,7 +370,7 @@ impl BiliPlugin {
             Ok(name) => name,
             Err(reason) => {
                 tracing::warn!(error = %reason, uid, "校验 UID 失败");
-                let _ = ctx.reply_text(format!("订阅失败：{reason}")).await;
+                let _ = ctx.reply.text(format!("订阅失败：{reason}")).await;
                 return Handled::Consumed;
             }
         };
@@ -378,14 +378,14 @@ impl BiliPlugin {
         let group = ctx.target.id().to_string();
         match store.bili_subscribe(uid, &group, &name).await {
             Ok(true) => {
-                let _ = ctx.reply_text(format!("UID: {uid}\n昵称: {name}\n订阅成功~")).await;
+                let _ = ctx.reply.text(format!("UID: {uid}\n昵称: {name}\n订阅成功~")).await;
             }
             Ok(false) => {
-                let _ = ctx.reply_text(format!("UID: {uid}\n昵称: {name}\n本群已经订阅过了")).await;
+                let _ = ctx.reply.text(format!("UID: {uid}\n昵称: {name}\n本群已经订阅过了")).await;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "写入订阅失败");
-                let _ = ctx.reply_text("订阅失败：数据库写入出错").await;
+                let _ = ctx.reply.text("订阅失败：数据库写入出错").await;
             }
         }
         Handled::Consumed
@@ -397,25 +397,25 @@ impl BiliPlugin {
             return Handled::Consumed;
         }
         let Some(uid) = ctx.arg(0) else {
-            let _ = ctx.reply_text("用法：哔哩退订 <UID>").await;
+            let _ = ctx.reply.text("用法：哔哩退订 <UID>").await;
             return Handled::Consumed;
         };
         let Some(store) = &self.config.store else {
-            let _ = ctx.reply_text("未启用持久化，订阅功能不可用").await;
+            let _ = ctx.reply.text("未启用持久化，订阅功能不可用").await;
             return Handled::Consumed;
         };
 
         let group = ctx.target.id().to_string();
         match store.bili_unsubscribe(uid, &group).await {
             Ok(true) => {
-                let _ = ctx.reply_text(format!("{uid} 退订成功")).await;
+                let _ = ctx.reply.text(format!("{uid} 退订成功")).await;
             }
             Ok(false) => {
-                let _ = ctx.reply_text(format!("{uid} 未订阅")).await;
+                let _ = ctx.reply.text(format!("{uid} 未订阅")).await;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "删除订阅失败");
-                let _ = ctx.reply_text("退订失败：数据库写入出错").await;
+                let _ = ctx.reply.text("退订失败：数据库写入出错").await;
             }
         }
         Handled::Consumed
@@ -427,11 +427,11 @@ impl BiliPlugin {
     /// 而实际上他只是没权限。
     async fn permit(&self, ctx: &Ctx) -> bool {
         if !ctx.is_group() {
-            let _ = ctx.reply_text("订阅是群功能，请在群里使用").await;
+            let _ = ctx.reply.text("订阅是群功能，请在群里使用").await;
             return false;
         }
         if !ctx.is_admin() {
-            let _ = ctx.reply_text("只有群管理员能管理订阅").await;
+            let _ = ctx.reply.text("只有群管理员能管理订阅").await;
             return false;
         }
         true
@@ -549,7 +549,7 @@ impl Handler for BiliPlugin {
         // 影响标题/数据/链接（`force_verify_image_resource` 默认 false），
         // 所以这里**不做**兜底重发 —— 与其它 markdown 插件一致。
         let md = format_card(&video);
-        if let Err(err) = ctx.reply_markdown(md).await {
+        if let Err(err) = ctx.reply.markdown(md).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "B 站卡片发送失败");
         }
         Handled::Consumed

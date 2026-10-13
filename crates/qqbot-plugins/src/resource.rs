@@ -288,7 +288,7 @@ impl Core {
 
         if let Err(err) = self.send(ctx, id).await {
             tracing::warn!(error = %err, keyword, "资源发送失败");
-            self.reply(ctx, format!("资源发送失败：{err}")).await;
+            self.reply_markdown(ctx, format!("资源发送失败：{err}")).await;
         }
         Handled::Consumed
     }
@@ -303,7 +303,7 @@ impl Core {
             .await
             .with_context(|| format!("读取素材失败：{}", res.path.display()))?;
         let file_type = FileType::from_u8(res.file_type).unwrap_or(FileType::File);
-        ctx.reply_media(file_type, &res.file_name, &bytes).await?;
+        ctx.reply.media(file_type, &res.file_name, &bytes).await?;
         Ok(())
     }
 
@@ -311,20 +311,20 @@ impl Core {
 
     async fn collect(&self, ctx: &Ctx, scope: ResourceScope) -> Handled {
         if let Err(reason) = self.permit(ctx, scope) {
-            self.reply(ctx, reason).await;
+            self.reply_markdown(ctx, reason).await;
             return Handled::Consumed;
         }
         let Some(owner) = self.owner(ctx, scope) else {
-            self.reply(ctx, "该命令只能在群里使用".to_string()).await;
+            self.reply_markdown(ctx, "该命令只能在群里使用".to_string()).await;
             return Handled::Consumed;
         };
         let args = ctx.args();
         let Some(name) = args.first() else {
-            self.reply(ctx, self.usage(scope)).await;
+            self.reply_markdown(ctx, self.usage(scope)).await;
             return Handled::Consumed;
         };
         if RESERVED.contains(&name.as_str()) {
-            self.reply(ctx, format!("{name} 是保留命令名，换一个关键词")).await;
+            self.reply_markdown(ctx, format!("{name} 是保留命令名，换一个关键词")).await;
             return Handled::Consumed;
         }
 
@@ -348,7 +348,7 @@ impl Core {
                     ResourceScope::Group => "本群",
                     ResourceScope::System => "系统",
                 };
-                self.reply(
+                self.reply_markdown(
                     ctx,
                     format!("已收录为{label}资源：{name}（id={id}，{size} 字节）"),
                 )
@@ -356,7 +356,7 @@ impl Core {
             }
             Err(err) => {
                 tracing::warn!(error = %err, name, "收录失败");
-                self.reply(ctx, format!("收录失败：{err}")).await;
+                self.reply_markdown(ctx, format!("收录失败：{err}")).await;
             }
         }
         Handled::Consumed
@@ -497,25 +497,25 @@ impl Core {
 
     async fn alias(&self, ctx: &Ctx, scope: ResourceScope) -> Handled {
         if let Err(reason) = self.permit(ctx, scope) {
-            self.reply(ctx, reason).await;
+            self.reply_markdown(ctx, reason).await;
             return Handled::Consumed;
         }
         let Some(owner) = self.owner(ctx, scope) else {
-            self.reply(ctx, "该命令只能在群里使用".to_string()).await;
+            self.reply_markdown(ctx, "该命令只能在群里使用".to_string()).await;
             return Handled::Consumed;
         };
         let args = ctx.args();
         let (Some(keyword), Some(alias)) = (args.first(), args.get(1)) else {
             let usage = format!("用法：{} 关键词 新词", self.cmd(scope, "别名"));
-            self.reply(ctx, usage).await;
+            self.reply_markdown(ctx, usage).await;
             return Handled::Consumed;
         };
         if RESERVED.contains(&alias.as_str()) {
-            self.reply(ctx, format!("{alias} 是保留命令名，换一个")).await;
+            self.reply_markdown(ctx, format!("{alias} 是保留命令名，换一个")).await;
             return Handled::Consumed;
         }
         let Some(id) = self.lookup_scoped(scope, &owner, keyword) else {
-            self.reply(ctx, format!("没有找到关键词 {keyword}")).await;
+            self.reply_markdown(ctx, format!("没有找到关键词 {keyword}")).await;
             return Handled::Consumed;
         };
 
@@ -524,34 +524,34 @@ impl Core {
                 if let Err(err) = self.reload().await {
                     tracing::warn!(error = %err, "索引重建失败");
                 }
-                self.reply(ctx, format!("已为 {keyword} 增加别名 {alias}")).await;
+                self.reply_markdown(ctx, format!("已为 {keyword} 增加别名 {alias}")).await;
             }
-            Err(err) => self.reply(ctx, format!("添加别名失败：{err}")).await,
+            Err(err) => self.reply_markdown(ctx, format!("添加别名失败：{err}")).await,
         }
         Handled::Consumed
     }
 
     async fn remove(&self, ctx: &Ctx, scope: ResourceScope) -> Handled {
         if let Err(reason) = self.permit(ctx, scope) {
-            self.reply(ctx, reason).await;
+            self.reply_markdown(ctx, reason).await;
             return Handled::Consumed;
         }
         let Some(owner) = self.owner(ctx, scope) else {
-            self.reply(ctx, "该命令只能在群里使用".to_string()).await;
+            self.reply_markdown(ctx, "该命令只能在群里使用".to_string()).await;
             return Handled::Consumed;
         };
         let Some(keyword) = ctx.args().first() else {
             let usage = format!("用法：{} 关键词", self.cmd(scope, "删除"));
-            self.reply(ctx, usage).await;
+            self.reply_markdown(ctx, usage).await;
             return Handled::Consumed;
         };
         // 用户给的是任意触发词，而删除是按 name 定位的，所以要先反查。
         let Some(id) = self.lookup_scoped(scope, &owner, keyword) else {
-            self.reply(ctx, format!("没有找到关键词 {keyword}")).await;
+            self.reply_markdown(ctx, format!("没有找到关键词 {keyword}")).await;
             return Handled::Consumed;
         };
         let Ok(Some(res)) = self.store.get(id).await else {
-            self.reply(ctx, "资源记录已不存在".to_string()).await;
+            self.reply_markdown(ctx, "资源记录已不存在".to_string()).await;
             return Handled::Consumed;
         };
 
@@ -560,10 +560,10 @@ impl Core {
                 if let Err(err) = self.reload().await {
                     tracing::warn!(error = %err, "索引重建失败");
                 }
-                self.reply(ctx, format!("已删除 {}", res.name)).await;
+                self.reply_markdown(ctx, format!("已删除 {}", res.name)).await;
             }
-            Ok(false) => self.reply(ctx, "资源记录已不存在".to_string()).await,
-            Err(err) => self.reply(ctx, format!("删除失败：{err}")).await,
+            Ok(false) => self.reply_markdown(ctx, "资源记录已不存在".to_string()).await,
+            Err(err) => self.reply_markdown(ctx, format!("删除失败：{err}")).await,
         }
         Handled::Consumed
     }
@@ -582,7 +582,7 @@ impl Core {
             match self.store.list(ResourceScope::Group, group).await {
                 Ok(items) => sections.push(("本群资源", items)),
                 Err(err) => {
-                    self.reply(ctx, format!("读取资源失败：{err}")).await;
+                    self.reply_markdown(ctx, format!("读取资源失败：{err}")).await;
                     return Handled::Consumed;
                 }
             }
@@ -590,12 +590,12 @@ impl Core {
         match self.store.list(ResourceScope::System, SYSTEM_OWNER).await {
             Ok(items) => sections.push(("系统资源", items)),
             Err(err) => {
-                self.reply(ctx, format!("读取资源失败：{err}")).await;
+                self.reply_markdown(ctx, format!("读取资源失败：{err}")).await;
                 return Handled::Consumed;
             }
         }
         let aliases = self.alias_map().await;
-        self.reply(ctx, render_list(&sections, &aliases)).await;
+        self.reply_markdown(ctx, render_list(&sections, &aliases)).await;
         Handled::Consumed
     }
 
@@ -605,9 +605,9 @@ impl Core {
             Ok(items) => {
                 let aliases = self.alias_map().await;
                 let sections = vec![("系统资源", items)];
-                self.reply(ctx, render_list(&sections, &aliases)).await;
+                self.reply_markdown(ctx, render_list(&sections, &aliases)).await;
             }
-            Err(err) => self.reply(ctx, format!("读取资源失败：{err}")).await,
+            Err(err) => self.reply_markdown(ctx, format!("读取资源失败：{err}")).await,
         }
         Handled::Consumed
     }
@@ -630,7 +630,7 @@ impl Core {
 
     async fn controllers_cmd(&self, ctx: &Ctx) -> Handled {
         if !self.is_controller(ctx.sender_openid()) {
-            self.reply(ctx, "只有系统控制者可以操作".to_string()).await;
+            self.reply_markdown(ctx, "只有系统控制者可以操作".to_string()).await;
             return Handled::Consumed;
         }
         let args = ctx.args();
@@ -642,18 +642,18 @@ impl Core {
                 } else {
                     list.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n")
                 };
-                self.reply(ctx, format!("**系统控制者**\n{body}")).await;
+                self.reply_markdown(ctx, format!("**系统控制者**\n{body}")).await;
             }
             Some("添加") | Some("移除") => {
                 let action = args[0].clone();
                 let Some(target) = args.get(1) else {
-                    self.reply(ctx, "用法：系统控制者 添加/移除 openid".to_string()).await;
+                    self.reply_markdown(ctx, "用法：系统控制者 添加/移除 openid".to_string()).await;
                     return Handled::Consumed;
                 };
                 let mut list = self.controllers();
                 if action == "添加" {
                     if list.iter().any(|c| c == target) {
-                        self.reply(ctx, format!("{target} 已经是系统控制者")).await;
+                        self.reply_markdown(ctx, format!("{target} 已经是系统控制者")).await;
                         return Handled::Consumed;
                     }
                     list.push(target.clone());
@@ -661,7 +661,7 @@ impl Core {
                     let before = list.len();
                     list.retain(|c| c != target);
                     if list.len() == before {
-                        self.reply(ctx, format!("{target} 不在控制者列表里")).await;
+                        self.reply_markdown(ctx, format!("{target} 不在控制者列表里")).await;
                         return Handled::Consumed;
                     }
                 }
@@ -672,13 +672,13 @@ impl Core {
                         } else {
                             ""
                         };
-                        self.reply(ctx, format!("已{action} {target}{warn}")).await;
+                        self.reply_markdown(ctx, format!("已{action} {target}{warn}")).await;
                     }
-                    Err(err) => self.reply(ctx, format!("保存失败：{err}")).await,
+                    Err(err) => self.reply_markdown(ctx, format!("保存失败：{err}")).await,
                 }
             }
             Some(_) => {
-                self.reply(ctx, "用法：系统控制者 [添加|移除] openid".to_string()).await;
+                self.reply_markdown(ctx, "用法：系统控制者 [添加|移除] openid".to_string()).await;
             }
         }
         Handled::Consumed
@@ -740,8 +740,8 @@ impl Core {
         )
     }
 
-    async fn reply(&self, ctx: &Ctx, text: String) {
-        if let Err(err) = ctx.reply_markdown(text).await {
+    async fn reply_markdown(&self, ctx: &Ctx, text: String) {
+        if let Err(err) = ctx.reply.markdown(text).await {
             tracing::warn!(error = %err, "资源提示回复失败");
         }
     }

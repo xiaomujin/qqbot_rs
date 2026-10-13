@@ -261,57 +261,60 @@ impl DeltaPlugin {
     /// 首页 → overview → getMenu，沿途收集 cookie。
     async fn handshake(&self, state: &mut DeltaState) -> Result<(), String> {
         for url in [&self.config.home_url, &self.config.overview_url] {
-            let res = self
-                .http
-                .get(url)
-                .header("User-Agent", UA)
-                .header("Cookie", state.cookie.clone().unwrap_or_default())
-                .send()
-                .await
-                .map_err(|err| format!("握手 {url} 失败：{err}"))?;
-            absorb_cookies(state, &res);
-            // 必须读掉响应体，否则连接可能不释放。
-            let _ = res.text().await;
+            // 这两步只为了拿 Set-Cookie，页面本身是什么状态码无关紧要 ——
+            // 首页返回 403 / 302 时照样会下发会话标记，因为状态码把整段握手
+            // 掐掉反而更脆。所以这里**刻意不做**非 2xx 检查（与改造前一致）。
+            // UA 走下面的 `UA` 常量（站点按 UA 拦），这里只补会话 cookie。
+            let sent = crate::http::send(
+                self.http
+                    .get(url)
+                    .header("Cookie", state.cookie.clone().unwrap_or_default())
+                    .header("User-Agent", UA),
+            )
+            .await;
+            match sent {
+                Ok(res) => {
+                    absorb_cookies(state, &res);
+                    // 必须读掉响应体，否则连接可能不释放。
+                    let _ = res.text().await;
+                }
+                Err(err) => tracing::warn!(error = %err, url, "握手预热请求失败，继续用已有 cookie"),
+            }
         }
         let cookie = state.cookie.clone().unwrap_or_default();
-        let res = self
-            .http
-            .post(&self.config.menu_url)
-            .header("User-Agent", UA)
-            .header("Cookie", cookie.clone())
-            .header("Origin", ORIGIN)
-            .header("Referer", ORIGIN)
-            .header("X-Requested-With", "XMLHttpRequest")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body("globalData=false")
-            .send()
-            .await
-            .map_err(|err| format!("getMenu 请求失败：{err}"))?;
+        let res = crate::http::send(
+            self.http
+                .post(&self.config.menu_url)
+                .header("Cookie", cookie.clone())
+                .header("User-Agent", UA)
+                .header("Origin", ORIGIN)
+                .header("Referer", ORIGIN)
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("globalData=false"),
+        )
+        .await
+        .map_err(|err| format!("getMenu 请求失败：{err}"))?;
         absorb_cookies(state, &res);
         let _ = res.text().await;
         Ok(())
     }
 
     async fn post(&self, url: &str, cookie: &str) -> Result<String, String> {
-        let res = self
-            .http
-            .post(url)
-            .header("User-Agent", UA)
-            .header("Cookie", cookie)
-            .header("Origin", ORIGIN)
-            .header("Referer", ORIGIN)
-            .header("X-Requested-With", "XMLHttpRequest")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body("globalData=false")
-            .send()
-            .await
-            .map_err(|err| format!("{err}"))?;
-        let status = res.status();
-        let body = res.text().await.map_err(|err| format!("{err}"))?;
-        if !status.is_success() {
-            return Err(format!("HTTP {status}"));
-        }
-        Ok(body)
+        let res = crate::http::send(
+            self.http
+                .post(url)
+                .header("Cookie", cookie)
+                .header("User-Agent", UA)
+                .header("Origin", ORIGIN)
+                .header("Referer", ORIGIN)
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("globalData=false"),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        res.text().await.map_err(|err| err.to_string())
     }
 
     /// `template` 是 `card.svg`（两列）或 `sections.svg`（带小标题）。
@@ -353,8 +356,15 @@ impl DeltaPlugin {
     }
 }
 
+/// 三角洲站点自己的 UA。
+///
+/// 与 [`crate::http::USER_AGENT`] **刻意不同**：kkrb 按 UA 拦请求，原本用的就是
+/// 完整浏览器 UA，所以这里是唯一逐请求覆盖 UA 的地方 —— 共享 client 上的默认 UA
+/// 是给其余插件的，不是给它的。删掉这个常量前请先跑一次
+/// `cargo test -p qqbot-plugins --lib -- --ignored live_delta`。
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 const ORIGIN: &str = "https://www.kkrb.net/";
 
 /// 把响应里的 Set-Cookie 合并进会话。
@@ -491,6 +501,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "需要网络"]
     async fn live_delta_handshake_returns_data() {
+        // 只放宽超时：UA 由插件自己逐请求覆盖（见 `UA` 常量），这里不装默认 UA ——
+        // 否则这条实跑测试就证明不了「线上用的那个 UA 能通」。
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()

@@ -23,6 +23,8 @@
 ### A 簇的三个提交
 
 4. **提交 1 —— `http.rs` 深模块**：它持有「对外 HTTP」这件事，接口是 `fetch_text` / `fetch_json` / `fetch_bytes` / `send`（后者给需要原始 `Response` 的两个调用点：delta 读 Set-Cookie、bili 取重定向后的最终 URL）；超时、UA、状态码、空体、大小上限与三种中文错误形状都收在内部。plugins 启用 `thiserror`（workspace 已有），`FetchError` 的 `Display` 就是给用户看的那句话。
+   - 例外：`delta` 逐请求覆盖成**完整浏览器 UA**（kkrb 按 UA 拦），共享 client 上的默认 UA 不是给它的。这一条用 `cargo test -p qqbot-plugins --lib -- --ignored live_delta` 实跑验证过。
+
 5. **提交 2 —— `Card` 类型**：落在 `qqbot-render`（几何属于模板）。调用方只给标题 / 行 / 页脚 / 宽度，高度由 `Card` 自己算；「分段行」是行的一个变体，调用方不再需要知道 `section: true` 这个键，也不再需要选 `card.svg` 还是 `sections.svg`。通用 `render_template(name, data)` 留在 `RenderService` 上供 self-test 与未来模板使用，**不进插件面**。
 6. **提交 3 —— `Reply` module**：`Reply` 持有 target + 凭证 + services，凭证在**构造它**时确定（消息凭证 / 事件凭证两种构造）。**删掉 `Ctx` 的 8 个 `reply_*` 与 5 个零调用转发方法**（`send` / `render_template_png` / `render_svg_png` / `upload_png` / `upload_image`），18 个插件机械改成 `ctx.reply.text(...)`；`Services` 的字段收起来，只留只读访问器（`bot_name()` 等）。`InteractionCtx` 保留，但内部持有一个用事件凭证构造的 `Reply`。`Reply` **不留** `send(SendRequest)` 逃生口 —— 真需要时再加方法比现在留一个没人用的口子安全。
 

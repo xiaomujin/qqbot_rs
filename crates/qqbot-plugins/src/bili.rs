@@ -440,20 +440,16 @@ impl BiliPlugin {
     /// 校验 UID 并取昵称。
     async fn fetch_up_name(&self, uid: &str) -> Result<String, String> {
         let url = format!("{}{uid}", self.config.card_api);
-        let res = self
-            .http
-            .get(&url)
-            .header("Accept", "application/json")
-            .header("Referer", "https://space.bilibili.com/")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
-            .send()
-            .await
-            .map_err(|err| format!("请求失败：{err}"))?;
-        let status = res.status();
-        if !status.is_success() {
-            return Err(format!("接口返回 HTTP {status}"));
-        }
-        let body = res.text().await.map_err(|err| format!("读取响应失败：{err}"))?;
+        // 卡片接口要 Referer + Accept，所以自己拼 RequestBuilder 再交给 http::send。
+        let res = crate::http::send(
+            self.http
+                .get(&url)
+                .header("Accept", "application/json")
+                .header("Referer", "https://space.bilibili.com/"),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        let body = res.text().await.map_err(|err| err.to_string())?;
         let parsed: CardResponse =
             serde_json::from_str(&body).map_err(|err| format!("解析响应失败：{err}"))?;
         if parsed.code != 0 {
@@ -475,32 +471,21 @@ impl BiliPlugin {
     }
 
     /// 把短链解析成真实地址。
+    ///
+    /// 必须走 http::send 拿原始 Response —— fetch_text 拿不到重定向后的最终 URL。
     async fn resolve_short(&self, url: &str) -> Result<String, String> {
-        let res = self
-            .http
-            .get(url)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
-            .send()
+        let res = crate::http::send(self.http.get(url))
             .await
-            .map_err(|err| format!("解析短链失败：{err}"))?;
+            .map_err(|err| err.to_string())?;
         Ok(res.url().to_string())
     }
 
     async fn fetch_video(&self, bvid: &str) -> Result<BiliVideo, String> {
         let url = format!("{}{bvid}", self.config.view_api);
-        let res = self
-            .http
-            .get(&url)
-            .header("Accept", "application/json")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
-            .send()
+        let res = crate::http::send(self.http.get(&url).header("Accept", "application/json"))
             .await
-            .map_err(|err| format!("请求稿件信息失败：{err}"))?;
-        let status = res.status();
-        if !status.is_success() {
-            return Err(format!("稿件接口返回 HTTP {status}"));
-        }
-        let body = res.text().await.map_err(|err| format!("读取响应失败：{err}"))?;
+            .map_err(|err| err.to_string())?;
+        let body = res.text().await.map_err(|err| err.to_string())?;
         let parsed: BiliResponse =
             serde_json::from_str(&body).map_err(|err| format!("解析响应失败：{err}"))?;
         if parsed.code != 0 {

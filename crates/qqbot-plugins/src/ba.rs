@@ -36,9 +36,6 @@ impl Default for BaConfig {
 /// 真发 8 张会有一半被服务端拒掉，用户看到的是「发到一半断了」。
 const MAX_IMAGES: usize = 3;
 
-/// 单张图片大小上限。实测常见图 2.3MB，留足余量但挡住异常大文件。
-const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
-
 /// 接口响应。
 #[derive(Debug, Deserialize)]
 struct BaResponse {
@@ -102,46 +99,17 @@ impl BaPlugin {
         Self { config, http }
     }
 
-    async fn fetch(&self, name: &str) -> Result<BaResponse, String> {
+    async fn fetch(&self, name: &str) -> Result<BaResponse, crate::http::FetchError> {
         // 名字要转义：用户可能输入 `&`、空格、日文假名。
         let url = format!("{}{}", self.config.api, urlencode(name));
-        let res = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|err| format!("请求失败：{err}"))?;
-        let status = res.status();
-        if !status.is_success() {
-            return Err(format!("接口返回 HTTP {status}"));
-        }
-        let body = res.text().await.map_err(|err| format!("读取响应失败：{err}"))?;
-        serde_json::from_str(&body).map_err(|err| format!("解析响应失败：{err}"))
+        let body = crate::http::fetch_text(&self.http, &url).await?;
+        serde_json::from_str(&body).map_err(crate::http::FetchError::from)
     }
 
-    async fn download(&self, path: &str) -> Result<(String, Vec<u8>), String> {
+    async fn download(&self, path: &str) -> Result<(String, Vec<u8>), crate::http::FetchError> {
         let url = format!("{}{}", self.config.cdn, urlencode_path(path));
-        let res = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|err| format!("下载失败：{err}"))?;
-        let status = res.status();
-        if !status.is_success() {
-            return Err(format!("下载返回 HTTP {status}"));
-        }
-        let bytes = res
-            .bytes()
-            .await
-            .map_err(|err| format!("读取图片失败：{err}"))?
-            .to_vec();
-        if bytes.is_empty() {
-            return Err("图片内容为空".to_string());
-        }
-        if bytes.len() > MAX_IMAGE_BYTES {
-            return Err(format!("图片过大（{} 字节）", bytes.len()));
-        }
+        let bytes = crate::http::fetch_bytes(&self.http, &url, crate::http::DEFAULT_IMAGE_MAX_BYTES)
+            .await?;
         Ok((file_name_from_path(path), bytes))
     }
 }

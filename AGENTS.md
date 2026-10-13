@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 bin（`src/`） |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 474 项，全绿 |
+| 测试基线 | 485 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -234,7 +234,7 @@ cargo check -p qqbot
 | 业务插件 | `crates/qqbot-plugins/src/{help,dice,wordcloud,daily,resource,tarkov,ba,bili,bangumi,caption,ammo,task,market,delta,tarkov_image,timewin}.rs`，注册在 `lib.rs::register` |
 | 资源管理（关键词→素材） | `crates/qqbot-plugins/src/resource.rs` + `crates/qqbot-store/src/resource.rs` |
 | 数据库表结构 / schema 版本 | `crates/qqbot-store/src/schema.rs`（加表要提 `SCHEMA_VERSION`；**加列必须显式 ALTER**，`CREATE TABLE IF NOT EXISTS` 对已存在的表无效）。**新列的索引不能写进 `DDL`** —— 它在 `upgrade()` 之前跑，旧库上会 `no such column` |
-| 插件对外 HTTP | `crates/qqbot-plugins/src/http.rs`（统一 20s 超时，**不要在插件里自建 `reqwest::Client`**） |
+| 插件对外 HTTP | `crates/qqbot-plugins/src/http.rs`（**插件唯一的对外 HTTP 入口**：统一 20s 超时与 UA，非 2xx / 空体 / 大小上限 / 传输失败归一成 `FetchError`；调用点只用 `fetch_text` / `fetch_json` / `fetch_bytes` / `send`，**不要在插件里自建 `reqwest::Client`，也不要再逐个手写 `User-Agent`**；唯一例外是 `delta` —— kkrb 按 UA 拦，它刻意逐请求覆盖成完整浏览器 UA） |
 | 插件配置 | 各插件自带 `XxxConfig`（如 `DailyConfig`），由 `PluginsConfig` 汇总传入 `register` |
 | 富媒体分片上传 / 秒传缓存 | `crates/qqbot-media/src/uploader.rs` |
 | 渲染服务、模板、词云布局 | `crates/qqbot-render/src/`（模板在 `templates/`，新增要加进 `BUILTIN_TEMPLATES`）。**SVG 模板必须转义**（`&` 不转义会让 XML 解析失败，整张卡片渲染不出来） |

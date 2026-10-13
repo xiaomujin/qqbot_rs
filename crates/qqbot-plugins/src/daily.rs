@@ -90,38 +90,17 @@ impl DailyPlugin {
     /// 拉取并解析上游数据，返回图片字节与文件名。
     async fn fetch(&self) -> Result<(Vec<u8>, String), String> {
         let url = with_token(&self.config.api_url, &self.config.token);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
+        let body = crate::http::fetch_text(&self.http, &url)
             .await
-            .map_err(|err| format!("请求失败：{err}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("接口返回 HTTP {status}"));
-        }
-        let body = resp.text().await.map_err(|err| format!("读取响应失败：{err}"))?;
+            .map_err(|err| err.to_string())?;
         let image_url = pick_image_url(&body)?;
         let file_name = file_name_from_url(&image_url);
 
-        let img = self
-            .http
-            .get(&image_url)
-            .send()
-            .await
-            .map_err(|err| format!("下载图片失败：{err}"))?;
-        let img_status = img.status();
-        if !img_status.is_success() {
-            return Err(format!("下载图片返回 HTTP {img_status}"));
-        }
-        let bytes = img
-            .bytes()
-            .await
-            .map_err(|err| format!("读取图片失败：{err}"))?
-            .to_vec();
-        if bytes.is_empty() {
-            return Err("图片内容为空".to_string());
-        }
+        // 早报是长图，用默认的图片上限兜底。
+        let bytes =
+            crate::http::fetch_bytes(&self.http, &image_url, crate::http::DEFAULT_IMAGE_MAX_BYTES)
+                .await
+                .map_err(|err| err.to_string())?;
         Ok((bytes, file_name))
     }
 }

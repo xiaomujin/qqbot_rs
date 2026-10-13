@@ -444,17 +444,12 @@ impl Core {
         }
         let url = pending.url.as_str();
 
-        let resp = self.http.get(url).send().await.context("下载附件失败")?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("下载附件返回 HTTP {}", resp.status()));
-        }
-        let bytes = resp.bytes().await.context("读取附件失败")?.to_vec();
-        if bytes.is_empty() {
-            return Err(anyhow!("附件内容为空"));
-        }
-        if bytes.len() as u64 > MAX_RESOURCE_BYTES {
-            return Err(anyhow!("附件过大，上限 {MAX_RESOURCE_BYTES} 字节"));
-        }
+        // 空体与上限的兜底检查在 fetch_bytes 里；上面那次是拿附件**声明**的
+        // size 做的预检，两者互补，都要保留。
+        let bytes =
+            crate::http::fetch_bytes(&self.http, url, MAX_RESOURCE_BYTES as usize)
+                .await
+                .context("下载附件失败")?;
 
         // QQ 的附件地址是带签名的临时地址，**必须落盘**，否则迟早取不到。
         let ext = guess_ext(pending.content_type.as_deref(), pending.filename.as_deref(), url);

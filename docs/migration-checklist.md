@@ -71,7 +71,9 @@
 
 - ✅ **全量模式 @ 前缀修复** —— `MessageEvent::trimmed()` 剥离开头提及。
       修复前裸关键词能触发、@机器人 毫无反应（详见协议文档 §6.2.1）
-- ✅ **插件共享 HTTP 客户端** —— `qqbot-plugins/src/http.rs`，统一 20 秒超时
+- ✅ **插件共享 HTTP 客户端** —— `qqbot-plugins/src/http.rs`，插件**唯一**的对外
+      HTTP 入口：统一 20 秒超时、统一 UA、非 2xx / 空体 / 大小上限 / JSON 解析失败
+      归一成 `FetchError`（`Display` 即用户可见文案），调用点只留自己的语义前缀
 - ✅ **`PluginsConfig` 结构** —— 加插件不再改 `register` 签名
 - ✅ **原始事件 JSON 落库** —— `messages.raw`（schema v3），
       类型声明不了的字段只能靠原文保留

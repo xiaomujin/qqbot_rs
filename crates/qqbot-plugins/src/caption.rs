@@ -15,8 +15,6 @@ use qqbot_store::ResourceStore;
 
 /// 待用图语的有效期。源项目也是 5 分钟。
 const CAPTION_TTL_SECS: i64 = 300;
-/// 单张图片大小上限。
-const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 /// 解析 `图语 <文本>`。返回 `None` 表示不是这个命令。
 pub fn parse_caption(content: &str) -> Option<&str> {
@@ -113,29 +111,8 @@ impl CaptionPlugin {
         Handled::Consumed
     }
 
-    async fn download(&self, url: &str) -> Result<Vec<u8>, String> {
-        let res = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|err| format!("下载失败：{err}"))?;
-        let status = res.status();
-        if !status.is_success() {
-            return Err(format!("下载返回 HTTP {status}"));
-        }
-        let bytes = res
-            .bytes()
-            .await
-            .map_err(|err| format!("读取图片失败：{err}"))?
-            .to_vec();
-        if bytes.is_empty() {
-            return Err("图片内容为空".to_string());
-        }
-        if bytes.len() > MAX_IMAGE_BYTES {
-            return Err(format!("图片过大（{} 字节）", bytes.len()));
-        }
-        Ok(bytes)
+    async fn download(&self, url: &str) -> Result<Vec<u8>, crate::http::FetchError> {
+        crate::http::fetch_bytes(&self.http, url, crate::http::DEFAULT_IMAGE_MAX_BYTES).await
     }
 }
 

@@ -104,19 +104,8 @@ impl BangumiPlugin {
         Self { config, http }
     }
 
-    async fn fetch(&self) -> Result<String, String> {
-        let res = self
-            .http
-            .get(&self.config.update_url)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
-            .send()
-            .await
-            .map_err(|err| format!("请求失败：{err}"))?;
-        let status = res.status();
-        if !status.is_success() {
-            return Err(format!("页面返回 HTTP {status}"));
-        }
-        res.text().await.map_err(|err| format!("读取页面失败：{err}"))
+    async fn fetch(&self) -> Result<String, crate::http::FetchError> {
+        crate::http::fetch_text(&self.http, &self.config.update_url).await
     }
 }
 

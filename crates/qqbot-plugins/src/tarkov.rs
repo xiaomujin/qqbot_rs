@@ -347,22 +347,15 @@ impl TarkovPlugin {
 
     /// GET 一个 JSON 接口。
     ///
-    /// 状态站会按 UA 拦请求，所以带一个常见的浏览器 UA —— 源项目也这么做。
+    /// 状态站会按 UA 拦请求：UA 现在由共享 client 统一携带（见 `http::USER_AGENT`），
+    /// 这里只补 `Accept`。
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
-        let res = self
-            .http
-            .get(url)
-            .header("Accept", "application/json")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
-            .send()
+        let body = crate::http::send(self.http.get(url).header("Accept", "application/json"))
             .await
-            .with_context(|| format!("请求 {url} 失败"))?;
-        let status = res.status();
-        let body = res.text().await.with_context(|| format!("读取 {url} 响应失败"))?;
-        if !status.is_success() {
-            let snippet: String = body.chars().take(200).collect();
-            anyhow::bail!("{url} 返回 {status}：{snippet}");
-        }
+            .map_err(|err| anyhow::Error::new(err).context(format!("请求 {url} 失败")))?
+            .text()
+            .await
+            .map_err(|err| anyhow::Error::new(err).context(format!("读取 {url} 响应失败")))?;
         serde_json::from_str(&body).with_context(|| format!("解析 {url} 响应失败"))
     }
 
@@ -385,21 +378,12 @@ impl TarkovPlugin {
 
     /// GET 一段文本。
     async fn get_text(&self, url: &str) -> anyhow::Result<String> {
-        let res = self
-            .http
-            .get(url)
-            .header("Accept", "application/json")
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) qqbot-rs")
-            .send()
+        crate::http::send(self.http.get(url).header("Accept", "application/json"))
             .await
-            .with_context(|| format!("请求 {url} 失败"))?;
-        let status = res.status();
-        let body = res.text().await.with_context(|| format!("读取 {url} 响应失败"))?;
-        if !status.is_success() {
-            let snippet: String = body.chars().take(200).collect();
-            anyhow::bail!("{url} 返回 {status}：{snippet}");
-        }
-        Ok(body)
+            .map_err(|err| anyhow::Error::new(err).context(format!("请求 {url} 失败")))?
+            .text()
+            .await
+            .map_err(|err| anyhow::Error::new(err).context(format!("读取 {url} 响应失败")))
     }
 }
 

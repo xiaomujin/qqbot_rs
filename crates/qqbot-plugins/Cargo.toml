@@ -18,8 +18,14 @@ rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "fs"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# 单元测试要起本机回环服务器（http.rs 的 mock），所以要 net / io-util。
+# 生产代码只用 rt / sync / time / macros / fs，不引入网络栈。
+tokio = { workspace = true, features = ["net", "io-util"] }
 
 [lints]
 workspace = true

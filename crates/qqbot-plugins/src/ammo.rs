@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qqbot_core::{Ctx, Handled, Handler};
+use qqbot_render::{Card, CardRow};
 use qqbot_store::{Ammo, ResourceStore};
 use serde::Deserialize;
-use serde_json::json;
 
 /// 数据源。
 const ITEMS_URL: &str = "https://json.tarkov.dev/regular/items";
@@ -183,14 +183,14 @@ pub fn query_tokens(raw: &str) -> Vec<String> {
 
 
 /// 卡片行：左边名称，右边三项关键数值。
-pub fn format_rows(items: &[Ammo]) -> Vec<serde_json::Value> {
+pub fn format_rows(items: &[Ammo]) -> Vec<CardRow> {
     items
         .iter()
         .map(|a| {
-            json!({
-                "label": a.name_zh.as_deref().unwrap_or(&a.normalized_name),
-                "value": format!("伤{} 穿{} 甲伤{}", a.damage, a.penetration_power, a.armor_damage),
-            })
+            CardRow::Item {
+                label: a.name_zh.as_deref().unwrap_or(&a.normalized_name).to_string(),
+                value: format!("伤{} 穿{} 甲伤{}", a.damage, a.penetration_power, a.armor_damage),
+            }
         })
         .collect()
 }
@@ -294,16 +294,15 @@ impl AmmoPlugin {
             return Handled::Consumed;
         }
 
-        let rows = format_rows(&items);
-        let height = 156 + rows.len() * 48 + 40;
-        let data = json!({
-            "title": format!("弹药 · {query}"),
-            "rows": rows,
-            "width": 980,
-            "height": height,
-            "footer": format!("{} 条结果 · 伤/穿/甲伤", items.len()),
-        });
-        if let Err(err) = ctx.reply_template("card.svg", data).await {
+        // 宽度与页脚都用 `Card` 的默认值（统一 1000 / 模板默认页脚）。
+        let mut card = Card::new(format!("弹药 · {query}"));
+        for row in format_rows(&items) {
+            card = match row {
+                CardRow::Item { label, value } => card.row(label, value),
+                CardRow::Section { label } => card.section(label),
+            };
+        }
+        if let Err(err) = ctx.reply_card(&card).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "弹药卡片发送失败");
             let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;
         }

@@ -5,6 +5,7 @@ use std::time::Duration;
 use moka::sync::Cache;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
+use crate::card::Card;
 use crate::error::RenderError;
 use crate::svg::{RenderedImage, SvgRenderer};
 use crate::template::TemplateEngine;
@@ -187,12 +188,23 @@ impl RenderService {
     }
 
     /// 便捷入口：按模板名渲染。
+    ///
+    /// 通用的按名渲染留在这一层（self-test 与未来模板要用），
+    /// **不进插件面** —— 插件用 `Self::render_card`。
     pub async fn render_template(
         &self,
         template: &str,
         data: serde_json::Value,
     ) -> Result<RenderedImage, RenderError> {
         self.render(RenderRequest::new(template, data)).await
+    }
+
+    /// 便捷入口：渲染一张 `Card`。
+    ///
+    /// 模板名与几何都由 `Card` 决定，所以调用方拿不到「选错模板」或
+    /// 「高度算错」的机会 —— 这正是这个类型存在的理由。
+    pub async fn render_card(&self, card: &Card) -> Result<RenderedImage, RenderError> {
+        self.render_template(card.template(), card.to_data()).await
     }
 
     /// 便捷入口：直接渲染 SVG 源码。
@@ -313,6 +325,7 @@ fn cache_key(source: &RenderSource, scale: f32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::card::CARD_DEFAULT_WIDTH;
     use serde_json::json;
 
     fn svc() -> RenderService {
@@ -343,6 +356,42 @@ mod tests {
 
         let st = s.stats();
         assert!(st.hits >= 1, "第二次应命中缓存: {st:?}");
+    }
+
+
+    /// 几何断言：渲染出来的像素尺寸必须正好是 `card.width() × card.height()`
+    /// 再乘输出倍率。
+    ///
+    /// 这一条是本次重构**新得到**的能力：以前高度是各插件自己算的，
+    /// 算错只会让页脚压住最后一行 —— 渲染照样成功，没有任何东西会失败。
+    /// 现在几何由 `Card` 一处负责，这条测试把它钉住。
+    ///
+    /// 超时按仓库既有约定放宽到 120 秒：debug 下渲染慢 25~31 倍，
+    /// 几十个测试并行时 5 秒会偶发超时（见 AGENTS.md §1）。
+    #[tokio::test]
+    async fn render_card_pixels_match_the_card_geometry() {
+        let s = RenderService::new(RenderConfig {
+            workers: 2,
+            timeout: Duration::from_secs(120),
+            cache_capacity: 16,
+            default_scale: 2.0,
+            queue_capacity: 8,
+        });
+        let card = Card::new("几何自检")
+            .row("甲", "1")
+            .section("段")
+            .row("乙", "2")
+            .width(1000);
+        assert_eq!(card.height(), 340, "156 + 3*48 + 40");
+        assert_eq!(card.width, CARD_DEFAULT_WIDTH);
+
+        let img = s.render_card(&card).await.unwrap();
+        // 默认倍率 2.0：像素尺寸是用户坐标的两倍。
+        assert_eq!(
+            (img.width, img.height),
+            (card.width * 2, card.height() * 2),
+            "渲染尺寸必须与 Card 算出来的几何一致"
+        );
     }
 
     #[tokio::test]

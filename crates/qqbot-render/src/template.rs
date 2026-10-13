@@ -37,12 +37,6 @@ impl TemplateEngine {
         Self { env }
     }
 
-    /// 注册额外模板（来自磁盘）。
-    pub fn add_template(&mut self, name: &'static str, src: &'static str) -> Result<(), RenderError> {
-        self.env.add_template(name, src)?;
-        Ok(())
-    }
-
     pub fn template_names(&self) -> Vec<String> {
         self.env.templates().map(|(n, _)| n.to_string()).collect()
     }
@@ -51,11 +45,6 @@ impl TemplateEngine {
     pub fn render(&self, name: &str, data: &serde_json::Value) -> Result<String, RenderError> {
         let tpl = self.env.get_template(name)?;
         Ok(tpl.render(data)?)
-    }
-
-    /// 直接渲染一段模板源码（用于插件自定义布局）。
-    pub fn render_source(&self, source: &str, data: &serde_json::Value) -> Result<String, RenderError> {
-        Ok(self.env.render_str(source, data)?)
     }
 }
 

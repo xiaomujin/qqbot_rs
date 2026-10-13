@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qqbot_core::{Ctx, Handled, Handler};
+use qqbot_render::{Card, CardRow};
 use qqbot_store::{ResourceStore, TarkovItem};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::ammo::{ItemLangPack, item_name, parse_item_lang, query_tokens};
 
@@ -140,39 +140,43 @@ fn price_summary(item: &TarkovItem) -> String {
 }
 
 /// 搜索结果的行。
-pub fn format_rows(items: &[TarkovItem]) -> Vec<serde_json::Value> {
+pub fn format_rows(items: &[TarkovItem]) -> Vec<CardRow> {
     items
         .iter()
         .map(|it| {
-            json!({
-                "label": it.name_zh.as_deref().unwrap_or(&it.normalized_name),
-                "value": price_summary(it),
-            })
+            CardRow::Item {
+                label: it.name_zh.as_deref().unwrap_or(&it.normalized_name).to_string(),
+                value: price_summary(it),
+            }
         })
         .collect()
 }
 
 /// 详情视图的行。
-pub fn detail_rows(item: &TarkovItem) -> Vec<serde_json::Value> {
+pub fn detail_rows(item: &TarkovItem) -> Vec<CardRow> {
     let opt = |v: Option<i64>| v.map_or("-".to_string(), format_price);
+    let name = item.name_zh.as_deref().unwrap_or(&item.normalized_name);
     let mut rows = vec![
-        json!({
-            "label": "物品",
-            "value": item.name_zh.as_deref().unwrap_or(&item.normalized_name),
-        }),
-        json!({ "label": "商人基础价", "value": format_price(item.base_price) }),
-        json!({ "label": "最低挂牌", "value": opt(item.last_low_price) }),
-        json!({ "label": "24 小时均价", "value": opt(item.avg24h_price) }),
-        json!({
-            "label": "24 小时区间",
-            "value": match (item.low24h_price, item.high24h_price) {
+        CardRow::Item { label: "物品".to_string(), value: name.to_string() },
+        CardRow::Item {
+            label: "商人基础价".to_string(),
+            value: format_price(item.base_price),
+        },
+        CardRow::Item { label: "最低挂牌".to_string(), value: opt(item.last_low_price) },
+        CardRow::Item { label: "24 小时均价".to_string(), value: opt(item.avg24h_price) },
+        CardRow::Item {
+            label: "24 小时区间".to_string(),
+            value: match (item.low24h_price, item.high24h_price) {
                 (Some(lo), Some(hi)) => format!("{} ~ {}", format_price(lo), format_price(hi)),
                 _ => "-".to_string(),
             },
-        }),
+        },
     ];
     if item.weight > 0.0 {
-        rows.push(json!({ "label": "重量", "value": format!("{:.2} kg", item.weight) }));
+        rows.push(CardRow::Item {
+            label: "重量".to_string(),
+            value: format!("{:.2} kg", item.weight),
+        });
     }
     rows
 }
@@ -293,15 +297,15 @@ impl MarketPlugin {
             (format!("跳蚤 · {raw}"), format_rows(&items))
         };
 
-        let height = 156 + rows.len() * 48 + 40;
-        let data = json!({
-            "title": title,
-            "rows": rows,
-            "width": 1000,
-            "height": height,
-            "footer": "价格单位：卢布 · 数据来自 tarkov.dev",
-        });
-        if let Err(err) = ctx.reply_template("card.svg", data).await {
+        // 宽度与页脚都用 `Card` 的默认值（统一 1000 / 模板默认页脚）。
+        let mut card = Card::new(title);
+        for row in rows {
+            card = match row {
+                CardRow::Item { label, value } => card.row(label, value),
+                CardRow::Section { label } => card.section(label),
+            };
+        }
+        if let Err(err) = ctx.reply_card(&card).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "跳蚤卡片发送失败");
             let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;
         }
@@ -433,30 +437,30 @@ mod tests {
     fn search_rows_say_when_there_is_no_flea_data() {
         let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
         let rows = format_rows(&items);
-        assert_eq!(rows[0]["value"], "跳蚤 9.36万 · 商人 1.84万", "均价优先于最低挂牌");
-        assert_eq!(rows[1]["value"], "无跳蚤数据", "缺价要说清楚，不能显示 0");
+        assert_eq!(rows[0].value(), Some("跳蚤 9.36万 · 商人 1.84万"), "均价优先于最低挂牌");
+        assert_eq!(rows[1].value(), Some("无跳蚤数据"), "缺价要说清楚，不能显示 0");
     }
 
     #[test]
     fn detail_rows_cover_every_field() {
         let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
         let rows = detail_rows(&items[0]);
-        let labels: Vec<&str> = rows.iter().map(|r| r["label"].as_str().unwrap()).collect();
+        let labels: Vec<&str> = rows.iter().map(CardRow::label).collect();
         assert_eq!(
             labels,
             vec!["物品", "商人基础价", "最低挂牌", "24 小时均价", "24 小时区间", "重量"]
         );
-        assert_eq!(rows[4]["value"], "2.00万 ~ 18.50万");
-        assert_eq!(rows[5]["value"], "3.40 kg");
+        assert_eq!(rows[4].value(), Some("2.00万 ~ 18.50万"));
+        assert_eq!(rows[5].value(), Some("3.40 kg"));
     }
 
     #[test]
     fn detail_rows_use_a_dash_for_missing_values() {
         let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
         let rows = detail_rows(&items[1]);
-        assert_eq!(rows[2]["value"], "-");
-        assert_eq!(rows[4]["value"], "-", "只有一边有价也算缺");
+        assert_eq!(rows[2].value(), Some("-"));
+        assert_eq!(rows[4].value(), Some("-"), "只有一边有价也算缺");
         // 重量为 0 时整行不出现，而不是显示 0.00 kg。
-        assert!(rows.iter().all(|r| r["label"] != "重量"));
+        assert!(rows.iter().all(|r| r.label() != "重量"));
     }
 }

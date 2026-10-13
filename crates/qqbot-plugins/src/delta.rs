@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use qqbot_core::{Ctx, Handled, Handler};
+use qqbot_render::{Card, CardRow};
 use serde::Deserialize;
-use serde_json::json;
 use tokio::sync::Mutex;
 
 /// 数据缓存多久。与 cq-bot 的 5 分钟一致 ——
@@ -153,7 +153,7 @@ pub fn format_updated(raw: &str) -> String {
 }
 
 /// 密码行的顺序与名称照抄 cq-bot（`DeltaForcePlugin.passwordHandler`）。
-fn password_rows(data: &DeltaData) -> Vec<serde_json::Value> {
+fn password_rows(data: &DeltaData) -> Vec<CardRow> {
     let p = &data.passwords;
     [
         ("零号大坝", &p.db),
@@ -164,29 +164,31 @@ fn password_rows(data: &DeltaData) -> Vec<serde_json::Value> {
     ]
     .into_iter()
     .filter(|(_, e)| !e.password.is_empty())
-    .map(|(name, e)| json!({ "label": name, "value": e.password }))
+    .map(|(name, e)| CardRow::Item { label: name.to_string(), value: e.password.clone() })
     .collect()
 }
 
-fn container_rows(data: &DeltaData) -> Vec<serde_json::Value> {
+fn container_rows(data: &DeltaData) -> Vec<CardRow> {
     data.containers
         .iter()
-        .map(|c| json!({ "label": c.name, "value": format!("{} 能量", c.energy) }))
+        .map(|c| {
+            CardRow::Item { label: c.name.clone(), value: format!("{} 能量", c.energy) }
+        })
         .collect()
 }
 
-fn market_rows(data: &DeltaData) -> Vec<serde_json::Value> {
+fn market_rows(data: &DeltaData) -> Vec<CardRow> {
     data.market
         .iter()
         .map(|m| {
-            json!({
-                "label": m.item_name,
-                "value": format!(
+            CardRow::Item {
+                label: m.item_name.clone(),
+                value: format!(
                     "当前 {} / 建议 {}",
                     format_price(m.currect_price),
                     format_price(m.suggested_price)
                 ),
-            })
+            }
         })
         .collect()
 }
@@ -194,11 +196,11 @@ fn market_rows(data: &DeltaData) -> Vec<serde_json::Value> {
 /// 往 `rows` 里追加一个小标题与它下面的行；没有内容就整段不出现。
 ///
 /// 空段落会留下一个孤零零的标题，比缺一段更难看。
-fn push_section(rows: &mut Vec<serde_json::Value>, name: &str, body: Vec<serde_json::Value>) {
+fn push_section(rows: &mut Vec<CardRow>, name: &str, body: Vec<CardRow>) {
     if body.is_empty() {
         return;
     }
-    rows.push(json!({ "section": true, "label": name }));
+    rows.push(CardRow::Section { label: name.to_string() });
     rows.extend(body);
 }
 
@@ -207,7 +209,7 @@ fn push_section(rows: &mut Vec<serde_json::Value>, name: &str, body: Vec<serde_j
 /// cq-bot 是让 Puppeteer 截整个 `overview.html`；本项目**禁止引入 Chromium**
 /// （AGENTS.md 硬性禁令第 7 条，纯 Rust 光栅化是刻意的硬约束），
 /// 所以改成用同一份数据自己渲染 —— 内容一样，只是排版由我们决定。
-pub fn overview_rows(data: &DeltaData) -> Vec<serde_json::Value> {
+pub fn overview_rows(data: &DeltaData) -> Vec<CardRow> {
     let mut rows = Vec::new();
     push_section(&mut rows, "密码门", password_rows(data));
     push_section(&mut rows, "集市", market_rows(data));
@@ -317,28 +319,30 @@ impl DeltaPlugin {
         res.text().await.map_err(|err| err.to_string())
     }
 
-    /// `template` 是 `card.svg`（两列）或 `sections.svg`（带小标题）。
-    async fn render(
-        &self,
-        ctx: &Ctx,
-        template: &str,
-        title: &str,
-        rows: Vec<serde_json::Value>,
-        footer: &str,
-    ) {
+    /// 渲染并回复一张卡片。
+    ///
+    /// 模板由 `Card` 自己选（有分段行就是 `sections.svg`），宽度走默认值 ——
+    /// 原来这里要调用方传模板名，而调用方传错的唯一后果就是小标题被画成
+    /// 「左标签 + 右值」，不会报错。
+    ///
+    /// `footer` 只在**承载信息**时才给（数据更新时间、上游活动名）：页脚是这张
+    /// 卡片唯一的附注位置，默认值 `qqbot` 只适合没有附注的卡片。
+    async fn render(&self, ctx: &Ctx, title: &str, rows: Vec<CardRow>, footer: Option<&str>) {
         if rows.is_empty() {
             let _ = ctx.reply_text("上游没有返回数据，稍后再试").await;
             return;
         }
-        let height = 156 + rows.len() * 48 + 40;
-        let data = json!({
-            "title": title,
-            "rows": rows,
-            "width": 1000,
-            "height": height,
-            "footer": footer,
-        });
-        if let Err(err) = ctx.reply_template(template, data).await {
+        let mut card = Card::new(title);
+        for row in rows {
+            card = match row {
+                CardRow::Item { label, value } => card.row(label, value),
+                CardRow::Section { label } => card.section(label),
+            };
+        }
+        if let Some(text) = footer {
+            card = card.footer(text);
+        }
+        if let Err(err) = ctx.reply_card(&card).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "三角洲卡片发送失败");
             let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;
         }
@@ -404,17 +408,15 @@ impl Handler for DeltaPlugin {
                 let footer = data
                     .market
                     .first()
-                    .map(|m| format!("{} · {}", m.activity_name, m.activity_time))
-                    .unwrap_or_default();
-                self.render(ctx, "card.svg", "三角洲集市", market_rows(&data), &footer).await;
+                    .map(|m| format!("{} · {}", m.activity_name, m.activity_time));
+                self.render(ctx, "三角洲集市", market_rows(&data), footer.as_deref()).await;
                 Handled::Consumed
             }
             "三角洲脑机" | "脑机" => {
                 let Some(data) = self.fetch_or_report(ctx).await else {
                     return Handled::Consumed;
                 };
-                self.render(ctx, "card.svg", "三角洲脑机", container_rows(&data), "容器消耗能量")
-                    .await;
+                self.render(ctx, "三角洲脑机", container_rows(&data), Some("容器消耗能量")).await;
                 Handled::Consumed
             }
             "三角洲密码" | "密码" => {
@@ -422,7 +424,7 @@ impl Handler for DeltaPlugin {
                     return Handled::Consumed;
                 };
                 let footer = format!("更新于 {}", format_updated(&data.passwords.db.updated));
-                self.render(ctx, "card.svg", "三角洲密码门", password_rows(&data), &footer).await;
+                self.render(ctx, "三角洲密码门", password_rows(&data), Some(&footer)).await;
                 Handled::Consumed
             }
             "三角洲一图流" | "一图流" => {
@@ -430,8 +432,7 @@ impl Handler for DeltaPlugin {
                     return Handled::Consumed;
                 };
                 let footer = format!("更新于 {}", format_updated(&data.passwords.db.updated));
-                self.render(ctx, "sections.svg", "三角洲一图流", overview_rows(&data), &footer)
-                    .await;
+                self.render(ctx, "三角洲一图流", overview_rows(&data), Some(&footer)).await;
                 Handled::Consumed
             }
             _ => Handled::Next,
@@ -525,20 +526,47 @@ mod tests {
         assert!(parse_overview("不是 JSON").is_err());
     }
 
+    /// 分段行在模板数据里的形状（`sections.svg` 靠 `section` 键分支）。
+    fn section_names(card: &Card) -> Vec<String> {
+        card.to_data()["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["section"] == true)
+            .map(|r| r["label"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// 把行拼进卡片：分段行的模板选择是 `Card` 的事，
+    /// 测试里只需要一个能喂给 `to_data()` 的容器。
+    fn card_from_rows(title: &str, rows: Vec<CardRow>) -> Card {
+        let mut card = Card::new(title);
+        for row in rows {
+            card = match row {
+                CardRow::Item { label, value } => card.row(label, value),
+                CardRow::Section { label } => card.section(label),
+            };
+        }
+        card
+    }
+
     #[test]
     fn overview_puts_the_three_blocks_in_one_card() {
         let data = parse_overview(FIXTURE).unwrap();
         let rows = overview_rows(&data);
-        let sections: Vec<&str> = rows
-            .iter()
-            .filter(|r| r["section"] == true)
-            .map(|r| r["label"].as_str().unwrap())
-            .collect();
-        assert_eq!(sections, vec!["密码门", "集市", "脑机"]);
+        let card = card_from_rows("三角洲一图流", rows.clone());
+        assert_eq!(section_names(&card), vec!["密码门", "集市", "脑机"]);
         // 小标题本身不带右值。
-        assert!(rows.iter().filter(|r| r["section"] == true).all(|r| r.get("value").is_none()));
+        assert!(
+            rows.iter()
+                .filter(|r| ["密码门", "集市", "脑机"].contains(&r.label()))
+                .all(|r| r.value().is_none()),
+            "小标题不该有右值: {rows:?}"
+        );
         // 三个小标题 + 5 密码 + 1 集市 + 2 脑机。
         assert_eq!(rows.len(), 3 + 5 + 1 + 2);
+        // 有分段行就必须走 sections.svg，否则小标题会被画成「左标签 + 右值」。
+        assert_eq!(card.template(), "sections.svg");
     }
 
     #[test]
@@ -549,19 +577,8 @@ mod tests {
         sparse.market.clear();
         sparse.containers.clear();
         let rows = overview_rows(&sparse);
-        let sections: Vec<&str> = rows
-            .iter()
-            .filter(|r| r["section"] == true)
-            .map(|r| r["label"].as_str().unwrap())
-            .collect();
-        assert_eq!(sections, vec!["密码门"]);
-    }
-
-    #[test]
-    fn fractional_prices_keep_two_decimals() {
-        // 真实数据里出现过 `51937.6`；mock 用整数时这个分支从没被走到过。
-        assert_eq!(format_price(36046.0), "36046");
-        assert_eq!(format_price(51937.6), "51937.60");
+        let card = card_from_rows("三角洲一图流", rows);
+        assert_eq!(section_names(&card), vec!["密码门"]);
     }
 
     #[test]
@@ -574,23 +591,30 @@ mod tests {
     }
 
     #[test]
+    fn fractional_prices_keep_two_decimals() {
+        // 真实数据里出现过 `51937.6`；mock 用整数时这个分支从没被走到过。
+        assert_eq!(format_price(36046.0), "36046");
+        assert_eq!(format_price(51937.6), "51937.60");
+    }
+
+    #[test]
     fn password_rows_keep_the_cq_bot_order() {
         let data = parse_overview(FIXTURE).unwrap();
         let rows = password_rows(&data);
-        let labels: Vec<&str> = rows.iter().map(|r| r["label"].as_str().unwrap()).collect();
+        let labels: Vec<&str> = rows.iter().map(CardRow::label).collect();
         assert_eq!(labels, vec!["零号大坝", "长弓溪谷", "巴 克 什", "航天基地", "潮汐监狱"]);
-        assert_eq!(rows[0]["value"], "0533");
+        assert_eq!(rows[0].value(), Some("0533"));
         // az3 是上游新加的图，cq-bot 没显示，这里也不显示。
-        assert!(!rows.iter().any(|r| r["value"] == "0030"));
+        assert!(!rows.iter().any(|r| r.value() == Some("0030")));
     }
 
     #[test]
     fn container_and_market_rows_read_their_fields() {
         let data = parse_overview(FIXTURE).unwrap();
         let c = container_rows(&data);
-        assert_eq!(c[0]["label"], "快递箱");
-        assert_eq!(c[0]["value"], "8 能量", "energy 上游给的是字符串");
+        assert_eq!(c[0].label(), "快递箱");
+        assert_eq!(c[0].value(), Some("8 能量"), "energy 上游给的是字符串");
         let m = market_rows(&data);
-        assert_eq!(m[0]["value"], "当前 36046 / 建议 13052");
+        assert_eq!(m[0].value(), Some("当前 36046 / 建议 13052"));
     }
 }

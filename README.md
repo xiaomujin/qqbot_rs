@@ -151,17 +151,24 @@ impl Handler for SignInPlugin {
 router.on_group(Matcher::Command("签到".into()), SignInPlugin);
 ```
 
-回复图片只需三步（渲染 → 上传 → 发送由 `Ctx` 一次完成）：
+回复卡片只需给内容 —— 用哪个模板、高度多少都由 `Card` 算，
+渲染 → 上传 → 发送由 `Ctx` 一次完成：
 
 ```rust
-ctx.reply_template("card.svg", serde_json::json!({
-    "title": "签到成功",
-    "rows": [{"label": "小明", "value": "+1 天"}],
-    "width": 720, "height": 240
-})).await?;
+use qqbot_render::Card;
+
+let card = Card::new("签到成功")
+    .row("小明", "+1 天")
+    .footer("数据来自签到表");   // 不调用则用模板默认页脚
+ctx.reply_card(&card).await?;
 ```
 
-或直接给 SVG：
+`Card` 的几何是**唯一一处**定义（首行 y=156、行距 48、页脚余量 40，见
+`crates/qqbot-render/src/card.rs`）：加一行就自己长高，调用方不需要算。
+`.section("小标题")` 会插入分段行，整张卡自动换成 `sections.svg` ——
+调用方不必知道有哪两个模板。
+
+需要完全自定义布局时才直接给 SVG（词云走的就是这条）：
 
 ```rust
 let svg = qqbot_render::build_wordcloud_svg(&words, 900, 640, "群聊词云");
@@ -176,7 +183,7 @@ ctx.reply_svg(svg).await?;
 ## 测试与自检
 
 ```bash
-cargo test --workspace        # 485 项测试（含端到端）
+cargo test --workspace        # 493 项测试（含端到端）
 cargo test --test end_to_end  # 只跑收发链路端到端
 cargo test -p qqbot-gateway --test gateway_protocol  # 只跑网关协议（Identify/Resume/分片/op9）
 cargo test -p qqbot-store     # 只跑存储：幂等 / 隔离 / 保留期边界 / 不阻塞

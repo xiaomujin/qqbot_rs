@@ -15,7 +15,7 @@ use qqbot_api::ApiClient;
 use qqbot_core::{DispatchConfig, Dispatcher, Router, Services, SessionRegistry};
 use qqbot_gateway::{spawn_gateway, GatewayConfig};
 use qqbot_media::MediaUploader;
-use qqbot_render::{build_wordcloud_svg, RenderConfig, RenderService, WordItem};
+use qqbot_render::{build_wordcloud_svg, Card, RenderConfig, RenderService, WordItem};
 use qqbot_store::MessageStore;
 use tracing_subscriber::EnvFilter;
 
@@ -143,7 +143,34 @@ async fn self_test() -> Result<()> {
         );
     }
 
-    // ---- 2) 词云（算法布局，非模板） ----
+    // ---- 2) Card：几何由渲染层算 ----
+    //
+    // 上面那轮给三个模板喂的是**同一份写死 height: 400 的数据** ——
+    // 它验证的是模板引擎与转义，但永远发现不了「高度算错」：
+    // 算错只会让页脚压住最后一行，渲染照样成功。
+    //
+    // 这一轮走插件实际用的那条路（`Card` → `render_card`），
+    // 并把算出来的 height 与渲染出来的像素尺寸一起打出来对照。
+    // 2 个 Item 行 + 1 个 Section 行 → 156 + 3*48 + 40 = 340。
+    let card = Card::new("自检 · Card")
+        .row("外部依赖", "无 Chromium / 无 Node")
+        .row("转义自检", "A&B <ok>")
+        .section("分段标题");
+    let t_card = Instant::now();
+    let card_img = render.render_card(&card).await.context("Card 渲染失败")?;
+    let card_ms = t_card.elapsed().as_secs_f64() * 1000.0;
+    std::fs::write(out_dir.join("card-from-Card.png"), &card_img.png)?;
+    println!(
+        "✓ card-from-Card  模板={}  算出 height={}  渲染 {}x{}  {} 字节  {:.1}ms",
+        card.template(),
+        card.height(),
+        card_img.width,
+        card_img.height,
+        card_img.png.len(),
+        card_ms
+    );
+
+    // ---- 3) 词云（算法布局，非模板） ----
     // 刻意用长尾分布：字号按 sqrt(词频) 缩放、透明度同维度，
     // 线性映射会让尾部词全部挤在最小字号上。
     let words = vec![
@@ -171,7 +198,7 @@ async fn self_test() -> Result<()> {
         cloud_ms
     );
 
-    // ---- 3) 缓存命中 ----
+    // ---- 4) 缓存命中 ----
     let t2 = Instant::now();
     let _ = render
         .render_template(

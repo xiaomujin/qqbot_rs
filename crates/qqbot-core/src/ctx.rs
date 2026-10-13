@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use qqbot_api::{ApiClient, Keyboard, MessageEvent, SendResult, Target};
 use qqbot_media::{FileType, MediaUploader};
-use qqbot_render::RenderService;
+use qqbot_render::{Card, RenderService};
 use qqbot_store::MessageStore;
 
 use crate::error::CoreError;
@@ -58,13 +58,12 @@ impl Services {
         self.sessions.send(request).await
     }
 
-    /// 渲染模板为 PNG 字节。
-    pub async fn render_template_png(
-        &self,
-        template: &str,
-        data: serde_json::Value,
-    ) -> Result<Vec<u8>, CoreError> {
-        Ok(self.render.render_template(template, data).await?.png)
+    /// 渲染卡片为 PNG 字节。
+    ///
+    /// 插件只能走这条路：模板名与几何都在 `Card` 里，
+    /// 通用的按名渲染（`RenderService::render_template`）不进插件面。
+    pub async fn render_card_png(&self, card: &Card) -> Result<Vec<u8>, CoreError> {
+        Ok(self.render.render_card(card).await?.png)
     }
 
     /// 渲染 SVG 源码为 PNG 字节。
@@ -244,13 +243,12 @@ impl Ctx {
             .await
     }
 
-    /// 渲染模板并作为图片回复。
-    pub async fn reply_template(
-        &self,
-        template: &str,
-        data: serde_json::Value,
-    ) -> Result<SendResult, CoreError> {
-        let png = self.services.render_template_png(template, data).await?;
+    /// 渲染一张卡片并作为图片回复。
+    ///
+    /// 调用方只管内容（标题 / 行 / 页脚 / 宽度），
+    /// 用哪个模板、高度多少都由 `Card` 决定。
+    pub async fn reply_card(&self, card: &Card) -> Result<SendResult, CoreError> {
+        let png = self.services.render_card_png(card).await?;
         self.reply_image(&png).await
     }
 

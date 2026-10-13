@@ -9,8 +9,8 @@
 
 use async_trait::async_trait;
 use qqbot_core::{Ctx, Handled, Handler};
+use qqbot_render::Card;
 use regex::Regex;
-use serde_json::json;
 
 /// 番剧插件配置。
 #[derive(Debug, Clone)]
@@ -136,28 +136,20 @@ impl Handler for BangumiPlugin {
 
         let total = updates.len();
         let shown = total.min(MAX_ROWS);
-        let rows: Vec<serde_json::Value> = updates
-            .iter()
-            .take(shown)
-            .map(|(title, episode)| json!({ "label": title, "value": episode }))
-            .collect();
-
-        // 与 card.svg 的排版对齐：首行 y=156，行距 48，页脚在 height-24。
-        let height = 156 + shown * 48 + 40;
+        // 截断是业务逻辑（页面一次给 130 部左右，全画出来高度上万像素），
+        // 所以留在这里；高度与模板名交给 `Card`。
+        let mut card = Card::new("番剧一周更新");
+        for (title, episode) in updates.iter().take(shown) {
+            card = card.row(title, episode);
+        }
         let footer = if total > shown {
             format!("共 {total} 部，仅显示前 {shown} 部")
         } else {
             format!("共 {total} 部")
         };
-        let data = json!({
-            "title": "番剧一周更新",
-            "rows": rows,
-            "width": 900,
-            "height": height,
-            "footer": footer,
-        });
+        card = card.footer(footer);
 
-        if let Err(err) = ctx.reply_template("card.svg", data).await {
+        if let Err(err) = ctx.reply_card(&card).await {
             tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "番剧卡片发送失败");
             // 渲染失败也要回话：静默失败会让用户以为机器人没收到命令。
             let _ = ctx.reply_text(format!("卡片生成失败：{err}")).await;

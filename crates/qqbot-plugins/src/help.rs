@@ -32,9 +32,11 @@ impl HelpPlugin {
             // 同一插件的多个别名（骰子 / roll / r）合并成一行，避免帮助列表被别名淹没。
             let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
             for item in items {
+                // 展示名优先：正则这类 matcher 的 `describe()` 不能给用户看。
+                let label = item.display.as_deref().unwrap_or(item.matcher.as_str());
                 match groups.iter_mut().find(|(name, _)| *name == item.name.as_str()) {
-                    Some((_, matchers)) => matchers.push(item.matcher.as_str()),
-                    None => groups.push((item.name.as_str(), vec![item.matcher.as_str()])),
+                    Some((_, matchers)) => matchers.push(label),
+                    None => groups.push((item.name.as_str(), vec![label])),
                 }
             }
             for (_, matchers) in groups {
@@ -77,7 +79,14 @@ mod tests {
     use super::*;
 
     fn route(name: &str, scope: Scope, matcher: &str) -> RouteInfo {
-        RouteInfo { name: name.into(), scope, matcher: matcher.into(), priority: 0, hidden: false }
+        RouteInfo {
+            name: name.into(),
+            scope,
+            matcher: matcher.into(),
+            display: None,
+            priority: 0,
+            hidden: false,
+        }
     }
 
     #[test]
@@ -103,6 +112,7 @@ mod tests {
             name: "词云".into(),
             scope: Scope::Any,
             matcher: "*".into(),
+            display: None,
             priority: 0,
             hidden: true,
         });
@@ -123,6 +133,20 @@ mod tests {
             md.contains("-`骰子` / `roll` / `r`") || md.contains("- `骰子` / `roll` / `r`"),
             "别名应合并成一行: {md}"
         );
+    }
+
+    /// 正则 matcher 不能出现在用户看到的指令表里。
+    #[test]
+    fn display_replaces_the_raw_regex() {
+        let mut routes = vec![route("骰子", Scope::Any, "骰子")];
+        routes.push(RouteInfo {
+            display: Some(".r 数字".into()),
+            ..route("骰子", Scope::Any, r"/^[.。][rR]($|[\s\d-])/")
+        });
+
+        let md = HelpPlugin::new(routes).render_markdown("bot");
+        assert!(md.contains("- `骰子` / `.r 数字`"), "展示名应替换正则: {md}");
+        assert!(!md.contains("^[."), "正则不该出现在指令表里: {md}");
     }
 
     #[test]

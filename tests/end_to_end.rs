@@ -975,6 +975,12 @@ async fn help_lists_registered_routes() {
     let content = body["markdown"]["content"].as_str().unwrap();
     assert!(content.contains("骰子"), "帮助应包含已注册指令: {content}");
     assert!(content.contains("词云"));
+    // 骰子的四个入口合并成一行；`.r` 是正则路由，展示名替代正则字面量。
+    assert!(
+        content.contains("- `骰子` / `roll` / `r` / `.r 数字`"),
+        "骰子别名应合并成一行可读文案: {content}"
+    );
+    assert!(!content.contains("^[."), "正则不该出现在用户看到的指令表里: {content}");
 }
 
 #[tokio::test]
@@ -1622,6 +1628,8 @@ async fn ba_fuzzy_search_lists_candidates_instead_of_images() {
 }
 
 /// A2 区间记法：`.r 5 10` 取 [5,10] 内的整数，两数自动排序。
+///
+/// 区间和 NdM 走同一条版式（Markdown 单行），不再是一个 Markdown、一个纯文本。
 #[tokio::test]
 async fn dice_range_form_stays_within_bounds() {
     let mock = MockServer::start().await;
@@ -1639,14 +1647,110 @@ async fn dice_range_form_stays_within_bounds() {
         .find(|h| h.path == "/v2/groups/GD/messages")
         .expect("应当回复骰子");
     let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
-    let text = body["content"].as_str().unwrap_or_default();
-    assert!(text.contains("范围：[5-10]"), "两数应当自动排序: {text}");
-    let value: i64 = text
-        .rsplit("结果：")
-        .next()
+    assert_eq!(body["msg_type"], 2, "区间记法也要走 Markdown");
+    let md = body["markdown"]["content"].as_str().expect("缺少 markdown.content");
+    assert!(md.contains("[5-10]"), "两数应当自动排序: {md}");
+    let value: i64 = md
+        .split("**")
+        .nth(1)
         .and_then(|s| s.trim().parse().ok())
         .expect("应当给出结果");
-    assert!((5..=10).contains(&value), "结果必须落在区间内: {text}");
+    assert!((5..=10).contains(&value), "结果必须落在区间内: {md}");
+}
+
+/// 命令写法也要认区间：改动前 `r 10 100` 只取第一个参数、把 `100` 丢掉，
+/// **静默**算成 1d100 —— 用户以为在掷 10~100。
+#[tokio::test]
+async fn dice_command_form_accepts_the_range_syntax() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DICE_R3","author":{"member_openid":"U1"},"content":"r 10 100","group_openid":"GD3"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GD3/messages")
+        .expect("应当回复骰子");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let md = body["markdown"]["content"].as_str().expect("缺少 markdown.content");
+    assert!(md.contains("[10-100]"), "命令写法必须和 `.r` 等价: {md}");
+    assert!(!md.contains("1d100"), "不能再静默算成 1d100: {md}");
+}
+
+/// 标准记法里数量可以省略：`骰子 d6` 就是 `1d6`。
+/// 改动前它会**静默**掉回 1d100 —— 用户以为在掷 d6。
+#[tokio::test]
+async fn dice_omitted_count_rolls_a_single_die() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DICE_R5","author":{"member_openid":"U1"},"content":"骰子 d6","group_openid":"GD5"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GD5/messages")
+        .expect("应当回复骰子");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let md = body["markdown"]["content"].as_str().expect("缺少 markdown.content");
+    assert!(md.contains("1d6"), "省略数量应按 1d6 处理: {md}");
+    assert!(!md.contains("1d100"), "不该掉回默认规格: {md}");
+}
+
+/// 参数看不懂时要给出用法提示，而且提示本身也得走 Markdown（里面有加粗）。
+#[tokio::test]
+async fn dice_unparseable_input_replies_with_usage_hint() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DICE_R6","author":{"member_openid":"U1"},"content":"骰子 abc","group_openid":"GD6"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GD6/messages")
+        .expect("参数看不懂也要回一条提示");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    assert_eq!(body["msg_type"], 2, "提示也走 Markdown");
+    let md = body["markdown"]["content"].as_str().expect("缺少 markdown.content");
+    assert!(md.contains("请正确输入指令"), "{md}");
+    // 两种记法各给一个例子：NdM 走 `骰子`，区间走 `.r`。
+    assert!(md.contains("骰子 3d6") && md.contains(".r 1 100"), "两种记法都要给例子: {md}");
+}
+
+/// 提及落在正文结尾（先打字再点 @）时参数不能被污染。
+///
+/// 改动前 `r 2d10<@机器人>` 的参数是 `2d10<@…>`，NdM 解析失败后掉回 1d100，
+/// 看起来就像「@ 和不 @ 结果不一样」。
+#[tokio::test]
+async fn dice_survives_a_trailing_mention() {
+    let mock = MockServer::start().await;
+    let dispatcher = build_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"DICE_R4","author":{"member_openid":"U1"},"content":"r 2d10<@0F1E2D3C4B5A69788796A5B4C3D2E1F0>","group_openid":"GD4"}"#,
+    )
+    .await;
+
+    let send = mock
+        .find(|h| h.path == "/v2/groups/GD4/messages")
+        .expect("应当回复骰子");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let md = body["markdown"]["content"].as_str().expect("缺少 markdown.content");
+    assert!(md.contains("2d10"), "规格必须完整保留: {md}");
+    assert!(!md.contains("1d100"), "不该掉回默认规格: {md}");
 }
 
 /// `。` 是句末标点，`。roll` 这类正常句子不能被骰子吞掉。

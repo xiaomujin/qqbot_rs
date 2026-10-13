@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 bin（`src/`） |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 459 项，全绿 |
+| 测试基线 | 474 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -45,8 +45,15 @@ Windows 会锁住**正在运行的那个** exe。所以**开发期一律从副�
 
 ```powershell
 # 启动 / 换二进制
+Get-Process qqbot -ErrorAction SilentlyContinue | Stop-Process -Force
 cargo build
 Copy-Item -Force target\debug\qqbot.exe target\devrun\qqbot.exe
+# 旧实例占着 exe 时 Copy-Item 会**报错但不中断**（非终止性错误），
+# 于是你以为换了二进制，其实还在跑旧的 —— 症状是「改了代码但行为没变」。
+# 所以必须校验哈希，别信 Copy-Item 有没有抛。
+if ((Get-FileHash target\debug\qqbot.exe).Hash -ne (Get-FileHash target\devrun\qqbot.exe).Hash) {
+    throw '二进制没换成功：旧实例还在跑？'
+}
 Remove-Item target\live.log -ErrorAction SilentlyContinue
 $env:RUST_LOG='info'
 & .\target\devrun\qqbot.exe run 2>&1 | Tee-Object -FilePath target\live.log

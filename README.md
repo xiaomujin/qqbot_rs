@@ -44,8 +44,7 @@ cargo run -- self-test     # 离线渲染自检（无需网络与凭据）
 | 指令 | 说明 |
 |---|---|
 | `ping` | 存活探测 |
-| `骰子` / `骰子 3d6` / `roll 2d20` | NdM 记法掷骰，会列出每一颗骰子（Markdown 渲染） |
-| `.r 100` / `.r 5 10` | 区间记法，取 `[a,b]` 内的一个整数；`。r` 同样识别，两数自动排序 |
+| `骰子` / `roll` / `r` / `.r` / `。r` | 掷骰。**每个入口都认两种记法**：`骰子 3d6` 是 NdM（会列出每一颗骰子，数量可省：`d6` = `1d6`），`骰子 100` / `.r 5 10` 是区间（取 `[a,b]` 内的一个整数，两数自动排序）。无参数 = 1d100，结果走 Markdown |
 | `塔科夫时间` | 游戏内时刻（现实 × 7），按莫斯科时区取，回两行（左 / 右相差 12 小时） |
 | （无需命令） | 消息里出现 `bilibili.com/video/...` 或 `b23.tv/...` 时自动展开视频卡片（封面 + 标题 + 数据），同会话 5 分钟内不重复 |
 | `哔哩订阅 <UID>` / `哔哩退订 <UID>` | 按群订阅 UP 主（**群管理员**）。订阅前会校验 UID 是否存在 |
@@ -177,7 +176,7 @@ ctx.reply_svg(svg).await?;
 ## 测试与自检
 
 ```bash
-cargo test --workspace        # 463 项测试（含端到端）
+cargo test --workspace        # 474 项测试（含端到端）
 cargo test --test end_to_end  # 只跑收发链路端到端
 cargo test -p qqbot-gateway --test gateway_protocol  # 只跑网关协议（Identify/Resume/分片/op9）
 cargo test -p qqbot-store     # 只跑存储：幂等 / 隔离 / 保留期边界 / 不阻塞

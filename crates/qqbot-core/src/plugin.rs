@@ -187,6 +187,11 @@ pub struct Rule {
     pub name: String,
     pub scope: Scope,
     pub matcher: Matcher,
+    /// 帮助里展示的文案；`None` 时用 `matcher.describe()`。
+    ///
+    /// 正则 matcher 的 `describe()` 是**给排障看的**（`/^[.。][rR]($|[\s\d-])/`），
+    /// 直接列进指令表等于把正则丢给用户。
+    pub display: Option<String>,
     /// 数值越大越先执行。
     pub priority: i32,
     pub handler: Arc<dyn Handler>,
@@ -199,7 +204,10 @@ pub struct Rule {
 pub struct RouteInfo {
     pub name: String,
     pub scope: Scope,
+    /// matcher 的原始文案（正则就是正则字面量）。
     pub matcher: String,
+    /// 帮助里优先展示的文案，见 [`Rule::display`]。
+    pub display: Option<String>,
     pub priority: i32,
     pub hidden: bool,
 }
@@ -242,7 +250,15 @@ impl Router {
         handler: H,
     ) -> &mut Self {
         let name = handler.name().to_string();
-        self.add(Rule { name, scope, matcher, priority, handler: Arc::new(handler), hidden: false });
+        self.add(Rule {
+            name,
+            scope,
+            matcher,
+            display: None,
+            priority,
+            handler: Arc::new(handler),
+            hidden: false,
+        });
         self
     }
 
@@ -254,6 +270,7 @@ impl Router {
             name,
             scope: Scope::Any,
             matcher,
+            display: None,
             priority: 0,
             handler: Arc::new(handler),
             hidden: true,
@@ -273,6 +290,28 @@ impl Router {
         self.on(Scope::Any, matcher, 0, handler)
     }
 
+    /// 注册 `Scope::Any` 规则，并指定帮助里的展示文案。
+    ///
+    /// 给「matcher 不可读」的路由用 —— 目前只有正则前缀（`.r`）。
+    pub fn on_any_displayed<H: Handler>(
+        &mut self,
+        matcher: Matcher,
+        display: impl Into<String>,
+        handler: H,
+    ) -> &mut Self {
+        let name = handler.name().to_string();
+        self.add(Rule {
+            name,
+            scope: Scope::Any,
+            matcher,
+            display: Some(display.into()),
+            priority: 0,
+            handler: Arc::new(handler),
+            hidden: false,
+        });
+        self
+    }
+
     pub fn routes(&self) -> Vec<RouteInfo> {
         self.rules
             .iter()
@@ -280,6 +319,7 @@ impl Router {
                 name: r.name.clone(),
                 scope: r.scope,
                 matcher: r.matcher.describe(),
+                display: r.display.clone(),
                 priority: r.priority,
                 hidden: r.hidden,
             })
@@ -373,6 +413,17 @@ mod tests {
     fn noop(name: &str) -> FnHandler<impl for<'a> Fn(&'a Ctx) -> BoxedHandlerFuture<'a> + Send + Sync + 'static> {
         let owned = name.to_string();
         FnHandler::new(owned, |_ctx| Box::pin(async { Handled::Next }))
+    }
+
+    /// 正则 matcher 的 `describe()` 不能直接给用户看，但原始文案要留着。
+    #[test]
+    fn route_display_replaces_an_unreadable_matcher() {
+        let mut r = Router::new();
+        r.on_any_displayed(Matcher::Regex(Regex::new(r"^[.。][rR]").unwrap()), ".r 数字", noop("骰子"));
+
+        let info = r.routes();
+        assert_eq!(info[0].matcher, "/^[.。][rR]/", "原始 matcher 仍要保留（命令表推导依赖它）");
+        assert_eq!(info[0].display.as_deref(), Some(".r 数字"));
     }
 
     #[test]

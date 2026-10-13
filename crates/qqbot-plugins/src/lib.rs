@@ -93,13 +93,18 @@ pub async fn register(
     let http = http::build_client()?;
 
     router.on_any(Matcher::Command("ping".into()), PingPlugin);
+    // 骰子：三个命令别名 + 一条 `.r` 前缀路由。**它们完全等价** ——
+    // 插件内部同时接受 NdM（`3d6`）与区间（`100` / `5 10`）两种记法。
     router.on_any(Matcher::Command("骰子".into()), DicePlugin);
     router.on_any(Matcher::Command("roll".into()), DicePlugin);
     router.on_any(Matcher::Command("r".into()), DicePlugin);
-    // `.r 100` / `。r 5 10`：区间记法。两种句点都认 ——
+    // `.r 100` / `。r 5 10`：cq-bot 的区间记法。两种句点都认 ——
     // 中文输入法下 `.` 很容易打成 `。`。
-    router.on_any(
+    // 这条路由只负责把 `.r` 开头的消息也送进插件；帮助里展示 `display`，
+    // 不把正则字面量丢给用户。
+    router.on_any_displayed(
         Matcher::Regex(regex::Regex::new(r"^[.。][rR]($|[\s\d-])").expect("骰子区间正则字面量")),
+        ".r 数字",
         DicePlugin,
     );
 

@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
     match mode.as_str() {
         // 离线自检**不读配置**：没有 config.toml、没有任何凭据也必须能跑。
         "self-test" | "--self-test" => {
-            init_tracing("debug");
+            init_tracing("self-test", "debug");
             self_test().await
         }
         "help" | "--help" | "-h" => {
@@ -56,23 +56,19 @@ async fn main() -> Result<()> {
 /// 顺序不能反：日志级别本身来自配置，所以 `init_tracing` 必须排在 `load` 之后。
 fn boot() -> Result<Config> {
     let cfg = Config::load()?;
-    init_tracing(&cfg.log_level);
+    init_tracing(cfg.log_level_source, &cfg.log_level);
     tracing::info!(sources = %cfg.sources, "配置已加载");
     Ok(cfg)
 }
 
 /// 初始化日志。
 ///
-/// 优先级：`RUST_LOG` > `configured`（来自 config.toml，默认 `info`）。
+/// `value` 与它的 `source` 都由 `Config::resolve` 算好传进来
+/// （优先级 `RUST_LOG` > `config.toml` > 默认值），这里**不再读进程环境** ——
+/// 否则同一个优先级会有两份实现，而真正生效的那份没有单测。
+///
 /// 非法指令**不静默生效**：回退到 info，并往 stderr 说清楚是哪个来源的值坏了。
-fn init_tracing(configured: &str) {
-    let explicit = std::env::var("RUST_LOG")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let (source, value) = match &explicit {
-        Some(v) => ("RUST_LOG", v.as_str()),
-        None => ("log_level", configured),
-    };
+fn init_tracing(source: &str, value: &str) {
     let filter = EnvFilter::try_new(value).unwrap_or_else(|err| {
         eprintln!("{source}={value:?} 不是合法的日志指令（{err}），回退到 info");
         EnvFilter::new("info")

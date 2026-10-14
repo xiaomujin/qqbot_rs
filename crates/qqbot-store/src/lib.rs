@@ -42,7 +42,7 @@ pub use resource::{
     Ammo, TarkovItem, TarkovObjective, TarkovPrereq, TarkovReward, TarkovSuccessor, TarkovTask,
     TarkovTaskDetail, TarkovTaskFail, TarkovTaskKey,
     KeywordEntry, Resource, ResourceScope, ResourceSpec, ResourceStore, DEFAULT_SYSTEM_CONTROLLER,
-    SYSTEM_CONTROLLERS_KEY, SYSTEM_OWNER,
+    SYSTEM_OWNER,
 };
 
 use reader::ReadHandle;

@@ -31,7 +31,7 @@ use qqbot_media::FileType;
 // 所以给前者起个别名 —— 直接用会让 `latest_attachment` 收到错误的类型。
 use qqbot_store::{
     now_unix, KeywordEntry, MessageStore, Resource, ResourceScope, ResourceSpec, ResourceStore,
-    Scope as MessageScope, StoredAttachment, SYSTEM_CONTROLLERS_KEY, SYSTEM_OWNER,
+    Scope as MessageScope, StoredAttachment, SYSTEM_OWNER,
 };
 
 /// 触发监听器的优先级。
@@ -173,10 +173,11 @@ impl Core {
     async fn new(cfg: ResourcesConfig, http: reqwest::Client) -> Result<Arc<Self>> {
         // 显式配置优先：它同时也是「控制者列表被改坏」之后的恢复通道。
         if let Some(list) = &cfg.controllers {
-            let raw = serde_json::to_string(list).context("序列化系统控制者失败")?;
-            cfg.store.set_setting(SYSTEM_CONTROLLERS_KEY, &raw).await?;
+            cfg.store.set_system_controllers(list).await?;
         }
-        let controllers = read_controllers(&cfg.store).await?;
+        // 名单**只能**通过 store 的领域方法读写：键名与 JSON 形状留在存储层，
+        // 「坏了怎么办」也只剩那一处答案。
+        let controllers = cfg.store.system_controllers().await?;
         if controllers.is_empty() {
             tracing::warn!(
                 "系统控制者列表为空，系统级资源命令将无人可用；可用 QQBOT_SYSTEM_CONTROLLERS 覆盖"
@@ -651,8 +652,8 @@ impl Core {
     }
 
     async fn persist_controllers(&self, list: Vec<String>) -> Result<()> {
-        let raw = serde_json::to_string(&list).context("序列化系统控制者失败")?;
-        self.store.set_setting(SYSTEM_CONTROLLERS_KEY, &raw).await?;
+        self.store.set_system_controllers(&list).await?;
+        // 写库成功后同步缓存：权限判断是每条消息的热路径，不该读库。
         if let Ok(mut state) = self.state.write() {
             state.controllers = list;
         }
@@ -715,23 +716,6 @@ impl Core {
 /// 当前消息所属的群。单聊返回 `None`。
 fn group_of(ctx: &Ctx) -> Option<&str> {
     ctx.message.group_openid.as_deref().filter(|g| !g.is_empty())
-}
-
-/// 读系统控制者列表。
-///
-/// 值坏了不该让机器人起不来：退回空列表并告警，比启动失败好 ——
-/// 而且空列表有明确的恢复通道（环境变量覆盖）。
-async fn read_controllers(store: &ResourceStore) -> Result<Vec<String>> {
-    let Some(raw) = store.get_setting(SYSTEM_CONTROLLERS_KEY).await? else {
-        return Ok(Vec::new());
-    };
-    match serde_json::from_str::<Vec<String>>(&raw) {
-        Ok(list) => Ok(list),
-        Err(err) => {
-            tracing::warn!(error = %err, "系统控制者列表解析失败，按空列表处理");
-            Ok(Vec::new())
-        }
-    }
 }
 
 /// 推断素材扩展名。优先级：content_type > 原始文件名 > URL 路径。

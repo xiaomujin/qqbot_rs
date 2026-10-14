@@ -332,12 +332,8 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(cfg: ApiClientConfig) -> Result<Self, ApiError> {
-        Self::with_timeout(cfg, DEFAULT_HTTP_TIMEOUT)
-    }
-
-    pub fn with_timeout(cfg: ApiClientConfig, timeout: Duration) -> Result<Self, ApiError> {
         let http = reqwest::Client::builder()
-            .timeout(timeout)
+            .timeout(DEFAULT_HTTP_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(90))
             .build()?;
         let tokens = Arc::new(TokenProvider::new(cfg.clone(), http.clone()));

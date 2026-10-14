@@ -51,8 +51,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use qqbot_core::{Ctx, Handled, Handler};
 use qqbot_store::{
-    now_unix, ResourceStore, SYSTEM_CONTROLLERS_KEY, TarkovObjective, TarkovPrereq, TarkovReward,
-    TarkovSuccessor, TarkovTask, TarkovTaskDetail, TarkovTaskFail, TarkovTaskKey,
+    now_unix, ResourceStore, TarkovObjective, TarkovPrereq, TarkovReward, TarkovSuccessor,
+    TarkovTask, TarkovTaskDetail, TarkovTaskFail, TarkovTaskKey,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1092,17 +1092,15 @@ fn url_encode(raw: &str) -> String {
 
 /// 是否是系统控制者。
 ///
-/// 名单在 settings.system_controllers 里，与「系统控制者」命令同一份数据 ——
+/// 名单由 store 持有，与「系统控制者」命令是同一份数据 ——
 /// 全量导入是重操作（6 个端点、约 3.6 MB），只让系统控制者触发。
 async fn is_system_controller(ctx: &Ctx, store: &ResourceStore) -> bool {
     let Some(openid) = ctx.sender_openid() else {
         return false;
     };
-    match store.get_setting(SYSTEM_CONTROLLERS_KEY).await {
-        Ok(Some(raw)) => serde_json::from_str::<Vec<String>>(&raw)
-            .map(|list| list.iter().any(|c| c == openid))
-            .unwrap_or(false),
-        Ok(None) => false,
+    // 键名与 JSON 解码都在 store 里，这里只问「是不是」。
+    match store.is_system_controller(openid).await {
+        Ok(hit) => hit,
         Err(err) => {
             tracing::warn!(error = %err, "读取系统控制者失败");
             false

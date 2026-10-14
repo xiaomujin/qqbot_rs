@@ -97,8 +97,13 @@ pub struct Config {
     pub tarkov_images_dir: Option<PathBuf>,
     /// 系统控制者。`None` 表示沿用数据库里的值（首次建库会播种默认值）。
     pub system_controllers: Option<Vec<String>>,
-    /// 日志级别。`RUST_LOG` 未设置时生效。
+    /// 日志级别（`RUST_LOG` > `config.toml` > 默认值，**已在这里解析完**）。
     pub log_level: String,
+    /// `log_level` 的来源名（`RUST_LOG` / `log_level` / `默认值`）。
+    ///
+    /// 只给 `init_tracing` 报错时点名用 —— 有了它，日志级别就**只有一处**解析，
+    /// 而不是「配置里算一遍、初始化时再读一次环境算一遍」。
+    pub log_level_source: &'static str,
     /// 配置来源摘要，供启动日志打印。**不含任何密钥值**，只有来源名与路径。
     pub sources: String,
 }
@@ -126,7 +131,9 @@ impl Config {
     /// `config.toml` 不存在**本身不是错误**：环境变量给全了凭据就照常启动。
     pub fn load() -> Result<Self> {
         let env = EnvSource::process();
-        let found = discover(&env)?;
+        // cwd 只在这里取一次：`discover` 保持纯函数，才能对「查找顺序」写测试。
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let found = discover(&env, &cwd)?;
         Self::resolve(&env, &found)
     }
 
@@ -188,9 +195,15 @@ impl Config {
         });
 
         // ---- 日志：RUST_LOG 是既有的标准覆盖名，不另设 QQBOT_LOG_LEVEL ----
-        let log_level = non_empty(env.get("RUST_LOG"))
-            .or_else(|| file.and_then(|f| non_empty(f.log_level.as_deref())))
-            .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
+        // 来源名与取值一起算出来：`init_tracing` 只做「合法性校验 + 回退」，
+        // 不再自己读一遍环境（否则优先级有两份实现，而生效的那份没有测试）。
+        let (log_level, log_level_source) = match non_empty(env.get("RUST_LOG")) {
+            Some(v) => (v, "RUST_LOG"),
+            None => match file.and_then(|f| non_empty(f.log_level.as_deref())) {
+                Some(v) => (v, "log_level"),
+                None => (DEFAULT_LOG_LEVEL.to_string(), "默认值"),
+            },
+        };
 
         // ---- 并发 ----
         let session_shards = env
@@ -278,6 +291,7 @@ impl Config {
             tarkov_images_dir,
             system_controllers,
             log_level,
+            log_level_source,
             sources: describe_sources(env, found),
         })
     }
@@ -445,6 +459,7 @@ fn split_list(raw: &str) -> Vec<String> {
 }
 
 /// 配置文件发现结果。
+#[derive(Debug)]
 struct Discovered {
     /// 查找过的路径。**即使文件不存在也填**，用于报错时告诉用户该往哪写。
     path: PathBuf,
@@ -453,8 +468,12 @@ struct Discovered {
 
 /// 定位并解析 `config.toml`。
 ///
-/// 查找顺序：`QQBOT_CONFIG` 指定 → 当前目录及其父目录。
-fn discover(env: &EnvSource) -> Result<Discovered> {
+/// 查找顺序：`QQBOT_CONFIG` 指定 → `cwd` 及其父目录。
+///
+/// `cwd` 是**参数**而不是就地读 `std::env::current_dir()`：否则「查找顺序」与
+/// 「`QQBOT_CONFIG` 指向不存在的文件必须报错」这两条规则根本没有测试面
+/// （和 `resolve` 注入环境变量是同一个理由）。
+fn discover(env: &EnvSource, cwd: &Path) -> Result<Discovered> {
     // 显式指定路径时**必须存在**：静默回退到默认路径会让「配置没生效」
     // 变成一件完全无法察觉的事。
     if let Some(raw) = env.get("QQBOT_CONFIG") {
@@ -469,8 +488,7 @@ fn discover(env: &EnvSource) -> Result<Discovered> {
     }
 
     // 向上找，这样在子目录里 `cargo run` 也能找到仓库根的配置。
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut dir: Option<&Path> = Some(&cwd);
+    let mut dir: Option<&Path> = Some(cwd);
     while let Some(d) = dir {
         let candidate = d.join(CONFIG_FILE);
         if candidate.is_file() {
@@ -523,6 +541,17 @@ mod tests {
             path: PathBuf::from("config.toml"),
             config: toml_text.map(|t| toml::from_str(t).expect("测试用 TOML 必须合法")),
         }
+    }
+
+    /// 建一个干净的测试目录（相对 `target/`，落在 gitignore 范围内）。
+    ///
+    /// 每个用例一个独立目录：`discover` 会**逐级向上**找 `config.toml`，
+    /// 共用目录会让「更近的那份赢」这类断言互相干扰。
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from("target/config-test").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("创建测试目录失败");
+        dir
     }
 
     fn resolve(pairs: &[(&str, &str)], toml_text: Option<&str>) -> Result<Config> {
@@ -819,5 +848,47 @@ token = ""
         assert_eq!(src.get("QQBOT_CONFIG"), Some("C:\\tmp\\qqbot.toml"));
         // 空串视为未设置，会退回默认查找路径。
         assert_eq!(env(&[("QQBOT_CONFIG", "  ")]).get("QQBOT_CONFIG"), None);
+    }
+
+    /// `QQBOT_CONFIG` 指定的路径**优先，且必须存在**。
+    #[test]
+    fn discover_honours_qqbot_config() {
+        let dir = test_dir("explicit");
+        // 默认名字的那份也在：显式指定的必须赢。
+        std::fs::write(dir.join(CONFIG_FILE), "app_id = \"from-default\"").unwrap();
+        let explicit = dir.join("custom.toml");
+        std::fs::write(&explicit, "app_id = \"from-explicit\"").unwrap();
+
+        let found = discover(&env(&[("QQBOT_CONFIG", explicit.to_str().unwrap())]), &dir).unwrap();
+        assert_eq!(found.path, explicit, "显式指定的路径应当压过默认查找");
+        assert_eq!(found.config.and_then(|f| f.app_id).as_deref(), Some("from-explicit"));
+
+        // 指向不存在的文件必须**报错**：静默回退到默认路径会让「配置没生效」
+        // 变成一件完全无法察觉的事。
+        let missing = dir.join("nope.toml");
+        let err = discover(&env(&[("QQBOT_CONFIG", missing.to_str().unwrap())]), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("QQBOT_CONFIG"), "{err}");
+    }
+
+    /// 未设 `QQBOT_CONFIG` 时：从 `cwd` 逐级向上找 `config.toml`，最近的那份赢。
+    #[test]
+    fn discover_walks_up_for_config_toml() {
+        let dir = test_dir("walk-up");
+        let sub = dir.join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join(CONFIG_FILE), "app_id = \"outer\"").unwrap();
+
+        // 在子目录里也能找到上层那份 —— 这就是「在子目录里 cargo run」的场景。
+        let found = discover(&env(&[]), &sub).unwrap();
+        assert_eq!(found.path, dir.join(CONFIG_FILE));
+        assert_eq!(found.config.and_then(|f| f.app_id).as_deref(), Some("outer"));
+
+        // 更近的那份赢。
+        std::fs::write(sub.join(CONFIG_FILE), "app_id = \"inner\"").unwrap();
+        let found = discover(&env(&[]), &sub).unwrap();
+        assert_eq!(found.path, sub.join(CONFIG_FILE));
+        assert_eq!(found.config.and_then(|f| f.app_id).as_deref(), Some("inner"));
     }
 }

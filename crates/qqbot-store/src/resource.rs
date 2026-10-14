@@ -19,7 +19,9 @@ use crate::model::now_unix;
 pub const DEFAULT_SYSTEM_CONTROLLER: &str = "5CF47107AFE2275EE0173D298F6FF07E";
 
 /// 系统控制者列表在 `settings` 表里的键名。
-pub const SYSTEM_CONTROLLERS_KEY: &str = "system_controllers";
+///
+/// **store 私有**：名单是 store 的领域概念，插件不该自己拼键名或解 JSON。
+const SYSTEM_CONTROLLERS_KEY: &str = "system_controllers";
 
 /// 系统资源的 `owner_id` 哨兵值。
 ///
@@ -1197,6 +1199,35 @@ impl ResourceStore {
         .await
     }
 
+    /// 系统控制者名单。
+    ///
+    /// 值坏了不该让机器人起不来：**退回空列表并告警**（恢复通道是
+    /// `QQBOT_SYSTEM_CONTROLLERS` 环境变量）。容错只有这一处，
+    /// 调用方拿到的永远是一份能用的列表。
+    pub async fn system_controllers(&self) -> Result<Vec<String>> {
+        let Some(raw) = self.get_setting(SYSTEM_CONTROLLERS_KEY).await? else {
+            return Ok(Vec::new());
+        };
+        match serde_json::from_str::<Vec<String>>(&raw) {
+            Ok(list) => Ok(list),
+            Err(err) => {
+                tracing::warn!(error = %err, "系统控制者列表解析失败，按空列表处理");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// 覆盖系统控制者名单。
+    pub async fn set_system_controllers(&self, list: &[String]) -> Result<()> {
+        let raw = serde_json::to_string(list).context("序列化系统控制者失败")?;
+        self.set_setting(SYSTEM_CONTROLLERS_KEY, &raw).await
+    }
+
+    /// `openid` 是否在名单里。
+    pub async fn is_system_controller(&self, openid: &str) -> Result<bool> {
+        Ok(self.system_controllers().await?.iter().any(|c| c == openid))
+    }
+
     /// 读一条系统设置。
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let key = key.to_string();
@@ -1778,6 +1809,45 @@ mod tests {
         assert_eq!(s.get_setting("k").await.unwrap().as_deref(), Some("v1"));
         s.set_setting("k", "v2").await.unwrap();
         assert_eq!(s.get_setting("k").await.unwrap().as_deref(), Some("v2"));
+    }
+
+    /// 名单坏掉时退回空表，而不是让启动失败。
+    #[tokio::test]
+    async fn system_controllers_decode_failure_falls_back_to_empty() {
+        let s = store();
+        // 建库会播种默认控制者，先确认这份默认值能被解出来。
+        assert_eq!(
+            s.system_controllers().await.unwrap(),
+            vec![DEFAULT_SYSTEM_CONTROLLER.to_string()]
+        );
+
+        s.set_setting(SYSTEM_CONTROLLERS_KEY, "{ 不是数组 }").await.unwrap();
+        assert!(
+            s.system_controllers().await.unwrap().is_empty(),
+            "解析失败应当退回空表，而不是把错误抛给调用方"
+        );
+    }
+
+    /// 写入后读回。
+    #[tokio::test]
+    async fn system_controllers_roundtrip() {
+        let s = store();
+        let list = vec!["a".to_string(), "b".to_string()];
+        s.set_system_controllers(&list).await.unwrap();
+        assert_eq!(s.system_controllers().await.unwrap(), list);
+
+        // 空列表是合法状态（「删掉最后一个控制者」），不该被默认值顶回来。
+        s.set_system_controllers(&[]).await.unwrap();
+        assert!(s.system_controllers().await.unwrap().is_empty());
+    }
+
+    /// `is_system_controller` 命中与不命中。
+    #[tokio::test]
+    async fn is_system_controller_hits_and_misses() {
+        let s = store();
+        s.set_system_controllers(&["a".to_string()]).await.unwrap();
+        assert!(s.is_system_controller("a").await.unwrap());
+        assert!(!s.is_system_controller("b").await.unwrap());
     }
 
     #[tokio::test]

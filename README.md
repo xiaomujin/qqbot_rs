@@ -183,7 +183,7 @@ ctx.reply.svg(svg).await?;
 ## 测试与自检
 
 ```bash
-cargo test --workspace        # 498 项测试（含端到端）
+cargo test --workspace        # 503 项测试（含端到端）
 cargo test --test end_to_end  # 只跑收发链路端到端
 cargo test -p qqbot-gateway --test gateway_protocol  # 只跑网关协议（Identify/Resume/分片/op9）
 cargo test -p qqbot-store     # 只跑存储：幂等 / 隔离 / 保留期边界 / 不阻塞

@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 bin（`src/`） |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 498 项，全绿 |
+| 测试基线 | 503 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -247,6 +247,10 @@ cargo check -p qqbot
 配置解析是**纯函数**（`Config::resolve(env, file)`，见 `src/config.rs`）：
 edition 2024 起 `env::set_var` 是 unsafe，而本 workspace 禁 unsafe，
 所以**必须注入环境变量才能测试** —— 不要在 `resolve` 里直接读 `std::env`。
+`discover(env, cwd)` 同理：`cwd` 也是参数，`Config::load` 里只取一次
+`std::env::current_dir()` 传下去（否则「查找顺序」没有测试面）。
+日志级别（`RUST_LOG` > `config.toml` > 默认值）同样在 `resolve` 里算完，
+连**来源名**一起带出；`init_tracing` 只做校验与回退，不再自己读 `RUST_LOG`。
 
 ---
 

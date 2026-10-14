@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -78,10 +79,92 @@ impl ApiClientConfig {
     }
 }
 
+/// 一次成功刷新的结果。
+///
+/// 把「响应里有什么」和「缓存什么时候该刷新」分开：解析只读字段，
+/// 余量 / 上界这些寿命换算留给 [`TokenProvider`]。
+struct TokenGrant {
+    token: String,
+    lifetime: Duration,
+}
+
 struct CachedToken {
     token: String,
     /// 到这一刻就该刷新（余量已经扣掉）。
     refresh_at: Instant,
+}
+
+impl CachedToken {
+    /// `now` 时刻是否还能直接用。到点即不可用（`now < refresh_at`，不是 `<=`），
+    /// 与原来 `refresh_at > Instant::now()` 的判定逐字等价。
+    fn usable_at(&self, now: Instant) -> bool {
+        now < self.refresh_at
+    }
+}
+
+/// 解析取 token 的响应。
+///
+/// ⚠️ **协议差异**：`/app/getAppAccessToken` 用 `code` 判成败，其余 OpenAPI 端点用
+/// `err_code`（见 [`decode_response`]）。这条差异以前埋在 `fetch_token` 正文里，
+/// 抽成纯函数后才能离线断言。
+///
+/// 逐字保留原行为：**不按 HTTP 状态码分支**（抽取前就没有这一支），
+/// 状态码只进错误消息，便于排查。
+fn parse_token_response(status: u16, body: &str) -> Result<TokenGrant, ApiError> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        ApiError::Protocol(format!(
+            "getAppAccessToken 返回非 JSON（HTTP {status}）: {e}; body={body}"
+        ))
+    })?;
+
+    if let Some(code) = v.get("code").and_then(|c| c.as_i64()) && code != 0 {
+        return Err(ApiError::Business {
+            code,
+            message: v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+            trace_id: None,
+        });
+    }
+
+    let token = v
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| ApiError::Protocol(format!("响应缺少 access_token: {body}")))?
+        .to_string();
+
+    // 官方返回示例中 expires_in 是字符串 "7200"，这里同时兼容数字。
+    let expires_in = v.get("expires_in").and_then(parse_secs).unwrap_or(7200);
+
+    // 服务端数值不可信：夹住上界防溢出；余量不得超过寿命的一半，
+    // 否则会出现「刚刷新完就判定过期」的空刷循环（线上日志见过 expires_in=271/214）。
+    let lifetime = Duration::from_secs(expires_in).min(MAX_TOKEN_LIFETIME);
+
+    Ok(TokenGrant { token, lifetime })
+}
+
+/// 取 token 的传输接缝：**只负责把字节拿回来**。
+///
+/// 解析（[`parse_token_response`]）与刷新决策（[`TokenProvider`]）都在接缝之上，
+/// 于是「并发只刷一次」「短寿命不空刷」这类时序行为无需网络即可断言。
+#[async_trait]
+trait TokenTransport: Send + Sync {
+    /// 发一次取 token 的 POST，返回 (HTTP 状态码, 响应体)。
+    async fn fetch(&self, url: &str, body: &serde_json::Value) -> Result<(u16, String), ApiError>;
+}
+
+/// 生产实现：就是原先 `fetch_token` 里的那几行请求。
+struct HttpTransport {
+    http: reqwest::Client,
+}
+
+#[async_trait]
+impl TokenTransport for HttpTransport {
+    async fn fetch(&self, url: &str, body: &serde_json::Value) -> Result<(u16, String), ApiError> {
+        let resp = self.http.post(url).json(body).send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await?;
+        Ok((status, text))
+    }
 }
 
 /// access_token 提供者。
@@ -93,14 +176,25 @@ struct CachedToken {
 /// 已经命中缓存的调用，只有真正需要刷新的任务才在 `refresh` 上排队。
 pub struct TokenProvider {
     cfg: ApiClientConfig,
-    http: reqwest::Client,
+    transport: Arc<dyn TokenTransport>,
     cache: RwLock<Option<CachedToken>>,
     refresh: Mutex<()>,
 }
 
 impl TokenProvider {
     pub fn new(cfg: ApiClientConfig, http: reqwest::Client) -> Self {
-        Self { cfg, http, cache: RwLock::new(None), refresh: Mutex::new(()) }
+        Self {
+            cfg,
+            transport: Arc::new(HttpTransport { http }),
+            cache: RwLock::new(None),
+            refresh: Mutex::new(()),
+        }
+    }
+
+    /// 测试用：把脚本化 transport 装进来。
+    #[cfg(test)]
+    fn with_transport(cfg: ApiClientConfig, transport: Arc<dyn TokenTransport>) -> Self {
+        Self { cfg, transport, cache: RwLock::new(None), refresh: Mutex::new(()) }
     }
 
     /// 取当前有效的 access_token（必要时刷新）。
@@ -121,68 +215,34 @@ impl TokenProvider {
 
     /// 命中缓存则返回 token。共享读锁，不阻塞并发读。
     async fn cached(&self) -> Option<String> {
+        let now = Instant::now();
         let guard = self.cache.read().await;
-        guard
-            .as_ref()
-            .filter(|c| c.refresh_at > Instant::now())
-            .map(|c| c.token.clone())
+        guard.as_ref().filter(|c| c.usable_at(now)).map(|c| c.token.clone())
     }
 
     /// 真正发起刷新。**调用方必须已持有 `refresh` 锁。**
     async fn fetch_token(&self) -> Result<String, ApiError> {
         let url = format!("{}/app/getAppAccessToken", self.cfg.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .json(&serde_json::json!({
-                "appId": self.cfg.app_id,
-                "clientSecret": self.cfg.client_secret,
-            }))
-            .send()
-            .await?;
+        let payload = serde_json::json!({
+            "appId": self.cfg.app_id,
+            "clientSecret": self.cfg.client_secret,
+        });
+        // 传输只把字节拿回来；解析与缓存决策都在这里。
+        let (status, body) = self.transport.fetch(&url, &payload).await?;
+        let grant = parse_token_response(status, &body)?;
+        let lifetime = grant.lifetime;
 
-        let status = resp.status();
-        let body = resp.text().await?;
-
-        // ⚠️ 该接口失败时 HTTP 仍可能为 200，必须看响应体的 code 字段。
-        let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-            ApiError::Protocol(format!(
-                "getAppAccessToken 返回非 JSON（HTTP {status}）: {e}; body={body}"
-            ))
-        })?;
-
-        if let Some(code) = v.get("code").and_then(|c| c.as_i64()) && code != 0 {
-            return Err(ApiError::Business {
-                code,
-                message: v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
-                trace_id: None,
-            });
-        }
-
-        let token = v
-            .get("access_token")
-            .and_then(|t| t.as_str())
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| ApiError::Protocol(format!("响应缺少 access_token: {body}")))?
-            .to_string();
-
-        // 官方返回示例中 expires_in 是字符串 "7200"，这里同时兼容数字。
-        let expires_in = v.get("expires_in").and_then(parse_secs).unwrap_or(7200);
-
-        // 服务端数值不可信：夹住上界防溢出；余量不得超过寿命的一半，
-        // 否则会出现「刚刷新完就判定过期」的空刷循环（线上日志见过 expires_in=271/214）。
-        let lifetime = Duration::from_secs(expires_in).min(MAX_TOKEN_LIFETIME);
-
+        // 记的是**夹住之后**的有效寿命：日志要能解释刷新点为什么在那儿。
         tracing::info!(
-            expires_in,
+            expires_in = lifetime.as_secs(),
             margin_secs = refresh_margin(lifetime).as_secs(),
             "access_token 已刷新"
         );
         *self.cache.write().await = Some(CachedToken {
-            token: token.clone(),
+            token: grant.token.clone(),
             refresh_at: Instant::now() + refresh_after(lifetime),
         });
-        Ok(token)
+        Ok(grant.token)
     }
 
     /// 丢弃缓存，强制下次重新获取（401 后调用）。
@@ -338,6 +398,16 @@ impl ApiClient {
             .build()?;
         let tokens = Arc::new(TokenProvider::new(cfg.clone(), http.clone()));
         Ok(Self { cfg, http, tokens })
+    }
+
+    /// 测试用：注入脚本化 transport，装配出**完整**的 `ApiClient`。
+    ///
+    /// 这样 `gateway_token()` / `identify()` 这些真实路径才能被断言，
+    /// 而不是在测试里把拼接逻辑抄一遍（抄一遍等于没测）。
+    #[cfg(test)]
+    fn with_transport(cfg: ApiClientConfig, transport: Arc<dyn TokenTransport>) -> Self {
+        let tokens = Arc::new(TokenProvider::with_transport(cfg.clone(), transport));
+        Self { cfg, http: reqwest::Client::new(), tokens }
     }
 
     pub fn config(&self) -> &ApiClientConfig {
@@ -943,12 +1013,196 @@ mod tests {
         assert_eq!(parse_secs(&serde_json::json!(null)), None);
     }
 
+    // ---------- access_token 的解析与刷新决策 ----------
+
+    /// 脚本化 transport：按顺序吐出预设响应（用尽后重复最后一个），并统计请求次数。
+    ///
+    /// 锁内没有 `await`，所以用 `std::sync::Mutex` 就够 —— `async_trait` 生成的
+    /// future 必须是 `Send`，跨 `await` 持锁会直接编译不过。
+    struct ScriptedTransport {
+        responses: std::sync::Mutex<std::collections::VecDeque<(u16, String)>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedTransport {
+        fn new(responses: impl IntoIterator<Item = (u16, String)>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: std::sync::Mutex::new(responses.into_iter().collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl TokenTransport for ScriptedTransport {
+        async fn fetch(
+            &self,
+            _url: &str,
+            _body: &serde_json::Value,
+        ) -> Result<(u16, String), ApiError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // 让出一次，放大「多个任务同时到达」的窗口：singleflight 一旦失效，
+            // 每个任务都会各自发出请求，计数立刻对不上。
+            tokio::task::yield_now().await;
+            let next = {
+                let mut q = self.responses.lock().unwrap();
+                if q.len() > 1 { q.pop_front() } else { q.front().cloned() }
+            };
+            Ok(next.expect("脚本至少要给一个响应"))
+        }
+    }
+
+    fn test_cfg() -> ApiClientConfig {
+        ApiClientConfig::new("app-id", "client-secret")
+    }
+
+    /// 组装一份取 token 的响应体（`expires_in` 两种写法都能给）。
+    fn grant_body(token: &str, expires_in: serde_json::Value) -> String {
+        serde_json::json!({ "access_token": token, "expires_in": expires_in }).to_string()
+    }
+
     #[test]
-    fn gateway_token_must_carry_qqbot_prefix() {
-        // 官方文档：token 格式为 "QQBot {AccessToken}"。
-        // 这里直接验证拼接逻辑，避免回归时又要连线上才能发现。
-        let token = "ABC123";
-        assert_eq!(format!("QQBot {token}"), "QQBot ABC123");
+    fn parse_token_response_reads_token_and_lifetime() {
+        // 官方示例：expires_in 是字符串
+        let g = parse_token_response(200, &grant_body("T", serde_json::json!("7200"))).unwrap();
+        assert_eq!(g.token, "T");
+        assert_eq!(g.lifetime, Duration::from_secs(7200));
+
+        // 数字写法同样接受
+        let g = parse_token_response(200, &grant_body("T", serde_json::json!(60))).unwrap();
+        assert_eq!(g.lifetime, Duration::from_secs(60));
+
+        // 缺失时回落 7200（与抽取前一致）
+        let g = parse_token_response(200, r#"{"access_token":"T"}"#).unwrap();
+        assert_eq!(g.lifetime, Duration::from_secs(7200));
+
+        // 上界夹住，防 `Instant + Duration` 溢出
+        let g = parse_token_response(200, &grant_body("T", serde_json::json!(u64::MAX))).unwrap();
+        assert_eq!(g.lifetime, MAX_TOKEN_LIFETIME);
+    }
+
+    #[test]
+    fn parse_token_response_keeps_every_failure_mode() {
+        // 用 .err() 而不是 .unwrap_err()：TokenGrant 刻意不实现 Debug，
+        // 免得 access_token 被一次 dbg! / expect 打进日志。
+        // 非 2xx 且不是 JSON：协议错误，状态码留在消息里便于排查
+        let e = parse_token_response(500, "<html>bad gateway</html>").err().unwrap();
+        assert!(e.to_string().contains("500"), "{e}");
+        assert!(matches!(e, ApiError::Protocol(_)));
+
+        // 该接口失败时 HTTP 仍可能是 200，必须看响应体的 `code`
+        let e = parse_token_response(200, r#"{"code":10001,"message":"账号异常"}"#).err().unwrap();
+        assert_eq!(e.business_code(), Some(10001));
+        assert!(e.to_string().contains("账号异常"), "{e}");
+
+        // 缺 access_token / 空串都算协议错误
+        assert!(matches!(
+            parse_token_response(200, r#"{"expires_in":"7200"}"#).err().unwrap(),
+            ApiError::Protocol(_)
+        ));
+        assert!(matches!(
+            parse_token_response(200, r#"{"access_token":""}"#).err().unwrap(),
+            ApiError::Protocol(_)
+        ));
+
+        // token 接口**不看** `err_code`（那是别的端点的字段）—— 固定这条协议差异
+        let g = parse_token_response(200, r#"{"err_code":40034,"access_token":"T"}"#).unwrap();
+        assert_eq!(g.token, "T");
+    }
+
+    #[test]
+    fn cached_token_is_usable_only_before_refresh_at() {
+        let now = Instant::now();
+        let c = CachedToken { token: "T".into(), refresh_at: now + Duration::from_secs(10) };
+        assert!(c.usable_at(now));
+        assert!(c.usable_at(now + Duration::from_secs(9)));
+        // 到点即不可用：判定是 `now < refresh_at`，不是 `<=`
+        assert!(!c.usable_at(now + Duration::from_secs(10)));
+        assert!(!c.usable_at(now + Duration::from_secs(11)));
+    }
+
+    /// 并发 4 个 `token()` 只发一次请求：`Mutex` singleflight + 等锁后的 double-check。
+    #[tokio::test]
+    async fn concurrent_token_calls_share_a_single_refresh() {
+        let transport =
+            ScriptedTransport::new([(200, grant_body("T", serde_json::json!("7200")))]);
+        let provider = TokenProvider::with_transport(test_cfg(), transport.clone());
+
+        let (a, b, c, d) =
+            tokio::join!(provider.token(), provider.token(), provider.token(), provider.token());
+
+        for r in [a, b, c, d] {
+            assert_eq!(r.unwrap(), "T");
+        }
+        assert_eq!(transport.calls(), 1, "并发调用应当只发一次请求");
+    }
+
+    #[tokio::test]
+    async fn cache_hit_does_not_refetch() {
+        let transport =
+            ScriptedTransport::new([(200, grant_body("T", serde_json::json!("7200")))]);
+        let provider = TokenProvider::with_transport(test_cfg(), transport.clone());
+
+        for _ in 0..3 {
+            assert_eq!(provider.token().await.unwrap(), "T");
+        }
+        assert_eq!(transport.calls(), 1, "命中缓存时不得再发请求");
+    }
+
+    #[tokio::test]
+    async fn invalidate_forces_the_next_call_to_refetch() {
+        let transport = ScriptedTransport::new([
+            (200, grant_body("T1", serde_json::json!("7200"))),
+            (200, grant_body("T2", serde_json::json!("7200"))),
+        ]);
+        let provider = TokenProvider::with_transport(test_cfg(), transport.clone());
+
+        assert_eq!(provider.token().await.unwrap(), "T1");
+        assert_eq!(transport.calls(), 1);
+
+        provider.invalidate().await;
+        assert_eq!(provider.token().await.unwrap(), "T2");
+        assert_eq!(transport.calls(), 2, "invalidate 之后必须重新取");
+    }
+
+    /// 回归：线上见过 `expires_in = 271 / 214`。余量若恒为 300s，
+    /// 刷新刚完成时「剩余寿命 > 余量」就恒为假 —— 每次调用都空刷一遍。
+    #[tokio::test]
+    async fn short_lifetime_does_not_refresh_storm() {
+        let transport =
+            ScriptedTransport::new([(200, grant_body("T", serde_json::json!("271")))]);
+        let provider = TokenProvider::with_transport(test_cfg(), transport.clone());
+
+        for _ in 0..5 {
+            assert_eq!(provider.token().await.unwrap(), "T");
+        }
+        assert_eq!(transport.calls(), 1, "短寿命不得导致每次调用都空刷");
+
+        // 271s 寿命 -> 余量被压到一半，刷新点落在 135.5s 之后，仍在未来
+        assert_eq!(refresh_after(Duration::from_secs(271)), Duration::from_millis(135_500));
+
+        // `expires_in = 1` 的边界只有 500ms 可用窗口，做成接缝测试会因机器卡顿偶发失败，
+        // 所以这里只断言不变式：窗口为正 = 刚写入的缓存必定可用，不会空刷。
+        assert_eq!(refresh_after(Duration::from_secs(1)), Duration::from_millis(500));
+        assert!(refresh_after(Duration::from_secs(1)) > Duration::ZERO);
+    }
+
+    /// 官方文档：Identify / Resume 的 token 格式为 `QQBot {AccessToken}`。
+    ///
+    /// 修复前这条测试断言的是 `format!("QQBot {token}")`（token 还是字面量）——
+    /// 等于把被测的那一行抄进测试。现在真的走一遍 `ApiClient::gateway_token()`。
+    #[tokio::test]
+    async fn gateway_token_must_carry_qqbot_prefix() {
+        let transport =
+            ScriptedTransport::new([(200, grant_body("ABC123", serde_json::json!("7200")))]);
+        let client = ApiClient::with_transport(test_cfg(), transport.clone());
+
+        assert_eq!(client.gateway_token().await.unwrap(), "QQBot ABC123");
+        assert_eq!(transport.calls(), 1);
     }
 
     #[test]

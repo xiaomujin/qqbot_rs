@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 bin（`src/`） |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 503 项，全绿 |
+| 测试基线 | 510 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -188,6 +188,7 @@ cargo check -p qqbot
 | 不变量 | 说明 |
 |---|---|
 | **只依据 `err_code` 判成败** | 失败时 HTTP 仍可能是 **200**，响应体里带 `err_code`。绝不能只看状态码 |
+| **token 接口的 envelope 是 `code`，不是 `err_code`** | `POST /app/getAppAccessToken` 用响应体的 `code` 判成败（其余 OpenAPI 端点用 `err_code`）；两者别混，见 `client.rs::parse_token_response` |
 | **`msg_seq` 必须由 `SessionShard` 分配** | 同一 `msg_id + msg_seq` 重复发送会被拒；不能在各处自行拼发送请求 |
 | **Identify / Resume 的 `token` 必须带 `QQBot ` 前缀** | 漏掉前缀服务端立刻回 op 9 InvalidSession，表现为「连上了但收不到 READY」 |
 | **被动窗口不同** | 单聊 60 分钟 / 4 次；群聊 5 分钟 / 5 次。**从收到消息开始计时**，不是从回复开始 |

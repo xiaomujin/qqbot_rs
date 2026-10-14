@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 package（**lib + bin**，`src/`）—— 装配在 lib 里，e2e 才引用得到 |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 510 项，全绿 |
+| 测试基线 | 514 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -163,6 +163,8 @@ cargo check -p qqbot
 - `SessionShard` 是「按 key 分片」，**不是一群一 actor** —— 群数量会无界增长。
 - 扩大 actor 边界（新增第四类、或把无状态逻辑塞进 actor）属于架构变更：
   必须更新本节上面的边界表，并在提交说明里论证为什么现有三类不够用。
+- actor 内部的 IO 边缘可以用**单方法 trait** 替换（如 `SessionShard` 的 `SendApi`），
+  便于进程内测试；这只是给已有 actor 加一个可替换点，**不算**扩大 actor 边界。
 
 事件流（改分发逻辑前先对照）：
 
@@ -229,7 +231,7 @@ cargo check -p qqbot
 | 新增 / 修改 HTTP 端点 | `crates/qqbot-api/src/client.rs` + 对应的 `bot.rs` / `group.rs` / `message.rs` |
 | 新增协议类型 | 同上的类型模块，并**从 `lib.rs` 显式 re-export** |
 | 网关状态机（Identify / 心跳 / Resume / 分片 / 重连） | `crates/qqbot-gateway/src/actor.rs` |
-| 发送链路、`msg_seq`、被动窗口、配额 | `crates/qqbot-core/src/session.rs` |
+| 发送链路、`msg_seq`、被动窗口、配额 | `crates/qqbot-core/src/session.rs`。发送边缘是单方法 trait `SendApi`（`ApiClient` 是唯一生产实现），所以「被动过期 → 主动重试一次」这段策略有**进程内**测试（脚本化 adapter 直接驱动 `handle_send`），不必起 mock HTTP |
 | 事件分发、去重、并发 | `crates/qqbot-core/src/dispatch.rs` |
 | 路由表与插件 trait | `crates/qqbot-core/src/plugin.rs` |
 | 业务插件 | `crates/qqbot-plugins/src/{help,dice,wordcloud,daily,resource,tarkov,ba,bili,bangumi,caption,ammo,task,market,delta,tarkov_image,timewin}.rs`，注册在 `lib.rs::register` |

@@ -176,7 +176,8 @@ mod tests {
         let api = ApiClient::new(ApiClientConfig::new("test-app", "test-secret")).unwrap();
         let media = MediaUploader::new(api.clone());
         let render = RenderService::new(RenderConfig::default());
-        let sessions = Arc::new(SessionRegistry::new(api.clone(), 2, 16, Duration::from_secs(5)));
+        let sessions =
+            Arc::new(SessionRegistry::new(Arc::new(api.clone()), 2, 16, Duration::from_secs(5)));
         Arc::new(Services::new(api, media, render, sessions))
     }
 

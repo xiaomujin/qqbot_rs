@@ -9,9 +9,11 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use qqbot_api::{ApiClient, SendResult, Target};
+use async_trait::async_trait;
+use qqbot_api::{ApiClient, ApiError, OutMessage, SendResult, Target};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::CoreError;
@@ -234,7 +236,15 @@ pub struct SessionRegistry {
 
 impl SessionRegistry {
     /// `shards` 建议取 CPU 核数 × 2；每个 shard 内部持有全部会话状态。
-    pub fn new(api: ApiClient, shards: usize, queue_capacity: usize, timeout: Duration) -> Self {
+    ///
+    /// 发送边缘收 [`SendApi`] 而不是具体的 [`ApiClient`]：这样「被动过期 →
+    /// 主动重试」这段策略可以用脚本化 adapter 在进程内断言，不必起 mock HTTP。
+    pub fn new(
+        api: Arc<dyn SendApi>,
+        shards: usize,
+        queue_capacity: usize,
+        timeout: Duration,
+    ) -> Self {
         let shards = shards.max(1);
         // mpsc::channel(0) 会直接 assert panic；这是 pub 构造器，必须自己兜住。
         let queue_capacity = queue_capacity.max(1);
@@ -309,11 +319,27 @@ impl SessionRegistry {
 
 }
 
+/// 发送一条消息。`SessionShard` 只依赖这一个方法 —— 它原来直接收 `&ApiClient`，
+/// 而 `ApiClient` 自建 reqwest client，于是「被动过期 → 主动重试」这段策略
+/// 只能靠起 mock HTTP 观察。
+#[async_trait]
+pub trait SendApi: Send + Sync {
+    async fn send_message(&self, target: &Target, msg: &OutMessage) -> Result<SendResult, ApiError>;
+}
+
+/// 唯一的生产实现：转发到 [`ApiClient::send_message`]。
+#[async_trait]
+impl SendApi for ApiClient {
+    async fn send_message(&self, target: &Target, msg: &OutMessage) -> Result<SendResult, ApiError> {
+        ApiClient::send_message(self, target, msg).await
+    }
+}
+
 struct SessionShard {
     index: usize,
     inbox: mpsc::Receiver<SessionMsg>,
     states: HashMap<String, SessionState>,
-    api: ApiClient,
+    api: Arc<dyn SendApi>,
 }
 
 /// 空闲多久后回收会话状态。
@@ -352,7 +378,7 @@ impl SessionShard {
                                 .observe(&msg_id, now);
                         }
                         SessionMsg::Send { key, request, ack } => {
-                            let result = handle_send(&api, &mut states, &key, request).await;
+                            let result = handle_send(api.as_ref(), &mut states, &key, request).await;
                             let _ = ack.send(result);
                         }
                     }
@@ -375,7 +401,7 @@ fn evict_idle(states: &mut HashMap<String, SessionState>, now: Instant, shard: u
 }
 
 async fn handle_send(
-    api: &ApiClient,
+    api: &dyn SendApi,
     states: &mut HashMap<String, SessionState>,
     key: &str,
     request: SendRequest,
@@ -475,6 +501,65 @@ pub fn recommended_shards() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// 可编程的发送 adapter：记录每次调用收到的出站消息，按脚本依次返回结果。
+    ///
+    /// 进程内就能钉住「被动分配 → 主动回退 → 服务端判过期后重试一次」这段策略，
+    /// 不必起 mock HTTP 数请求 —— e2e 那条是端到端证据，这条是策略本身的证据。
+    struct ScriptedApi {
+        /// 按调用序消费；用尽后返回协议错误（测试里出现即说明调用次数超出预期）。
+        script: Mutex<VecDeque<Result<SendResult, ApiError>>>,
+        calls: Mutex<Vec<OutMessage>>,
+    }
+
+    impl ScriptedApi {
+        fn new(script: Vec<Result<SendResult, ApiError>>) -> Self {
+            Self { script: Mutex::new(script.into()), calls: Mutex::new(Vec::new()) }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        fn calls(&self) -> Vec<OutMessage> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SendApi for ScriptedApi {
+        async fn send_message(
+            &self,
+            _target: &Target,
+            msg: &OutMessage,
+        ) -> Result<SendResult, ApiError> {
+            self.calls.lock().unwrap().push(msg.clone());
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(ApiError::Protocol("脚本已用尽".to_string())))
+        }
+    }
+
+    /// 建一个已登记被动窗口的群会话状态。
+    fn state_with_window(key: &str) -> HashMap<String, SessionState> {
+        let now = Instant::now();
+        let mut state = SessionState::new(true, now);
+        state.observe("M1", now);
+        HashMap::from([(key.to_string(), state)])
+    }
+
+    /// 服务端判定被动窗口过期的错误（err_code 40034005）。
+    fn passive_expired() -> ApiError {
+        ApiError::Business {
+            code: 40034005,
+            message: "回复消息msg_id已过期".to_string(),
+            trace_id: None,
+        }
+    }
 
     fn state_group() -> SessionState {
         SessionState::new(true, Instant::now())
@@ -617,7 +702,7 @@ mod tests {
     async fn route_is_stable_for_same_key() {
         let api =
             ApiClient::new(qqbot_api::ApiClientConfig::new("test-app", "test-secret")).unwrap();
-        let reg = SessionRegistry::new(api, 8, 16, Duration::from_secs(5));
+        let reg = SessionRegistry::new(Arc::new(api), 8, 16, Duration::from_secs(5));
 
         let key = "group:G1";
         assert!(
@@ -631,5 +716,95 @@ mod tests {
             .collect::<std::collections::HashSet<_>>()
             .len();
         assert!(distinct > 1, "路由应把 key 分散到多个 shard，实际只用到 {distinct} 个");
+    }
+
+    /// 正常被动回复：带上 `msg_id`，且同一 `msg_id` 下 `msg_seq` 递增。
+    #[tokio::test]
+    async fn passive_reply_carries_msg_id_and_increasing_seq() {
+        let api = ScriptedApi::new(vec![Ok(SendResult::default()), Ok(SendResult::default())]);
+        let mut states = state_with_window("group:G1");
+        let request = SendRequest::text(Target::group("G1"), "hi").replying_to("M1");
+
+        handle_send(&api, &mut states, "group:G1", request.clone()).await.unwrap();
+        handle_send(&api, &mut states, "group:G1", request).await.unwrap();
+
+        let calls = api.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].msg_id.as_deref(), Some("M1"));
+        assert_eq!(calls[0].msg_seq, Some(1));
+        assert_eq!(calls[1].msg_id.as_deref(), Some("M1"));
+        assert_eq!(calls[1].msg_seq, Some(2), "同一 msg_id 下 msg_seq 必须递增");
+    }
+
+    /// 服务端判被动过期（40034005）→ 改用主动消息**重试一次**。
+    /// 第二次必须**不带** `msg_id`：带着过期的凭证重发只会再被拒一次。
+    #[tokio::test]
+    async fn server_expired_passive_window_retries_once_as_active() {
+        let api = ScriptedApi::new(vec![Err(passive_expired()), Ok(SendResult::default())]);
+        let mut states = state_with_window("group:G1");
+
+        let result = handle_send(
+            &api,
+            &mut states,
+            "group:G1",
+            SendRequest::text(Target::group("G1"), "hi").replying_to("M1"),
+        )
+        .await;
+
+        assert!(result.is_ok(), "重试成功时整体应返回 Ok");
+        let calls = api.calls();
+        assert_eq!(calls.len(), 2, "过期后应恰好重试一次");
+        assert_eq!(calls[0].msg_id.as_deref(), Some("M1"), "第一次是被动回复");
+        assert!(calls[0].msg_seq.is_some());
+        assert!(calls[1].msg_id.is_none(), "重试必须改用主动消息，不能带 msg_id");
+        assert!(calls[1].msg_seq.is_none(), "主动消息没有 msg_seq");
+    }
+
+    /// 主动配额耗尽 → 拒绝，且**一次请求都不该发出去**。
+    #[tokio::test]
+    async fn active_quota_exhausted_rejects_without_sending() {
+        let api = ScriptedApi::new(vec![]);
+        let now = Instant::now();
+        let mut state = SessionState::new(true, now);
+        // 默认 20/min：全部消耗掉，模拟主动额度用尽。
+        for _ in 0..QuotaRules::DEFAULT.per_minute {
+            assert!(state.try_active(now));
+        }
+        let mut states = HashMap::from([("group:G1".to_string(), state)]);
+
+        // 没有 reply_to（主动消息），且配额已空。
+        let err = handle_send(
+            &api,
+            &mut states,
+            "group:G1",
+            SendRequest::text(Target::group("G1"), "hi"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, CoreError::QuotaExceeded), "应是配额错误，实际 {err:?}");
+        assert_eq!(api.call_count(), 0, "配额不足时一次请求都不该发出");
+    }
+
+    /// 非「被动过期」的失败 → **不重试**，错误原样返回。
+    #[tokio::test]
+    async fn non_passive_failure_is_not_retried() {
+        let api = ScriptedApi::new(vec![Err(ApiError::RateLimited)]);
+        let mut states = state_with_window("group:G1");
+
+        let err = handle_send(
+            &api,
+            &mut states,
+            "group:G1",
+            SendRequest::text(Target::group("G1"), "hi").replying_to("M1"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, CoreError::Api(ApiError::RateLimited)),
+            "错误应原样返回，实际 {err:?}"
+        );
+        assert_eq!(api.call_count(), 1, "只有被动过期才重试，其它失败不重试");
     }
 }

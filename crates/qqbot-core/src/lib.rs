@@ -25,5 +25,6 @@ pub use plugin::{
 };
 pub use reply::Reply;
 pub use session::{
-    recommended_shards, Quota, QuotaRules, SessionMsg, SessionRegistry, SessionState, WindowRules,
+    recommended_shards, Quota, QuotaRules, SendApi, SessionMsg, SessionRegistry, SessionState,
+    WindowRules,
 };

@@ -68,7 +68,7 @@ pub async fn assemble_with(cfg: &Config, mut plugins: PluginsConfig) -> Result<A
     let media = MediaUploader::new(api.clone());
     let render = RenderService::new(cfg.render.clone());
     let sessions = Arc::new(SessionRegistry::new(
-        api.clone(),
+        Arc::new(api.clone()),
         cfg.session_shards,
         256,
         Duration::from_secs(10),

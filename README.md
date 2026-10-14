@@ -197,6 +197,10 @@ cargo run -- check            # 凭据与网关连通性
 真实跑 `ApiClient` + `SessionRegistry` + `Dispatcher` + 插件 + `RenderService`，
 只把网络出口指向 127.0.0.1，然后断言 mock **实际收到的 HTTP 请求**。
 
+装配本身走**产品那条路**（`qqbot::assembly::assemble_with`）：插件、存储、
+资源库、分发器与生产完全同源，测试不再自己拼一份 —— 手抄的那份已经漂移过
+（渲染超时、分片数各写各的，保留期清理一次都没被走到）。
+
 覆盖：鉴权头格式、`msg_id`/`msg_seq` 语义、事件去重幂等、群聊/单聊端点选择、
 「收到词云 → 渲染 PNG → 分片上传 → 合并 → 以 `msg_type=7` 发送图片」全链路、
 秒传缓存命中、未知事件无副作用。
@@ -243,7 +247,9 @@ crates/
 ├─ qqbot-store/     消息持久化（嵌入式 SQLite）：写线程批量提交 + 读线程 + 保留期清理
 └─ qqbot-plugins/   业务插件（帮助 / 骰子 / 词云 / 日报 / 资源 / 塔科夫 / BA）
 src/
-├─ main.rs          组合根：装配服务、连接网关、事件循环
+├─ lib.rs           库入口：re-export 装配与配置（集成测试走的就是这条路）
+├─ assembly.rs      装配：Config + PluginsConfig → App（产品与 e2e 共用一份）
+├─ main.rs          组合根：CLI、网关连接、事件循环
 └─ config.rs        配置加载（环境变量 > config.toml > 默认值）
 ```
 

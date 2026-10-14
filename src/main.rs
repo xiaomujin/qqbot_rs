@@ -4,22 +4,20 @@
 //! - `cargo run`（默认）   连接网关并开始服务
 //! - `cargo run -- check`  只校验凭据与网关信息，不建立长连接
 //! - `cargo run -- self-test` 离线渲染自检（不需要网络，不需要凭据）
-
-mod config;
+//!
+//! 服务栈的装配在 `qqbot::assembly`（lib target）：产品与 e2e 走同一条路，
+//! 这里只剩 CLI、日志、网关与事件主循环。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use qqbot_api::ApiClient;
-use qqbot_core::{DispatchConfig, Dispatcher, Router, Services, SessionRegistry};
 use qqbot_gateway::{spawn_gateway, GatewayConfig};
-use qqbot_media::MediaUploader;
 use qqbot_render::{build_wordcloud_svg, Card, RenderConfig, RenderService, WordItem};
-use qqbot_store::MessageStore;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
+use qqbot::{assemble, App, Config};
 
 /// 高并发场景下 mimalloc 明显优于系统分配器。
 #[global_allocator]
@@ -240,111 +238,16 @@ async fn check(cfg: Config) -> Result<()> {
 
 /// 正常服务模式。
 async fn run(cfg: Config) -> Result<()> {
-    let api = ApiClient::new(cfg.api_config())?;
-
-    let media = MediaUploader::new(api.clone());
-    let render = RenderService::new(cfg.render.clone());
-    let sessions = Arc::new(SessionRegistry::new(
-        api.clone(),
-        cfg.session_shards,
-        256,
-        Duration::from_secs(10),
-    ));
-    // 消息持久化。**打开失败不致命**：降级为内存语料，机器人照常服务。
-    let store = match &cfg.store {
-        Some(sc) => match MessageStore::open_async(sc.clone()).await {
-            Ok(s) => {
-                // 第一次 tick 立即触发 → 进程启动就会清理一次过期消息
-                s.spawn_sweeper();
-                tracing::info!(
-                    path = %sc.path.display(),
-                    retention_days = sc.retention_days(),
-                    "消息持久化已启用"
-                );
-                Some(s)
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "消息存储打开失败，词云将退化为内存语料");
-                None
-            }
-        },
-        None => {
-            tracing::warn!("未启用消息持久化（QQBOT_DB_PATH 为空），词云只用内存语料");
-            None
-        }
-    };
-
-    // 资源库与消息库**共用同一个文件**，但用独立连接：
-    // 资源操作由管理命令触发，频率是人手级别，没必要挤进消息的批量写线程。
-    // 打开失败不致命，降级为「不注册资源命令」。
-    // 资源管理依赖**两个**库：资源映射，以及消息库（收录时要回查上一条带图片的消息）。
-    // 所以只有消息库确实打开了才启用它。
-    let resources = match (&cfg.store, &store) {
-        (Some(sc), Some(messages)) => {
-            match qqbot_store::open_resource_store(sc.path.clone()).await {
-                Ok(rs) => {
-                    tracing::info!(basepath = %cfg.resources_basepath.display(), "资源管理已启用");
-                    Some(qqbot_plugins::ResourcesConfig {
-                        store: Arc::new(rs),
-                        messages: Arc::clone(messages),
-                        basepath: cfg.resources_basepath.clone(),
-                        controllers: cfg.system_controllers.clone(),
-                    })
-                }
-                Err(err) => {
-                    tracing::error!(error = %err, "资源库打开失败，资源管理命令不可用");
-                    None
-                }
-            }
-        }
-        _ => {
-            tracing::warn!("未启用消息持久化，资源管理命令不可用");
-            None
-        }
-    };
-
-    let mut services = Services::new(api.clone(), media, render, sessions);
-    if let Some(s) = &store {
-        services = services.with_store(Arc::clone(s));
-    }
-    let services = Arc::new(services);
-
-    let mut router = Router::new();
-    qqbot_plugins::register(
-        &mut router,
-        store.clone(),
-        &qqbot_plugins::PluginsConfig {
-            wordcloud_window: cfg.wordcloud_window,
-            daily: cfg.daily.clone(),
-            resources: resources.clone(),
-            tarkov: qqbot_plugins::TarkovConfig {
-                // 没配就不注册那个插件：这批图是固定的 19 个，
-                // 没放图时注册了也只会报「读取失败」。
-                images_dir: cfg.tarkov_images_dir.clone(),
-                ..Default::default()
-            },
-            ba: qqbot_plugins::BaConfig::default(),
-            bili: qqbot_plugins::BiliConfig::default(),
-            bangumi: qqbot_plugins::BangumiConfig::default(),
-            ammo: qqbot_plugins::AmmoConfig::default(),
-            task: qqbot_plugins::TaskConfig::default(),
-            market: qqbot_plugins::MarketConfig::default(),
-            delta: qqbot_plugins::DeltaConfig::default(),
-        },
-    )
-    .await
-    .context("初始化插件失败")?;
-    let route_count = router.len();
-
-    let dispatcher = Arc::new(Dispatcher::new(
-        router,
-        services.clone(),
-        DispatchConfig {
-            dedup_capacity: cfg.dedup_capacity,
-            concurrency: cfg.dispatch_concurrency,
-            ..DispatchConfig::default()
-        },
-    ));
+    // 装配（含存储降级、资源库、`spawn_sweeper`）全在 `assemble` 里 ——
+    // 产品与 e2e 走同一条路，这里只剩网关与事件循环。
+    // services / store / resources 由 dispatcher 持有，这里只多要一个 api：
+    // 网关用它（与 Services 内部是同一个 client，克隆共享 token 缓存）。
+    let App {
+        dispatcher,
+        route_count,
+        api,
+        ..
+    } = assemble(&cfg).await?;
 
     tracing::info!(
         app_id = %cfg.app_id,

@@ -74,6 +74,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# 根 package 同时提供 lib 与 bin：装配放在 lib（`src/assembly.rs`）里，
+# 集成测试才能调用**产品那条装配路径**，而不是自己再抄一份（抄出来的会漂移）。
+# bin 与 lib 同名是允许的，这里两个都显式写出来，免得靠隐式约定去猜。
+[lib]
+name = "qqbot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qqbot"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 mimalloc = { workspace = true }

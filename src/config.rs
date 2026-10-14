@@ -297,6 +297,49 @@ impl Config {
     }
 }
 
+impl Default for Config {
+    /// 内置默认值那一层：与 [`Config::resolve`] 在「环境变量与 `config.toml`
+    /// 都没表态」时的取值一致。**凭据为空**，所以它连不上线上，
+    /// 只服务测试与 `self-test`。
+    ///
+    /// 注意 `store` 默认是 `Some(data/qqbot.db)`（与产品默认一致）：
+    /// 测试要落库时**必须显式换路径**，否则会写到仓库里的 `data/qqbot.db`。
+    /// 产品路径也不要用它 —— 那是 `Config::load` 的活。
+    fn default() -> Self {
+        Self {
+            app_id: String::new(),
+            client_secret: String::new(),
+            api_base: qqbot_api::DEFAULT_API_BASE.to_string(),
+            // 与 `resolve` 一致：intents / shards / event_buffer / dedup_capacity
+            // 是产品决策与内存上界，不是运维旋钮。
+            intents: Intents::GROUP_AND_C2C_EVENT | Intents::INTERACTION,
+            shards: None,
+            session_shards: qqbot_core::recommended_shards(),
+            event_buffer: 2048,
+            dedup_capacity: 8192,
+            dispatch_concurrency: DEFAULT_DISPATCH_CONCURRENCY,
+            render: RenderConfig {
+                timeout: Duration::from_secs(DEFAULT_RENDER_TIMEOUT_SECS),
+                ..RenderConfig::default()
+            },
+            gateway_url: None,
+            store: Some(StoreConfig {
+                path: PathBuf::from(DEFAULT_DB_PATH),
+                retention: Duration::from_secs(DEFAULT_RETENTION_DAYS * DAY_SECS),
+                ..StoreConfig::default()
+            }),
+            wordcloud_window: Duration::from_secs(DEFAULT_WORDCLOUD_WINDOW_DAYS * DAY_SECS),
+            daily: None,
+            resources_basepath: PathBuf::from(DEFAULT_RESOURCES_BASEPATH),
+            tarkov_images_dir: None,
+            system_controllers: None,
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
+            log_level_source: "默认值",
+            sources: String::new(),
+        }
+    }
+}
+
 /// 生成「配置来源」摘要，供启动日志打印。
 ///
 /// 只列**被设置过**的来源，不列默认值 —— 默认值不会让人困惑，

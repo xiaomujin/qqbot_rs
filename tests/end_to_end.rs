@@ -12,11 +12,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use qqbot_api::{ApiClient, ApiClientConfig, Event, Target};
-use qqbot_core::{CoreError, DispatchConfig, Dispatcher, Reply, Router, Services, SessionRegistry};
-use qqbot_media::MediaUploader;
-use qqbot_render::{RenderConfig, RenderService};
-use qqbot_store::{MessageStore, Scope, StoreConfig};
+use qqbot::{assemble_with, App, Config};
+use qqbot_api::{Event, Target};
+use qqbot_core::{CoreError, Dispatcher, Reply};
+use qqbot_plugins::PluginsConfig;
+use qqbot_render::RenderConfig;
+use qqbot_store::{Scope, StoreConfig};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -518,107 +519,104 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
 
 // ---------------------------------------------------------------- harness
 
-async fn build_stack(mock: &MockServer) -> Arc<Dispatcher> {
-    build_stack_with(mock, None, None).await
+/// e2e 的基准配置：指向 mock，其余走产品默认值。
+///
+/// 渲染超时放宽到 120 秒（见 AGENTS.md）：几十个测试并行会把 debug 渲染挤爆，
+/// 按产品的 5 秒预算会偶发超时，表现为「渲染超时 → 插件降级成文字」，
+/// 于是断言图片的用例随机失败。这不是产品问题，是测试进程自己的负载。
+///
+/// 存储**默认关闭**：需要落库的用例自己设 `cfg.store`（临时目录）。
+/// 不要沿用 `Config::default()` 里的 `data/qqbot.db` —— 那会写到仓库里。
+fn base_cfg(mock: &MockServer) -> Config {
+    Config {
+        api_base: mock.base_url(),
+        render: RenderConfig {
+            timeout: Duration::from_secs(120),
+            ..RenderConfig::default()
+        },
+        // 分片数写小：用例只关心 `msg_seq` 怎么分配，不需要真铺满 CPU 核数。
+        session_shards: 2,
+        store: None,
+        ..Config::default()
+    }
 }
 
-async fn build_stack_with(
-    mock: &MockServer,
-    store: Option<Arc<MessageStore>>,
-    resources: Option<qqbot_plugins::ResourcesConfig>,
-) -> Arc<Dispatcher> {
-    let cfg = ApiClientConfig {
-        app_id: "mock-app".to_string(),
-        client_secret: "mock-secret".to_string(),
-        base_url: mock.base_url(),
-    };
-    let api = ApiClient::new(cfg).expect("api client");
-    let media = MediaUploader::new(api.clone());
-    // 超时给得很宽，是因为**这个测试进程本身**会把渲染服务挤爆：
-    // 几十个测试并行跑，每个都可能触发渲染，而 debug 构建的 resvg
-    // 比 release 慢 25~31 倍（见 AGENTS.md）。10 秒会被偶发超过，
-    // 表现为「渲染超时 → 插件降级成文字」，于是断言图片的测试随机失败。
-    //
-    // 这不是产品问题：release 下一张卡片 47ms，超时是 5 秒，余量 100 倍。
-    // 但测试必须稳定，所以这里不按产品的预算来。
-    let render = RenderService::new(RenderConfig {
-        timeout: Duration::from_secs(120),
-        ..RenderConfig::default()
-    });
-    let sessions = Arc::new(SessionRegistry::new(api.clone(), 2, 64, Duration::from_secs(10)));
-
-    let mut services = Services::new(api, media, render, sessions);
-    if let Some(s) = &store {
-        services = services.with_store(Arc::clone(s));
-    }
-    let services = Arc::new(services);
-
-    let mut router = Router::new();
-    qqbot_plugins::register(
-        &mut router,
-        store,
-        &qqbot_plugins::PluginsConfig {
-            wordcloud_window: Duration::from_secs(30 * 24 * 3600),
-            // 指向 mock：日报要下载长图再转成 file_info 发送，
-            // 这正是「涉及发送链路」的那一类，必须有端到端覆盖。
-            daily: Some(qqbot_plugins::DailyConfig {
-                api_url: format!("{}/daily-api", mock.base_url()),
-                token: "test-token".to_string(),
-                cache: Duration::from_secs(3600),
-            }),
-            resources,
-            // 指向 mock，否则塔科夫的 GraphQL 会真的打出去。
-            tarkov: qqbot_plugins::TarkovConfig {
-                graphql_url: String::new(),
-                maps_url: format!("{}/regular/maps", mock.base_url()),
-                status_base: mock.base_url(),
-                // 静态图从目录读，所以测试里造一个目录放两张假图。
-                images_dir: Some(tarkov_image_dir()),
-                ..Default::default()
-            },
-            ba: qqbot_plugins::BaConfig {
-                api: format!("{}/api/v2/image?name=", mock.base_url()),
-                cdn: format!("{}/image/s", mock.base_url()),
-            },
-            bili: qqbot_plugins::BiliConfig {
-                view_api: format!("{}/x/web-interface/view?bvid=", mock.base_url()),
-                card_api: format!("{}/x/web-interface/card?mid=", mock.base_url()),
-                store: None,
-            },
-            bangumi: qqbot_plugins::BangumiConfig {
-                update_url: format!("{}/update", mock.base_url()),
-            },
-            ammo: qqbot_plugins::AmmoConfig {
-                items_url: format!("{}/regular/items", mock.base_url()),
-                items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
-                store: None,
-            },
-            market: qqbot_plugins::MarketConfig {
-                items_url: format!("{}/regular/items", mock.base_url()),
-                items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
-                store: None,
-            },
-            delta: qqbot_plugins::DeltaConfig {
-                home_url: format!("{}/", mock.base_url()),
-                overview_url: format!("{}/overview", mock.base_url()),
-                menu_url: format!("{}/getMenu", mock.base_url()),
-                data_url: format!("{}/getOVData", mock.base_url()),
-            },
-            task: qqbot_plugins::TaskConfig {
-                tasks_url: format!("{}/regular/tasks", mock.base_url()),
-                traders_url: format!("{}/regular/traders", mock.base_url()),
-                tasks_zh_url: format!("{}/regular/tasks_zh", mock.base_url()),
-                items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
-                traders_zh_url: format!("{}/regular/traders_zh", mock.base_url()),
-                maps_zh_url: format!("{}/regular/maps_zh", mock.base_url()),
-                store: None,
-            },
+/// 指向 mock 的插件配置（产品那份由 `Config` 推导，见 `assembly::plugins_from_config`）。
+///
+/// `resources` 刻意留 `None`：资源库由装配按 `cfg.store` 打开并回填 ——
+/// 「资源库怎么开」只该有一处实现，这正是这次要消掉的漂移。
+fn mock_plugins(mock: &MockServer) -> PluginsConfig {
+    PluginsConfig {
+        wordcloud_window: Duration::from_secs(30 * 24 * 3600),
+        // 指向 mock：日报要下载长图再转成 file_info 发送，
+        // 这正是「涉及发送链路」的那一类，必须有端到端覆盖。
+        daily: Some(qqbot_plugins::DailyConfig {
+            api_url: format!("{}/daily-api", mock.base_url()),
+            token: "test-token".to_string(),
+            cache: Duration::from_secs(3600),
+        }),
+        resources: None,
+        // 指向 mock，否则塔科夫的 GraphQL 会真的打出去。
+        tarkov: qqbot_plugins::TarkovConfig {
+            graphql_url: String::new(),
+            maps_url: format!("{}/regular/maps", mock.base_url()),
+            status_base: mock.base_url(),
+            // 静态图从目录读，所以测试里造一个目录放两张假图。
+            images_dir: Some(tarkov_image_dir()),
+            ..Default::default()
         },
-    )
-    .await
-    .expect("初始化插件失败");
+        ba: qqbot_plugins::BaConfig {
+            api: format!("{}/api/v2/image?name=", mock.base_url()),
+            cdn: format!("{}/image/s", mock.base_url()),
+        },
+        bili: qqbot_plugins::BiliConfig {
+            view_api: format!("{}/x/web-interface/view?bvid=", mock.base_url()),
+            card_api: format!("{}/x/web-interface/card?mid=", mock.base_url()),
+            store: None,
+        },
+        bangumi: qqbot_plugins::BangumiConfig {
+            update_url: format!("{}/update", mock.base_url()),
+        },
+        ammo: qqbot_plugins::AmmoConfig {
+            items_url: format!("{}/regular/items", mock.base_url()),
+            items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
+            store: None,
+        },
+        market: qqbot_plugins::MarketConfig {
+            items_url: format!("{}/regular/items", mock.base_url()),
+            items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
+            store: None,
+        },
+        delta: qqbot_plugins::DeltaConfig {
+            home_url: format!("{}/", mock.base_url()),
+            overview_url: format!("{}/overview", mock.base_url()),
+            menu_url: format!("{}/getMenu", mock.base_url()),
+            data_url: format!("{}/getOVData", mock.base_url()),
+        },
+        task: qqbot_plugins::TaskConfig {
+            tasks_url: format!("{}/regular/tasks", mock.base_url()),
+            traders_url: format!("{}/regular/traders", mock.base_url()),
+            tasks_zh_url: format!("{}/regular/tasks_zh", mock.base_url()),
+            items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
+            traders_zh_url: format!("{}/regular/traders_zh", mock.base_url()),
+            maps_zh_url: format!("{}/regular/maps_zh", mock.base_url()),
+            store: None,
+        },
+    }
+}
 
-    Arc::new(Dispatcher::new(router, services, DispatchConfig::default()))
+/// 用**真实装配路径**搭一个栈。
+///
+/// e2e 里只有这一处装配调用：`build_stack` 与资源类辅助函数都走它。
+/// 产品装配一改（新增插件、改默认值、改资源库打开方式），测试立刻跟着变，
+/// 不会再出现「测试里那份装配悄悄过期」。
+async fn build_stack_with(cfg: Config, plugins: PluginsConfig) -> App {
+    assemble_with(&cfg, plugins).await.expect("装配失败")
+}
+
+/// 搭一个只连 mock、不落库的栈，返回 `Dispatcher` 供用例直接喂事件。
+async fn build_stack(mock: &MockServer) -> Arc<Dispatcher> {
+    build_stack_with(base_cfg(mock), mock_plugins(mock)).await.dispatcher
 }
 
 /// 塔科夫静态图的临时目录。内容无所谓：断言的是「读到了文件并作为富媒体发出」。
@@ -659,16 +657,19 @@ fn as_controller(payload: &str) -> String {
 #[tokio::test]
 async fn inbound_messages_are_persisted_for_both_scopes() {
     let mock = MockServer::start().await;
-    let dir = std::env::temp_dir().join(format!("qqbot-e2e-store-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = resource_dir("store");
     // 保留默认的 flush_interval（250ms）：断言前用 `flush()` 对齐写线程，不猜时间。
-    let store = MessageStore::open(StoreConfig {
-        path: dir.join("qqbot.db"),
-        ..StoreConfig::default()
-    })
-    .unwrap();
-
-    let dispatcher = build_stack_with(&mock, Some(Arc::clone(&store)), None).await;
+    let cfg = Config {
+        store: Some(StoreConfig {
+            path: dir.join("qqbot.db"),
+            ..StoreConfig::default()
+        }),
+        ..base_cfg(&mock)
+    };
+    let app = build_stack_with(cfg, mock_plugins(&mock)).await;
+    // 句柄从 `App` 取回 —— 消息库由装配打开（与产品同一条路径）。
+    let store = app.store.clone().expect("消息库应当已打开");
+    let dispatcher = app.dispatcher;
 
     feed(
         &dispatcher,
@@ -1075,65 +1076,54 @@ async fn active_quota_is_enforced_before_hitting_the_api() {
 
 // ------------------------------------------------------------ 资源管理
 
+/// 资源类用例的临时目录（`tag` 区分同一进程里的多个用例）。
+fn resource_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("qqbot-res-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    dir
+}
+
+/// 资源类用例的配置：消息库与资源库**共用同一个文件**，与产品一致。
+///
+/// 之前 e2e 用 `msg.db` + `res.db` 两个文件，产品却是一个 ——
+/// 于是「同一个库上开两条连接」这件事从来没被测试过。
+fn resource_cfg(mock: &MockServer, dir: &std::path::Path) -> Config {
+    Config {
+        store: Some(StoreConfig {
+            path: dir.join("qqbot.db"),
+            // 保留默认的 flush_interval（250ms）：需要看到写入的用例自己调
+            // `flush()` 对齐，不猜时间。
+            // 清理间隔拉长：`spawn_sweeper` 的首个 tick 仍会立即跑一次
+            // （这正是产品启动时的行为），但不会在用例中途再触发。
+            sweep_interval: Duration::from_secs(3600),
+            ..StoreConfig::default()
+        }),
+        resources_basepath: dir.join("collected"),
+        ..base_cfg(mock)
+    }
+}
+
+/// 按 `resource_cfg` 装配一个资源栈。
+async fn build_resource_app(mock: &MockServer, dir: &std::path::Path) -> App {
+    build_stack_with(resource_cfg(mock, dir), mock_plugins(mock)).await
+}
+
 /// 造一个带**空**资源库的栈。返回 (dispatcher, 临时目录, 资源库)。
 ///
 /// 与 `stack_with_resource` 分开，是为了能测「先收录再触发」这条路 ——
 /// 那条路才是用户实际要走的（`系统收录 <关键词> <路径>`），
 /// 而预先塞好资源的写法绕过了整个命令处理。
-async fn resource_dir_and_store(
-    tag: &str,
-) -> (std::path::PathBuf, Arc<qqbot_store::ResourceStore>) {
-    let dir = std::env::temp_dir().join(format!("qqbot-res-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-
-    let store = Arc::new(
-        qqbot_store::open_resource_store(dir.join("res.db"))
-            .await
-            .expect("打开资源库"),
-    );
-    (dir, store)
-}
-
-/// 用给定的资源库装配一个栈。
-///
-/// **必须在插入资源之后再调用** —— 插件在构造时就把关键词建成内存索引，
-/// 先装配后插入的话，资源永远进不了索引。
-async fn build_resource_stack(
-    mock: &MockServer,
-    dir: &std::path::Path,
-    store: Arc<qqbot_store::ResourceStore>,
-) -> Arc<Dispatcher> {
-    let dir = dir.to_path_buf();
-
-    // 资源管理依赖消息库（收录时要回查上一条带图片的消息），所以两个都要建。
-    // 保留默认的 flush_interval：需要看到写入的用例自己调 `flush()` 对齐，
-    // 不再为「等写入」把间隔压小 —— 那是猜时间。
-    let messages = MessageStore::open_async(StoreConfig {
-        path: dir.join("msg.db"),
-        sweep_interval: Duration::from_secs(3600),
-        ..StoreConfig::default()
-    })
-    .await
-    .expect("打开消息库");
-
-    let cfg = qqbot_plugins::ResourcesConfig {
-        store,
-        messages: Arc::clone(&messages),
-        basepath: dir.join("collected"),
-        controllers: None,
-    };
-    build_stack_with(mock, Some(messages), Some(cfg)).await
-}
-
-/// 造一个带**空**资源库的栈。返回 (dispatcher, 临时目录, 资源库)。
 async fn stack_with_resources(
     mock: &MockServer,
     tag: &str,
 ) -> (Arc<Dispatcher>, std::path::PathBuf, Arc<qqbot_store::ResourceStore>) {
-    let (dir, store) = resource_dir_and_store(tag).await;
-    let dispatcher = build_resource_stack(mock, &dir, Arc::clone(&store)).await;
-    (dispatcher, dir, store)
+    let dir = resource_dir(tag);
+    let app = build_resource_app(mock, &dir).await;
+    // 资源库句柄从 `App` 取回：它由装配按 `cfg.store.path` 打开，
+    // 与产品是同一个文件、同一条路径。
+    let store = app.resources.as_ref().expect("资源库应当已打开").store.clone();
+    (app.dispatcher, dir, store)
 }
 
 /// 造一个带资源库的栈，并放一条资源。返回 (dispatcher, 临时目录)。
@@ -1144,8 +1134,17 @@ async fn stack_with_resource(
     scope: qqbot_store::ResourceScope,
     tag: &str,
 ) -> (Arc<Dispatcher>, std::path::PathBuf) {
-    // 先建库、写资源，**再**装配 —— 顺序反了资源就进不了索引。
-    let (dir, store) = resource_dir_and_store(tag).await;
+    let dir = resource_dir(tag);
+    let cfg = resource_cfg(mock, &dir);
+
+    // 先建库、写资源，**再**装配 —— 顺序反了资源就进不了插件的内存索引。
+    // 装配自己会按 `cfg.store.path` 打开资源库（与消息库同文件），
+    // 所以这里也开同一个文件：两边看到的是同一个库，不是两份数据。
+    let store = qqbot_store::open_resource_store(
+        cfg.store.as_ref().expect("资源栈必须配 store").path.clone(),
+    )
+    .await
+    .expect("打开资源库");
 
     // 内容无所谓：测试断言的是「读到了文件并作为富媒体发出」。
     let img = dir.join("map.png");
@@ -1167,8 +1166,11 @@ async fn stack_with_resource(
         })
         .await
         .expect("写入资源");
+    // 装配会另开一条连接；这里先放掉，别让同一个文件上挂着多余的连接。
+    drop(store);
 
-    (build_resource_stack(mock, &dir, store).await, dir)
+    let app = build_resource_app(mock, &dir).await;
+    (app.dispatcher, dir)
 }
 
 /// 关键词触发：应当读到磁盘上的文件、上传富媒体、并走**被动回复**。
@@ -1274,29 +1276,11 @@ async fn non_resource_keyword_falls_through() {
 #[tokio::test]
 async fn collect_picks_up_an_image_from_a_previous_message() {
     let mock = MockServer::start().await;
-    let dir = std::env::temp_dir().join(format!("qqbot-collect-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-
-    let store = Arc::new(
-        qqbot_store::open_resource_store(dir.join("res.db"))
-            .await
-            .expect("打开资源库"),
-    );
-    let messages = MessageStore::open_async(StoreConfig {
-        path: dir.join("msg.db"),
-        sweep_interval: Duration::from_secs(3600),
-        ..StoreConfig::default()
-    })
-    .await
-    .expect("打开消息库");
-    let cfg = qqbot_plugins::ResourcesConfig {
-        store: Arc::clone(&store),
-        messages: Arc::clone(&messages),
-        basepath: dir.join("collected"),
-        controllers: None,
-    };
-    let dispatcher = build_stack_with(&mock, Some(Arc::clone(&messages)), Some(cfg)).await;
+    let dir = resource_dir("collect-img");
+    let app = build_resource_app(&mock, &dir).await;
+    let store = app.resources.as_ref().expect("资源库应当已打开").store.clone();
+    let messages = app.store.clone().expect("消息库应当已打开");
+    let dispatcher = app.dispatcher;
 
     // 1) 先发图片：content 为空，图片在 attachments 里。
     let url = format!("{}/test-image.png", mock.base_url());
@@ -1334,29 +1318,11 @@ async fn collect_picks_up_an_image_from_a_previous_message() {
 #[tokio::test]
 async fn collect_accepts_another_senders_image() {
     let mock = MockServer::start().await;
-    let dir = std::env::temp_dir().join(format!("qqbot-other-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-
-    let store = Arc::new(
-        qqbot_store::open_resource_store(dir.join("res.db"))
-            .await
-            .expect("打开资源库"),
-    );
-    let messages = MessageStore::open_async(StoreConfig {
-        path: dir.join("msg.db"),
-        sweep_interval: Duration::from_secs(3600),
-        ..StoreConfig::default()
-    })
-    .await
-    .expect("打开消息库");
-    let cfg = qqbot_plugins::ResourcesConfig {
-        store: Arc::clone(&store),
-        messages: Arc::clone(&messages),
-        basepath: dir.join("collected"),
-        controllers: None,
-    };
-    let dispatcher = build_stack_with(&mock, Some(Arc::clone(&messages)), Some(cfg)).await;
+    let dir = resource_dir("other");
+    let app = build_resource_app(&mock, &dir).await;
+    let store = app.resources.as_ref().expect("资源库应当已打开").store.clone();
+    let messages = app.store.clone().expect("消息库应当已打开");
+    let dispatcher = app.dispatcher;
 
     // U1 发图，U2 收录。
     let img = format!(
@@ -1390,29 +1356,10 @@ async fn collect_accepts_another_senders_image() {
 #[tokio::test]
 async fn collect_reads_the_quoted_message_attachment() {
     let mock = MockServer::start().await;
-    let dir = std::env::temp_dir().join(format!("qqbot-quote-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-
-    let store = Arc::new(
-        qqbot_store::open_resource_store(dir.join("res.db"))
-            .await
-            .expect("打开资源库"),
-    );
-    let messages = MessageStore::open_async(StoreConfig {
-        path: dir.join("msg.db"),
-        sweep_interval: Duration::from_secs(3600),
-        ..StoreConfig::default()
-    })
-    .await
-    .expect("打开消息库");
-    let cfg = qqbot_plugins::ResourcesConfig {
-        store: Arc::clone(&store),
-        messages: Arc::clone(&messages),
-        basepath: dir.join("collected"),
-        controllers: None,
-    };
-    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+    let dir = resource_dir("quote");
+    let app = build_resource_app(&mock, &dir).await;
+    let store = app.resources.as_ref().expect("资源库应当已打开").store.clone();
+    let dispatcher = app.dispatcher;
 
     // 结构照抄实测的回复消息：content 是用户输入，图在被引用的消息里。
     let url = format!("{}/test-image.png", mock.base_url());
@@ -1443,29 +1390,10 @@ async fn collect_reads_the_quoted_message_attachment() {
 #[tokio::test]
 async fn collect_prefers_the_own_attachment_over_the_quoted_one() {
     let mock = MockServer::start().await;
-    let dir = std::env::temp_dir().join(format!("qqbot-both-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-
-    let store = Arc::new(
-        qqbot_store::open_resource_store(dir.join("res.db"))
-            .await
-            .expect("打开资源库"),
-    );
-    let messages = MessageStore::open_async(StoreConfig {
-        path: dir.join("msg.db"),
-        sweep_interval: Duration::from_secs(3600),
-        ..StoreConfig::default()
-    })
-    .await
-    .expect("打开消息库");
-    let cfg = qqbot_plugins::ResourcesConfig {
-        store: Arc::clone(&store),
-        messages: Arc::clone(&messages),
-        basepath: dir.join("collected"),
-        controllers: None,
-    };
-    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+    let dir = resource_dir("both");
+    let app = build_resource_app(&mock, &dir).await;
+    let store = app.resources.as_ref().expect("资源库应当已打开").store.clone();
+    let dispatcher = app.dispatcher;
 
     let own = format!("{}/test-image.png", mock.base_url());
     let quoted = format!("{}/quoted-only.png", mock.base_url());
@@ -1494,29 +1422,10 @@ async fn collect_prefers_the_own_attachment_over_the_quoted_one() {
 #[tokio::test]
 async fn collect_without_any_attachment_explains_what_to_do() {
     let mock = MockServer::start().await;
-    let dir = std::env::temp_dir().join(format!("qqbot-none-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-
-    let store = Arc::new(
-        qqbot_store::open_resource_store(dir.join("res.db"))
-            .await
-            .expect("打开资源库"),
-    );
-    let messages = MessageStore::open_async(StoreConfig {
-        path: dir.join("msg.db"),
-        sweep_interval: Duration::from_secs(3600),
-        ..StoreConfig::default()
-    })
-    .await
-    .expect("打开消息库");
-    let cfg = qqbot_plugins::ResourcesConfig {
-        store: Arc::clone(&store),
-        messages: Arc::clone(&messages),
-        basepath: dir.join("collected"),
-        controllers: None,
-    };
-    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+    let dir = resource_dir("none");
+    let app = build_resource_app(&mock, &dir).await;
+    let store = app.resources.as_ref().expect("资源库应当已打开").store.clone();
+    let dispatcher = app.dispatcher;
 
     feed(
         &dispatcher,
@@ -1939,31 +1848,11 @@ async fn bili_stack(
     mock: &MockServer,
 ) -> (Arc<Dispatcher>, Arc<qqbot_store::ResourceStore>, std::path::PathBuf) {
     let n = BILI_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("qqbot-bili-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("建临时目录");
-
-    let store = Arc::new(
-        qqbot_store::open_resource_store(dir.join("res.db"))
-            .await
-            .expect("打开资源库"),
-    );
-    let messages = MessageStore::open_async(StoreConfig {
-        path: dir.join("msg.db"),
-        sweep_interval: Duration::from_secs(3600),
-        ..StoreConfig::default()
-    })
-    .await
-    .expect("打开消息库");
-
-    let cfg = qqbot_plugins::ResourcesConfig {
-        store: Arc::clone(&store),
-        messages: Arc::clone(&messages),
-        basepath: dir.join("collected"),
-        controllers: None,
-    };
-    let dispatcher = build_stack_with(mock, Some(messages), Some(cfg)).await;
-    (dispatcher, store, dir)
+    let dir = resource_dir(&format!("bili-{n}"));
+    let app = build_resource_app(mock, &dir).await;
+    // 订阅表与资源表在同一个库里（产品也是），句柄从 `App` 取回。
+    let store = app.resources.as_ref().expect("资源库应当已打开").store.clone();
+    (app.dispatcher, store, dir)
 }
 
 /// C4/C5：管理员订阅 → 落库 → 退订 → 清空。

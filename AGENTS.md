@@ -16,7 +16,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 |---|---|
 | edition / resolver | `2024` / `3` |
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
-| 结构 | 7 个 crate（`crates/*`）+ 根 bin（`src/`） |
+| 结构 | 7 个 crate（`crates/*`）+ 根 package（**lib + bin**，`src/`）—— 装配在 lib 里，e2e 才引用得到 |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
 | 测试基线 | 510 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
@@ -241,7 +241,8 @@ cargo check -p qqbot
 | 渲染服务、模板、词云布局 | `crates/qqbot-render/src/`。**卡片一律走 `Card`**（`card.rs`：几何常量 + 自动选 `card.svg` / `sections.svg`），插件面只有 `Reply::card`；通用的按名渲染 `RenderService::render_template` 留给 self-test 与未来模板。模板在 `templates/`，新增要加进 `BUILTIN_TEMPLATES`。**SVG 模板必须转义**（`&` 不转义会让 XML 解析失败，整张卡片渲染不出来） |
 | 存储 schema / 读写线程 / 保留期 | `crates/qqbot-store/src/` |
 | 配置项与环境变量 | `src/config.rs`（新增键要同步 `config.example.toml`） |
-| 装配与事件主循环 | `src/main.rs` |
+| 装配（服务栈：存储 / 资源库 / 插件 / 分发器） | `src/assembly.rs`。产品（`assemble`）与 e2e（`assemble_with`）**共用这一份** —— 不要再在别处拼一遍装配 |
+| CLI、网关连接与事件主循环 | `src/main.rs`（网关刻意不进 `assemble`：e2e 是直接喂 `Dispatcher` 的） |
 
 配置优先级：**环境变量 > `config.toml` > 内置默认值**。
 `config.toml` 已 gitignore，模板是 `config.example.toml`；`QQBOT_CONFIG` 可指定路径。

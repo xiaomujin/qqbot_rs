@@ -3,6 +3,9 @@
 //! **核心约束：写入绝不能阻塞消息热路径。**
 //! 因此 `record` 只做一次 `try_send`，队列满就丢弃并计数，
 //! 真正的 SQLite 事务提交全部发生在独立的 OS 线程上。
+//!
+//! 需要「确定的时刻」时用 `flush()`：它是走**同一条队列**的屏障，
+//! 返回即表示此前入队的记录都已提交。热路径不用它。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -11,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use tokio::sync::oneshot;
 
 use crate::model::NewMessage;
 
@@ -18,6 +22,28 @@ use crate::model::NewMessage;
 const INSERT_SQL: &str = "INSERT OR IGNORE INTO messages
     (id, scope, target_id, sender_id, sender_name, event_name, content, raw, created_at)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+
+/// 附件行。主键 (msg_id, ordinal) → 同一条消息重复推送（重推是常态）天然幂等。
+const INSERT_ATTACHMENT_SQL: &str = "INSERT OR IGNORE INTO message_attachments
+    (msg_id, ordinal, scope, target_id, created_at, quoted, url, content_type, filename, size)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+
+/// flush 屏障的总超时。
+///
+/// 写线程正常情况下毫秒级就能确认；超过它说明写线程卡死了（例如 SQLite 被
+/// 别的连接长时间锁住），此时**报错**比让调用方无限挂住好。
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 写线程的输入。
+///
+/// 屏障必须和记录走**同一条**通道：分成两条通道的话，
+/// 「先 record 再 flush」的两次投递可能被写线程反序看到，
+/// 而 flush 承诺的是「**此前**已入队的写入都已提交」。
+enum WriteMsg {
+    Record(NewMessage),
+    /// 收到它的写线程先把已攒的记录提交，再通过 oneshot 应答。
+    Flush(oneshot::Sender<()>),
+}
 
 /// 写入侧计数器，用于观测丢弃率。
 #[derive(Debug, Default)]
@@ -29,7 +55,7 @@ pub struct WriteStats {
 }
 
 pub struct WriteHandle {
-    tx: SyncSender<NewMessage>,
+    tx: SyncSender<WriteMsg>,
     pub stats: Arc<WriteStats>,
 }
 
@@ -54,7 +80,7 @@ impl WriteHandle {
 
     /// 非阻塞投递。队列满时**丢弃并计数**，绝不阻塞调用方。
     pub fn record(&self, msg: NewMessage) {
-        match self.tx.try_send(msg) {
+        match self.tx.try_send(WriteMsg::Record(msg)) {
             Ok(()) => {
                 self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
             }
@@ -70,11 +96,52 @@ impl WriteHandle {
             }
         }
     }
+
+    /// flush 屏障：返回表示「**此前**已入队的写入都已提交」，之后的写入不保证。
+    ///
+    /// 存在的理由是测试与运维工具都需要一个确定的时刻 —— 在此之前，
+    /// 「写入什么时候落盘」只能靠 sleep 猜 `flush_interval`（猜短了假失败、
+    /// 猜长了白等）。消息热路径（`record`）不用它，仍然是纯 `try_send`。
+    ///
+    /// 这里刻意不阻塞：本函数是 `async`，可能跑在 runtime 的 worker 线程上，
+    /// 而 `SyncSender::send` 是同步阻塞调用 —— 写线程正忙时它会把 worker
+    /// 整个卡住。所以队列满时用 `try_send` + `yield_now()` 重试：
+    /// 只要写线程还在消费，队列迟早会腾出位置。
+    pub async fn flush(&self) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        let mut pending = WriteMsg::Flush(ack);
+        let deadline = Instant::now() + FLUSH_TIMEOUT;
+
+        loop {
+            match self.tx.try_send(pending) {
+                Ok(()) => break,
+                Err(TrySendError::Full(msg)) => {
+                    pending = msg;
+                    if Instant::now() >= deadline {
+                        anyhow::bail!("存储写队列持续满载，flush 未能在 {FLUSH_TIMEOUT:?} 内入队");
+                    }
+                    // 让出当前任务：写线程是独立 OS 线程，这里空转没有意义。
+                    tokio::task::yield_now().await;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("存储写线程已退出，无法 flush");
+                }
+            }
+        }
+
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, rx).await {
+            Ok(Ok(())) => Ok(()),
+            // oneshot 发送端被丢弃：写线程在提交之前退出了。
+            Ok(Err(_)) => anyhow::bail!("存储写线程在确认 flush 之前退出"),
+            Err(_) => anyhow::bail!("等待存储写线程 flush 超时（{FLUSH_TIMEOUT:?}）"),
+        }
+    }
 }
 
 fn writer_loop(
     mut conn: Connection,
-    rx: Receiver<NewMessage>,
+    rx: Receiver<WriteMsg>,
     flush_interval: Duration,
     flush_batch: usize,
     stats: Arc<WriteStats>,
@@ -99,7 +166,7 @@ fn writer_loop(
 
         let wait = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
-            Ok(msg) => {
+            Ok(WriteMsg::Record(msg)) => {
                 // 新批次从第一条消息开始计时。
                 if buf.is_empty() {
                     deadline = Instant::now() + flush_interval;
@@ -109,6 +176,17 @@ fn writer_loop(
                     flush(&mut conn, &mut buf, &stats);
                     deadline = Instant::now() + flush_interval;
                 }
+            }
+            Ok(WriteMsg::Flush(ack)) => {
+                // 屏障：**先提交再应答**。反过来的话，调用方在收到 ack 之后
+                // 立刻查库会查不到自己刚写的东西 —— 屏障就没意义了。
+                // 通道是 FIFO，所以此刻缓冲区里已经包含所有先于它入队的记录。
+                if !buf.is_empty() {
+                    flush(&mut conn, &mut buf, &stats);
+                    deadline = Instant::now() + flush_interval;
+                }
+                // 调用方可能已经超时放弃（接收端被 drop）—— 不是错误。
+                let _ = ack.send(());
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -130,6 +208,7 @@ fn flush(conn: &mut Connection, buf: &mut Vec<NewMessage>, stats: &WriteStats) {
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(INSERT_SQL)?;
+            let mut att_stmt = tx.prepare_cached(INSERT_ATTACHMENT_SQL)?;
             for m in buf.iter() {
                 stmt.execute(rusqlite::params![
                     m.id,
@@ -142,6 +221,25 @@ fn flush(conn: &mut Connection, buf: &mut Vec<NewMessage>, stats: &WriteStats) {
                     m.raw,
                     m.created_at,
                 ])?;
+                // 附件与消息在**同一个事务**里。分成两个事务的话，
+                // 中间那一刻库里的消息是没有附件的，而「最近一张图」
+                // 恰恰是按附件行找的 —— 回查会漏掉刚发的那张。
+                for (ordinal, att) in m.attachments.iter().enumerate() {
+                    att_stmt.execute(rusqlite::params![
+                        m.id,
+                        ordinal as i64,
+                        m.scope.as_str(),
+                        m.target_id,
+                        m.created_at,
+                        att.quoted,
+                        att.url,
+                        att.content_type,
+                        att.filename,
+                        // size 是 u64 而 SQLite 只有 i64：超范围就存 NULL，
+                        // 而不是回绕成一个负数让上限检查失效。
+                        att.size.and_then(|s| i64::try_from(s).ok()),
+                    ])?;
+                }
             }
         }
         tx.commit()

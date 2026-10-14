@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use jieba_rs::Jieba;
 use qqbot_core::{Ctx, Handled, Handler};
 use qqbot_render::{build_wordcloud_svg, WordItem};
-use qqbot_store::{now_unix, MessageStore, Scope, MAX_TEXT_ROWS};
+use qqbot_store::{now_unix, MessageStore, Scope};
 
 use crate::timewin::{Window, SHANGHAI_OFFSET};
 
@@ -230,7 +230,7 @@ impl WordCloudPlugin {
                 now.saturating_sub(window_secs)
             }
         };
-        match store.recent_texts(scope, ctx.target.id(), sender, since, MAX_TEXT_ROWS).await {
+        match store.recent_texts(scope, ctx.target.id(), sender, since).await {
             Ok(texts) => self.filter_corpus(texts),
             Err(err) => {
                 tracing::warn!(error = %err, "读取消息存储失败，回退到内存语料");

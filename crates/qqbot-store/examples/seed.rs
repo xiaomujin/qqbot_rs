@@ -8,8 +8,6 @@
 //!
 //! 例：塞一条 400 天前的消息，然后重启机器人，观察它是否被自动清理。
 
-use std::time::Duration;
-
 use qqbot_store::{now_unix, MessageStore, NewMessage, Scope, StoreConfig, DAY_SECS};
 
 // store crate 只启用了 rt（不启用 rt-multi-thread），因此显式指定单线程运行时。
@@ -48,10 +46,13 @@ async fn main() -> anyhow::Result<()> {
         sender_name: Some("seed".into()),
         event_name: "SEED".into(),
         raw: None,
+        attachments: Vec::new(),
         content,
         created_at: now_unix() - days * DAY_SECS as i64,
     });
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // 屏障：返回时这条写入已经提交，下面统计到的行数一定包含它。
+    // 不用 sleep 猜写线程的批提交时机。
+    store.flush().await?;
 
     println!(
         "已向 {db} 插入 1 条 {days} 天前的消息；行数 {before} → {}",

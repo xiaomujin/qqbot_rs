@@ -262,9 +262,10 @@ migrate() 里 v < SCHEMA_VERSION 的分支本来就会更新版本号，
 （早先基于一条非回复消息的 `msg_elements: null` 得出过「引用内容不在事件里」的
 结论，那是错的 —— 非回复消息本来就不会有 `msg_elements`。）
 
-第 3 级需要 `messages` 表新增 `raw` 列保存**原始事件 JSON**：
-附件不在 `content` 里，只有原文能还原。
-查该会话最近 N 条带 `raw` 的记录，取第一条能解析出附件地址的。
+第 3 级落在 `message_attachments` 表上（B 簇的存储重构，schema v13）：附件在入库时
+就随消息落成行，回查是一条走 `(scope, target_id, created_at DESC)` 索引的 SQL，
+而不是「取回最近 N 条原文再逐条反序列化」。前两级也各有类型化访问器
+（`MessageEvent::first_attachment` / `quoted_attachment`），协议知识不再漏给插件。
 
 为什么不另建内存缓存：消息本来就落库了，再存一份只是多一处需要保持一致的状态，
 而且进程重启就没了。
@@ -276,6 +277,7 @@ migrate() 里 v < SCHEMA_VERSION 的分支本来就会更新版本号，
 `MessageEvent` 只声明了文档写到的字段，**没声明的会在反序列化时静默丢掉** ——
 实测 `attachments[].content` 就是文档没写但确实存在的字段。
 所以「存原文」不是冗余：它是唯一能事后重新提取的结构。
+（附件本身已经单独落表，不再依赖原文；保留 `raw` 是为了**其它**尚未声明的结构。）
 
 这也回答了「CQ 码还是 JSON」：**存 JSON**。CQ 码是 OneBot v11 的私有格式，
 官方 API 从不产生它；引入它要自己写 parser + serializer，而 JSON 是官方原生的，

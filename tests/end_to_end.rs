@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use qqbot_api::{ApiClient, ApiClientConfig, Event, Target};
 use qqbot_core::{CoreError, DispatchConfig, Dispatcher, Reply, Router, Services, SessionRegistry};
@@ -661,9 +661,9 @@ async fn inbound_messages_are_persisted_for_both_scopes() {
     let mock = MockServer::start().await;
     let dir = std::env::temp_dir().join(format!("qqbot-e2e-store-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // 保留默认的 flush_interval（250ms）：断言前用 `flush()` 对齐写线程，不猜时间。
     let store = MessageStore::open(StoreConfig {
         path: dir.join("qqbot.db"),
-        flush_interval: Duration::from_millis(20),
         ..StoreConfig::default()
     })
     .unwrap();
@@ -683,22 +683,20 @@ async fn inbound_messages_are_persisted_for_both_scopes() {
     )
     .await;
 
-    // 写线程是异步批提交，轮询等它落盘
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while store.count().await.unwrap() < 2 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // 写线程是异步批提交 —— 用 flush 屏障对齐，不轮询也不 sleep。
+    store.flush().await.expect("flush 消息库");
+    assert_eq!(store.count().await.unwrap(), 2);
 
     assert_eq!(
-        store.recent_texts(Scope::Group, "GP", None, 0, 10).await.unwrap(),
+        store.recent_texts(Scope::Group, "GP", None, 0).await.unwrap(),
         vec!["群里说的话"]
     );
     assert_eq!(
-        store.recent_texts(Scope::C2c, "U2", None, 0, 10).await.unwrap(),
+        store.recent_texts(Scope::C2c, "U2", None, 0).await.unwrap(),
         vec!["私聊说的话"]
     );
     // 群与私聊不能串台
-    assert!(store.recent_texts(Scope::C2c, "GP", None, 0, 10).await.unwrap().is_empty());
+    assert!(store.recent_texts(Scope::C2c, "GP", None, 0).await.unwrap().is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1109,9 +1107,10 @@ async fn build_resource_stack(
     let dir = dir.to_path_buf();
 
     // 资源管理依赖消息库（收录时要回查上一条带图片的消息），所以两个都要建。
+    // 保留默认的 flush_interval：需要看到写入的用例自己调 `flush()` 对齐，
+    // 不再为「等写入」把间隔压小 —— 那是猜时间。
     let messages = MessageStore::open_async(StoreConfig {
         path: dir.join("msg.db"),
-        flush_interval: Duration::from_millis(10),
         sweep_interval: Duration::from_secs(3600),
         ..StoreConfig::default()
     })
@@ -1268,25 +1267,6 @@ async fn non_resource_keyword_falls_through() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 等异步写线程把消息落库（最多 3 秒）。
-///
-/// 原来这里是固定的 80ms sleep。全量并行跑测试时，十几个 resvg 渲染用例
-/// 会把 CPU 占满，写线程可能排不上队 —— 实测「单独跑必过、全量跑偶尔挂」。
-/// 改成有界轮询：既不会假失败，也不会真的卡住。
-async fn wait_for_message(messages: &MessageStore, target: &str, needle: &str) {
-    for _ in 0..300 {
-        let rows = messages
-            .recent_raw(qqbot_store::Scope::Group, target, 0, 5)
-            .await
-            .unwrap_or_default();
-        if rows.iter().any(|row| row.contains(needle)) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("等了 3 秒，含 {needle} 的消息仍未落库");
-}
-
 /// 用户的实际用法：**先发图片，再发命令**（两条独立消息）。
 ///
 /// 图片消息的 content 是空的，命令消息本身没有附件 —— 两者靠
@@ -1305,7 +1285,6 @@ async fn collect_picks_up_an_image_from_a_previous_message() {
     );
     let messages = MessageStore::open_async(StoreConfig {
         path: dir.join("msg.db"),
-        flush_interval: Duration::from_millis(10),
         sweep_interval: Duration::from_secs(3600),
         ..StoreConfig::default()
     })
@@ -1325,9 +1304,9 @@ async fn collect_picks_up_an_image_from_a_previous_message() {
         r#"{{"id":"IN_IMG","author":{{"member_openid":"U1"}},"content":"","group_openid":"GCOL","attachments":[{{"url":"{url}","content_type":"image/png","filename":"a.png","size":16}}]}}"#
     );
     feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
-    // 入库是**异步批量**的（写线程每 flush_interval 提交一次），
-    // 要等它真的落库，命令才不会跑在图片前面。
-    wait_for_message(&messages, "GCOL", "IN_IMG").await;
+    // 入库是**异步批量**的（写线程每 flush_interval 提交一次）。
+    // 用 flush 屏障等它真的落库：命令必须跑在图片后面，否则回查会落空。
+    messages.flush().await.expect("flush 消息库");
 
     // 2) 再发命令：本身没有附件，必须回消息库找回上一条的图。
     feed(
@@ -1366,7 +1345,6 @@ async fn collect_accepts_another_senders_image() {
     );
     let messages = MessageStore::open_async(StoreConfig {
         path: dir.join("msg.db"),
-        flush_interval: Duration::from_millis(10),
         sweep_interval: Duration::from_secs(3600),
         ..StoreConfig::default()
     })
@@ -1386,7 +1364,7 @@ async fn collect_accepts_another_senders_image() {
         mock.base_url()
     );
     feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
-    wait_for_message(&messages, "GST", "IN_IMG2").await;
+    messages.flush().await.expect("flush 消息库");
 
     feed(
         &dispatcher,
@@ -1423,7 +1401,6 @@ async fn collect_reads_the_quoted_message_attachment() {
     );
     let messages = MessageStore::open_async(StoreConfig {
         path: dir.join("msg.db"),
-        flush_interval: Duration::from_millis(10),
         sweep_interval: Duration::from_secs(3600),
         ..StoreConfig::default()
     })
@@ -1455,6 +1432,108 @@ async fn collect_reads_the_quoted_message_attachment() {
     assert_eq!(items[0].name, "引用图");
     let saved = std::fs::read(&items[0].path).expect("素材应当已落盘");
     assert_eq!(saved, b"FAKE-IMAGE-BYTES");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 三级回退的**顺序**：本条消息自带的附件优先于被引用的那张。
+///
+/// 让被引用的那张指向一个 mock 不认识的路径（404）：顺序一旦反了，
+/// 下载就会失败，收录不会成功。
+#[tokio::test]
+async fn collect_prefers_the_own_attachment_over_the_quoted_one() {
+    let mock = MockServer::start().await;
+    let dir = std::env::temp_dir().join(format!("qqbot-both-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+
+    let store = Arc::new(
+        qqbot_store::open_resource_store(dir.join("res.db"))
+            .await
+            .expect("打开资源库"),
+    );
+    let messages = MessageStore::open_async(StoreConfig {
+        path: dir.join("msg.db"),
+        sweep_interval: Duration::from_secs(3600),
+        ..StoreConfig::default()
+    })
+    .await
+    .expect("打开消息库");
+    let cfg = qqbot_plugins::ResourcesConfig {
+        store: Arc::clone(&store),
+        messages: Arc::clone(&messages),
+        basepath: dir.join("collected"),
+        controllers: None,
+    };
+    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+
+    let own = format!("{}/test-image.png", mock.base_url());
+    let quoted = format!("{}/quoted-only.png", mock.base_url());
+    let both = format!(
+        r#"{{"id":"IN_BOTH","author":{{"member_openid":"U1","member_role":"admin"}},"content":"收录 两张图","group_openid":"GBOTH","attachments":[{{"url":"{own}","content_type":"image/png","filename":"own.png"}}],"msg_elements":[{{"message_type":103,"attachments":[{{"url":"{quoted}"}}]}}]}}"#
+    );
+    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &both).await;
+
+    let items = store
+        .list(qqbot_store::ResourceScope::Group, "GBOTH")
+        .await
+        .expect("列资源");
+    assert_eq!(items.len(), 1, "应当收录成功（用的是本条消息自带的附件）");
+    assert_eq!(items[0].name, "两张图");
+    let saved = std::fs::read(&items[0].path).expect("素材应当已落盘");
+    assert_eq!(saved, b"FAKE-IMAGE-BYTES");
+    assert!(
+        mock.all(|h| h.path == "/quoted-only.png").is_empty(),
+        "本条消息有附件时不该去下载被引用的那张"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 三级都没命中时，回执要说清「怎么才能成功」—— 这是用户唯一的线索。
+#[tokio::test]
+async fn collect_without_any_attachment_explains_what_to_do() {
+    let mock = MockServer::start().await;
+    let dir = std::env::temp_dir().join(format!("qqbot-none-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+
+    let store = Arc::new(
+        qqbot_store::open_resource_store(dir.join("res.db"))
+            .await
+            .expect("打开资源库"),
+    );
+    let messages = MessageStore::open_async(StoreConfig {
+        path: dir.join("msg.db"),
+        sweep_interval: Duration::from_secs(3600),
+        ..StoreConfig::default()
+    })
+    .await
+    .expect("打开消息库");
+    let cfg = qqbot_plugins::ResourcesConfig {
+        store: Arc::clone(&store),
+        messages: Arc::clone(&messages),
+        basepath: dir.join("collected"),
+        controllers: None,
+    };
+    let dispatcher = build_stack_with(&mock, Some(messages), Some(cfg)).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"IN_NONE","author":{"member_openid":"U1","member_role":"admin"},"content":"收录 没有图","group_openid":"GNONE"}"#,
+    )
+    .await;
+
+    let send = mock.find(|h| h.path == "/v2/groups/GNONE/messages").expect("应当有回执");
+    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.contains("没有找到可收录的图片"), "三级都没命中时要告诉用户怎么办: {md}");
+    assert!(md.contains("先发图片再发命令"), "提示里要含用法: {md}");
+    assert!(
+        store.list(qqbot_store::ResourceScope::Group, "GNONE").await.unwrap().is_empty(),
+        "没找到图就不该写进资源库"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1871,7 +1950,6 @@ async fn bili_stack(
     );
     let messages = MessageStore::open_async(StoreConfig {
         path: dir.join("msg.db"),
-        flush_interval: Duration::from_millis(10),
         sweep_interval: Duration::from_secs(3600),
         ..StoreConfig::default()
     })

@@ -2,6 +2,14 @@ use serde::Deserialize;
 
 use crate::message::Target;
 
+/// 「引用消息」在 `msg_elements[].message_type` 里的取值（**实测值，官方文档没写**）。
+///
+/// 回复一条消息时，事件里会多出一个 `message_type = 103` 的 `msg_elements` 元素：
+/// 被引用消息的正文与附件都在它里面，同时 `message_scene.ext` 多出 `ref_msg_idx`。
+/// 这是「回复收录」能成立的唯一依据 —— 早先基于非回复消息得出的
+/// 「引用内容不在事件里」是错的。
+pub const QUOTED_MESSAGE_TYPE: i32 = 103;
+
 /// 用户对象。
 ///
 /// 所有字段都可缺省：不同事件场景下官方只会填充其中一部分
@@ -200,6 +208,19 @@ impl MessageEvent {
     pub fn first_attachment(&self) -> Option<&MessageAttachment> {
         self.attachments.first()
     }
+
+    /// **被引用消息**的附件：`msg_elements` 里第一个 `message_type = 103`
+    /// 且带附件的元素的第一项。
+    ///
+    /// 与 [`Self::first_attachment`] 是两个不同的来源，优先级也不同：
+    /// 本条消息自带的附件在前，引用消息的在后。协议知识（那个 103）
+    /// 留在协议类型旁边，插件不必自己解析原文。
+    pub fn quoted_attachment(&self) -> Option<&MessageAttachment> {
+        self.msg_elements
+            .iter()
+            .filter(|e| e.message_type == Some(QUOTED_MESSAGE_TYPE))
+            .find_map(|e| e.attachments.first())
+    }
 }
 
 #[cfg(test)]
@@ -285,5 +306,55 @@ mod tests {
         let ev: MessageEvent = serde_json::from_str(r#"{"id":"X","group_openid":"G"}"#).unwrap();
         assert_eq!(ev.target(), Some(Target::group("G")));
         assert_eq!(ev.sender_openid(), None);
+    }
+
+    /// 实测结构：回复一条带图的消息时，被引用消息的附件在 `msg_elements` 里，
+    /// 该元素的 `message_type = 103`，`message_scene.ext` 同时多出 `ref_msg_idx`。
+    #[test]
+    fn quoted_attachment_comes_from_the_103_element() {
+        let raw = r#"{"id":"M1","content":" 收录 引用图","group_openid":"G1","message_type":103,"message_scene":{"ext":["ref_msg_idx=REFIDX_AAA","msg_idx=REFIDX_BBB","auth_token=T"],"source":"default"},"msg_elements":[{"message_type":103,"content":"1\n2","msg_idx":"REFIDX_AAA","attachments":[{"content":"","content_type":"image/jpeg","filename":"a.jpeg","height":440,"size":47195,"url":"https://example.invalid/quoted.jpeg","width":583}]}]}"#;
+        let ev: MessageEvent = serde_json::from_str(raw).unwrap();
+        let att = ev.quoted_attachment().expect("应当从引用消息里取到附件");
+        assert_eq!(att.url.as_deref(), Some("https://example.invalid/quoted.jpeg"));
+        assert_eq!(att.filename.as_deref(), Some("a.jpeg"));
+        assert_eq!(att.size, Some(47195));
+        assert_eq!(att.content_type.as_deref(), Some("image/jpeg"));
+        // 引用附件与「本条消息的附件」是两个来源，不能互相顶替。
+        assert!(ev.first_attachment().is_none());
+    }
+
+    #[test]
+    fn quoted_attachment_ignores_other_element_types() {
+        // message_type 不是 103 的元素不是「被引用的消息」，不能当成图源。
+        let ev: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","msg_elements":[{"message_type":0,"attachments":[{"url":"https://x/a.png"}]}]}"#,
+        )
+        .unwrap();
+        assert!(ev.quoted_attachment().is_none());
+    }
+
+    #[test]
+    fn quoted_attachment_is_none_without_attachments() {
+        let ev: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","msg_elements":[{"message_type":103,"content":"纯文本"}]}"#,
+        )
+        .unwrap();
+        assert!(ev.quoted_attachment().is_none());
+    }
+
+    #[test]
+    fn own_attachment_and_quoted_attachment_are_distinct() {
+        let ev: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","attachments":[{"url":"https://example.invalid/own.png"}],"msg_elements":[{"message_type":103,"attachments":[{"url":"https://example.invalid/quoted.png"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ev.first_attachment().and_then(|a| a.url.as_deref()),
+            Some("https://example.invalid/own.png")
+        );
+        assert_eq!(
+            ev.quoted_attachment().and_then(|a| a.url.as_deref()),
+            Some("https://example.invalid/quoted.png")
+        );
     }
 }

@@ -311,6 +311,10 @@ content="我第一次下载给的6块<@28800DF7B8FE4F830E9FF7C6DB937E35>"
 > 非回复消息里图片确实在顶层 `attachments`，但回复消息里它在 `msg_elements` 内。
 > 只按前者实现，症状就是「发图能收录、回复收录失败」。
 
+代码里这两个来源各有一个访问器：`MessageEvent::first_attachment()`（本条消息）与
+`MessageEvent::quoted_attachment()`（被引用的消息，按 `QUOTED_MESSAGE_TYPE = 103` 找）。
+**协议知识留在 `qqbot-api` 里**，调用方不要再自己解析原文。
+
 另外，`attachments[]` 里有一个文档未写但实测存在的字段 **`content`**（当前观察到为空串）。
 这也说明：**类型里没声明的字段会在反序列化时静默丢掉**，
 需要完整消息时应保留原始 JSON（见 `MessageEvent::raw`）。

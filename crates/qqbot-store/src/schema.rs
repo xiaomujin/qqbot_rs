@@ -36,9 +36,14 @@ use rusqlite::Connection;
 /// 这与项目早就定下的做法一致：`name_zh` 也是导入时解析好存下来的，
 /// 而不是渲染时再查语言包。
 ///
-/// 旧库的塔科夫缓存会在升级时清空 —— 正文只能由上游数据重算，库里的行救不回来。
+/// v12 升级时清空过塔科夫缓存 —— 正文只能由上游数据重算，库里的行救不回来。
 /// 它是上游的副本，系统控制者发一次「更新任务」就重建。
-pub const SCHEMA_VERSION: i64 = 12;
+///
+/// v13 增加 `message_attachments`：附件落成行，不再靠「把原始 JSON 存进 messages.raw、
+/// 读的时候再解析回来」。附件是查询条件（按会话取最近一条），不是一串待解析的文本。
+///
+/// 从 v13 起**不再迁移旧库**：版本不等一律报错要求删库重建，理由见 `migrate`。
+pub const SCHEMA_VERSION: i64 = 13;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -63,6 +68,33 @@ CREATE INDEX IF NOT EXISTS idx_messages_scope_target_time
 -- 保留期清理走 created_at
 CREATE INDEX IF NOT EXISTS idx_messages_created_at
     ON messages(created_at);
+
+-- 消息附件。一行 = 一条消息里的一个附件。
+--
+-- 为什么不继续从 `messages.raw` 里解析：附件是**查询条件**
+-- （「这个会话最近一张图是哪张」），而 raw 是一串只能整段取回、再在应用层
+-- 反序列化的文本 —— 回查要扫最近几十条原文，还要求解析形状与当时的协议版本一致。
+-- 落成行之后，「最近一条带附件的消息」就是一条走索引的 SQL。
+CREATE TABLE IF NOT EXISTS message_attachments (
+    msg_id       TEXT    NOT NULL,
+    -- 同一消息内附件的下标。主键的一部分，保证重复推送时幂等。
+    ordinal      INTEGER NOT NULL,
+    scope        TEXT    NOT NULL CHECK(scope IN ('group','c2c')),
+    target_id    TEXT    NOT NULL,
+    created_at   INTEGER NOT NULL,
+    -- 1 = 来自被引用的消息（msg_elements 里 message_type = 103）。
+    -- 引用图与本条图在「收录」时优先级不同，所以要能区分。
+    quoted       INTEGER NOT NULL DEFAULT 0,
+    url          TEXT    NOT NULL,
+    content_type TEXT,
+    filename     TEXT,
+    size         INTEGER,
+    PRIMARY KEY (msg_id, ordinal)
+);
+
+-- 回查「最近一张附件」走 (scope, target_id, created_at DESC)。
+CREATE INDEX IF NOT EXISTS idx_attachments_target_time
+    ON message_attachments(scope, target_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -290,6 +322,10 @@ CREATE TABLE IF NOT EXISTS tarkov_task_fail (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tarkov_task_name ON tarkov_task(normalized_name);
+CREATE INDEX IF NOT EXISTS idx_tarkov_task_name_zh ON tarkov_task(name_zh);
+CREATE INDEX IF NOT EXISTS idx_tarkov_task_prereq_pre ON tarkov_task_prereq(prereq_id);
+CREATE INDEX IF NOT EXISTS idx_tarkov_task_successor_succ
+    ON tarkov_task_successor(successor_id);
 
 -- 塔科夫物品与跳蚤价格。价格字段可为 NULL —— 实测 5442 件里只有 3525 件有价。
 CREATE TABLE IF NOT EXISTS tarkov_item (
@@ -341,183 +377,74 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// 逐版本升级**已存在的表**。
+/// 表存不存在。用于在**建表之前**判断这是不是一个全新的库。
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let found: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get(0),
+    )?;
+    Ok(found > 0)
+}
+
+/// 建表并写入 schema 版本。三条规则：
 ///
-/// `DDL` 里的 `CREATE TABLE IF NOT EXISTS` 只能建新表；
-/// 给已存在的表**加列**必须显式 ALTER。这一步最容易漏 ——
-/// 新库一切正常，旧库直到读那一列时才报 `no such column: raw`。
-fn upgrade(conn: &Connection, from: i64) -> Result<()> {
-    if from < 3 {
-        add_column_if_missing(conn, "messages", "raw", "TEXT")?;
-    }
-    if from < 9 {
-        // 可空：GraphQL 挂着时这一列全是 NULL，检索要能接受。
-        add_column_if_missing(conn, "tarkov_task", "name_zh", "TEXT")?;
-    }
-    if from < 10 {
-        // 三张子表由 `DDL` 的 `CREATE TABLE IF NOT EXISTS` 建好，不用管。
-        // 这里只补 `tarkov_task` 自己新增的列。
-        add_column_if_missing(conn, "tarkov_task", "trader_name_zh", "TEXT")?;
-        add_column_if_missing(conn, "tarkov_task", "trader_image", "TEXT NOT NULL DEFAULT ''")?;
-        add_column_if_missing(conn, "tarkov_task", "task_image", "TEXT NOT NULL DEFAULT ''")?;
-        add_column_if_missing(conn, "tarkov_task", "map", "TEXT NOT NULL DEFAULT ''")?;
-        // `objectives` 那个计数列被 `tarkov_task_objective` 取代了。
-        // 留着它就是「两处真相」，迟早有人读错那一处。
-        drop_column_if_present(conn, "tarkov_task", "objectives")?;
-    }
-    if from < 11 {
-        // 塔科夫全模块改用静态语言包，理由见 `SCHEMA_VERSION` 的注释。
-        // `tarkov_task_successor` 由 `DDL` 建好，这里只补已存在表的新列。
-        add_column_if_missing(conn, "tarkov_task", "name_en", "TEXT")?;
-        add_column_if_missing(conn, "tarkov_task", "map_name_zh", "TEXT")?;
-        add_column_if_missing(conn, "tarkov_task", "updated_at", "INTEGER NOT NULL DEFAULT 0")?;
-        add_column_if_missing(conn, "tarkov_task", "detail_json", "TEXT")?;
-        add_column_if_missing(conn, "tarkov_task_objective", "detail_json", "TEXT")?;
-        add_column_if_missing(conn, "tarkov_task_reward", "extra", "TEXT")?;
-        add_column_if_missing(conn, "ammo", "name_zh", "TEXT")?;
-        add_column_if_missing(conn, "tarkov_item", "name_zh", "TEXT")?;
-    }
-    if from < 12 {
-        // 三张子表由 `DDL` 建好（它跑在本函数之前），这里只动已存在的表。
-        add_column_if_missing(conn, "tarkov_task", "faction", "TEXT")?;
-        add_column_if_missing(conn, "tarkov_task", "restartable", "INTEGER NOT NULL DEFAULT 0")?;
-        add_column_if_missing(
-            conn,
-            "tarkov_task_objective",
-            "display_text",
-            "TEXT NOT NULL DEFAULT ''",
-        )?;
-        add_column_if_missing(conn, "tarkov_task_objective", "marks", "TEXT NOT NULL DEFAULT ''")?;
-        drop_column_if_present(conn, "tarkov_task", "detail_json")?;
-        for column in ["description_zh", "is_optional", "count", "is_raid", "detail_json"] {
-            drop_column_if_present(conn, "tarkov_task_objective", column)?;
-        }
-        // 旧行的 `display_text` / `marks` 只能是空的，而它们**只能由上游数据重算** ——
-        // 库里的行救不回来。与其留一张渲染出来目标全空的卡片，不如清掉缓存：
-        // 它是上游的副本，系统控制者发一次「更新任务」就重建。
-        for table in [
-            "tarkov_task_objective",
-            "tarkov_task_reward",
-            "tarkov_task_prereq",
-            "tarkov_task_successor",
-            "tarkov_task_key",
-            "tarkov_task_requirement",
-            "tarkov_task_fail",
-            "tarkov_task",
-        ] {
-            conn.execute(&format!("DELETE FROM {table}"), [])?;
-        }
-        tracing::info!("塔科夫缓存已清空（v12 去 JSON 化），等下一次「更新任务」重建");
-    }
-    Ok(())
-}
-
-/// 删列。`ALTER TABLE DROP COLUMN` 没有 IF EXISTS（SQLite 3.35+ 才有 DROP COLUMN），
-/// 所以同样要先查 `PRAGMA table_info`。
+/// 1. **新库**（连 `meta` 表都没有，或有表但没有版本行）→ 建表 + 写版本 + 播种默认资源；
+/// 2. 版本**恰好相等** → 直接用，什么都不做；
+/// 3. 版本**不等**（旧库或更新的库）→ 返回明确错误，**不建表、不迁移**。
 ///
-/// 比加列危险：列一旦删掉，里面的数据就没了。只在**确认没有别的读法**时才用。
-fn drop_column_if_present(conn: &Connection, table: &str, column: &str) -> Result<()> {
-    if !has_column(conn, table, column)? {
-        return Ok(());
-    }
-    tracing::info!(table, column, "已删除列");
-    conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
-        .with_context(|| format!("删除列 {table}.{column} 失败"))?;
-    Ok(())
-}
-
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
-    // 先查一遍再 ALTER：`ALTER TABLE ADD COLUMN` 没有 IF NOT EXISTS，
-    // 重复执行会直接报错。
-    if !has_column(conn, table, column)? {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
-            .with_context(|| format!("给 {table} 增加列 {column} 失败"))?;
-        tracing::info!(table, column, "已增加列");
-    }
-    Ok(())
-}
-
-/// 表里有没有这一列。
+/// 第 3 条是 ADR 0001 第 11 条的授权结果：本次重构允许重建数据库，
+/// 所以加表加列只需要改 `DDL` 并提 `SCHEMA_VERSION`，不必再维护跨版本的
+/// `ALTER` / `DROP` 分支。宁可让用户删掉 `data/qqbot.db` 重启，
+/// 也不要留下「升了一半」的库 —— 那种半残状态既没有测试能覆盖，
+/// 报出来的错也指不到真正的原因。
 ///
-/// 加列与删列都靠它 —— SQLite 的 `ALTER TABLE` 两个方向都没有 `IF EXISTS`。
-fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let found = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(std::result::Result::ok)
-        .any(|name| name == column);
-    Ok(found)
-}
-
-/// 建表并写入 schema 版本。
+/// ⚠️ 版本判定必须发生在执行 `DDL` **之前**：否则旧库会被顺手建上新表，
+/// 之后即使报错，库里也已经多出一堆形状不一致的表。
 pub fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(DDL).context("建表失败")?;
-
     // ⚠️ 不能用 `.ok()` 把三种语义压成同一个 None：
-    //   (a) 行不存在     → 正常首次初始化，走 None 分支
+    //   (a) 行不存在     → 正常首次初始化，走新库分支
     //   (b) 查询失败     → 真实错误，必须上报
     //   (c) 值不是整数   → 数据损坏，必须上报
     // (b)/(c) 若混进 None 分支，会撞上 meta.key 主键约束，报出一条毫无指向性的
     // "UNIQUE constraint failed"，进而让 main 静默把整个持久化降级掉。
-    let current: Option<i64> = match conn.query_row(
-        "SELECT value FROM meta WHERE key = 'schema_version'",
-        [],
-        |r| r.get::<_, String>(0),
-    ) {
-        Ok(v) => Some(
-            v.parse()
-                .with_context(|| format!("meta.schema_version 不是整数: {v:?}"))?,
-        ),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(err) => return Err(err).context("读取 schema_version 失败"),
+    let current: Option<i64> = if !table_exists(conn, "meta")? {
+        None
+    } else {
+        match conn.query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(v) => Some(
+                v.parse()
+                    .with_context(|| format!("meta.schema_version 不是整数: {v:?}"))?,
+            ),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(err).context("读取 schema_version 失败"),
+        }
     };
 
     match current {
-        Some(v) if v == SCHEMA_VERSION => {}
-        Some(v) if v < SCHEMA_VERSION => {
-            // 目前只有 v1，后续版本在这里按序升级。
-            tracing::info!(from = v, to = SCHEMA_VERSION, "数据库 schema 已升级");
-            upgrade(conn, v)?;
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [SCHEMA_VERSION.to_string()],
-            )?;
-            // 只在**首次到达本版本**时播种。之后控制者清空列表不会让默认值复活。
-            crate::resource::seed_defaults(conn)?;
-        }
+        Some(v) if v == SCHEMA_VERSION => return Ok(()),
         Some(v) => {
             anyhow::bail!(
-                "数据库 schema 版本 {v} 高于本程序支持的 {SCHEMA_VERSION}，请升级程序或更换数据库文件"
+                "数据库 schema 版本 {v} 与本程序要求的 {SCHEMA_VERSION} 不一致。\
+                 本次重构（ADR 0001 第 11 条）不再迁移旧库：删掉 data/qqbot.db 后重启即可重建"
             );
         }
-        None => {
-            // 与上面 v < SCHEMA_VERSION 的分支保持一致，做到真正幂等。
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [SCHEMA_VERSION.to_string()],
-            )?;
-            tracing::info!(version = SCHEMA_VERSION, "数据库 schema 已初始化");
-            crate::resource::seed_defaults(conn)?;
-        }
+        None => {}
     }
 
-    // ⚠️ 这条索引**必须**放在版本判定之后，不能写进 `DDL`。
-    //
-    // `DDL` 在 `upgrade()` **之前**执行，而旧库的 `tarkov_task` 还没有
-    // `name_zh` 那一列 —— 在它上面建索引会直接报 `no such column`，
-    // 而错误信息只有「建表失败」四个字，看不出是哪张表哪一列。
-    //
-    // 这个 bug 测试没抓到：测试都建新库，新库的 `CREATE TABLE` 里本来就有那一列。
-    // 是实跑重启时才炸出来的。
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_tarkov_task_name_zh ON tarkov_task(name_zh);
-         CREATE INDEX IF NOT EXISTS idx_tarkov_task_prereq_pre ON tarkov_task_prereq(prereq_id);
-         CREATE INDEX IF NOT EXISTS idx_tarkov_task_successor_succ
-             ON tarkov_task_successor(successor_id);",
-    )
-    .context("建 tarkov_task 相关索引失败")?;
+    conn.execute_batch(DDL).context("建表失败")?;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [SCHEMA_VERSION.to_string()],
+    )?;
+    tracing::info!(version = SCHEMA_VERSION, "数据库 schema 已初始化");
+    // 只在**首次建库**时播种。之后控制者清空列表不会让默认值复活。
+    crate::resource::seed_defaults(conn)?;
     Ok(())
 }
 
@@ -525,94 +452,25 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// 旧库（v8，`tarkov_task` 还没有 `name_zh`）必须能升上来。
+    /// 版本不符（旧库或更新的库）必须**原地报错**，且不得把新表建进旧库。
     ///
-    /// 这条测试是**事后补的**：真正的 bug 是 `name_zh` 的索引写进了 `DDL`，
-    /// 而 `DDL` 跑在加列之前 —— 旧库上必然 `no such column`，
-    /// 表现却是「建表失败」，整个消息存储被降级掉。
-    /// 测试原先只建新库，所以完全没覆盖到这条路径。
+    /// 「不建表」是这个新规则的一半：如果先执行 `DDL` 再判版本，
+    /// 旧库会被顺手建上一堆形状不一致的新表 —— 报错之后它更没人敢碰了。
     #[test]
-    fn upgrades_a_v8_database_without_name_zh() {
-        let conn = Connection::open_in_memory().unwrap();
-        // 造一个 v8 形状的库：tarkov_task 没有 name_zh。
-        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\nINSERT INTO meta(key, value) VALUES('schema_version', '8');\nCREATE TABLE tarkov_task (\n    id TEXT PRIMARY KEY,\n    normalized_name TEXT NOT NULL,\n    trader TEXT NOT NULL DEFAULT '',\n    min_level INTEGER NOT NULL DEFAULT 0,\n    is_kappa INTEGER NOT NULL DEFAULT 0,\n    is_lightkeeper INTEGER NOT NULL DEFAULT 0,\n    experience INTEGER NOT NULL DEFAULT 0,\n    objectives INTEGER NOT NULL DEFAULT 0,\n    wiki_link TEXT NOT NULL DEFAULT ''\n);").unwrap();
-
-        migrate(&conn).expect("旧库必须能升级");
-        let v: String = conn
-            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+    fn mismatched_version_errors_without_creating_tables() {
+        for v in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta(key, value) VALUES('schema_version', '{v}');"
+            ))
             .unwrap();
-        assert_eq!(v, SCHEMA_VERSION.to_string());
-        // 列真的加上了。
-        conn.execute("INSERT INTO tarkov_task(id, normalized_name, name_zh) VALUES('x','y','彻夜难眠')", [])
-            .expect("新列可用");
-    }
 
-    /// 回归：v11 的塔科夫库必须能升到 v12 —— 这一步要**真的删列**。
-    ///
-    /// 删列比加列危险（`ALTER TABLE DROP COLUMN` 在列被索引时会直接失败），
-    /// 而这条路径只有**旧库**才走得到：新库的 `CREATE TABLE` 里本来就没有那些列，
-    /// 所以「新库一切正常」说明不了任何问题。实跑的 `data/qqbot.db` 正是这么升上来的。
-    #[test]
-    fn upgrades_a_v11_database_and_clears_the_tarkov_cache() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO meta(key, value) VALUES('schema_version', '11');
-            CREATE TABLE tarkov_task (
-                id TEXT PRIMARY KEY, normalized_name TEXT NOT NULL, name_zh TEXT,
-                name_en TEXT, trader TEXT NOT NULL DEFAULT '', trader_name_zh TEXT,
-                trader_image TEXT NOT NULL DEFAULT '', task_image TEXT NOT NULL DEFAULT '',
-                map TEXT NOT NULL DEFAULT '', map_name_zh TEXT,
-                min_level INTEGER NOT NULL DEFAULT 0, is_kappa INTEGER NOT NULL DEFAULT 0,
-                is_lightkeeper INTEGER NOT NULL DEFAULT 0, experience INTEGER NOT NULL DEFAULT 0,
-                wiki_link TEXT NOT NULL DEFAULT '', detail_json TEXT,
-                updated_at INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE tarkov_task_objective (
-                task_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
-                objective_type TEXT NOT NULL DEFAULT '', description_key TEXT NOT NULL DEFAULT '',
-                description_zh TEXT, is_optional INTEGER NOT NULL DEFAULT 0, count INTEGER,
-                is_raid INTEGER NOT NULL DEFAULT 0, detail_json TEXT,
-                PRIMARY KEY (task_id, ordinal)
-            );
-            INSERT INTO tarkov_task(id, normalized_name, detail_json)
-                VALUES('x', 'y', '{"faction":"BEAR"}');
-            INSERT INTO tarkov_task_objective(task_id, ordinal, description_zh, count)
-                VALUES('x', 0, '击杀 Scav', 25);
-            "#,
-        )
-        .unwrap();
-
-        migrate(&conn).expect("v11 必须能升到 v12");
-
-        // 新列与新表到位。
-        assert!(has_column(&conn, "tarkov_task", "faction").unwrap());
-        assert!(has_column(&conn, "tarkov_task", "restartable").unwrap());
-        assert!(has_column(&conn, "tarkov_task_objective", "display_text").unwrap());
-        assert!(has_column(&conn, "tarkov_task_objective", "marks").unwrap());
-        for table in ["tarkov_task_key", "tarkov_task_requirement", "tarkov_task_fail"] {
-            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0))
-                .unwrap_or_else(|err| panic!("{table} 应当存在: {err}"));
+            let err = format!("{:#}", migrate(&conn).unwrap_err());
+            assert!(err.contains("删掉 data/qqbot.db"), "版本 {v} 应提示删库重建: {err}");
+            assert!(!table_exists(&conn, "messages").unwrap(), "版本 {v} 时不该建表");
+            assert!(!table_exists(&conn, "message_attachments").unwrap(), "版本 {v} 时不该建表");
         }
-
-        // 旧列没了 —— 留着就是「两处真相」，早晚有人读错那一处。
-        assert!(
-            !has_column(&conn, "tarkov_task", "detail_json").unwrap(),
-            "tarkov_task.detail_json 该被删掉"
-        );
-        for column in ["description_zh", "is_optional", "count", "is_raid", "detail_json"] {
-            assert!(
-                !has_column(&conn, "tarkov_task_objective", column).unwrap(),
-                "tarkov_task_objective.{column} 该被删掉"
-            );
-        }
-
-        // 缓存清空：正文只能由上游数据重算，库里的旧行救不回来。
-        let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tarkov_task", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(left, 0, "升级时该清空塔科夫缓存，等下一次「更新任务」重建");
     }
 
     #[test]
@@ -626,19 +484,8 @@ mod tests {
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-    }
-
-    #[test]
-    fn rejects_future_schema_version() {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
-        conn.execute(
-            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-            [(SCHEMA_VERSION + 1).to_string()],
-        )
-        .unwrap();
-        let err = migrate(&conn).unwrap_err().to_string();
-        assert!(err.contains("高于本程序支持"), "应拒绝未来版本: {err}");
+        // v13 的新表必须建出来 —— 重复调用不会把它建第二遍（IF NOT EXISTS）。
+        assert!(table_exists(&conn, "message_attachments").unwrap());
     }
 
     /// 回归：损坏的 schema_version 必须报出**真实原因**。

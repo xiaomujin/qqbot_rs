@@ -36,8 +36,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-pub use model::{fmt_unix, now_unix, NewMessage, Scope, MAX_CONTENT_CHARS};
-pub use reader::{MAX_TEXT_CHARS, MAX_TEXT_ROWS};
+pub use model::{fmt_unix, now_unix, NewAttachment, NewMessage, Scope, MAX_CONTENT_CHARS};
+pub use reader::StoredAttachment;
 pub use resource::{
     Ammo, TarkovItem, TarkovObjective, TarkovPrereq, TarkovReward, TarkovSuccessor, TarkovTask,
     TarkovTaskDetail, TarkovTaskFail, TarkovTaskKey,
@@ -162,6 +162,14 @@ impl MessageStore {
         self.writer.record(msg);
     }
 
+    /// flush 屏障：返回表示「**此前**已入队的写入都已提交」，之后的写入不保证。
+    ///
+    /// 给测试与运维工具用（在这之前只能 sleep 猜 `flush_interval`）。
+    /// 消息热路径不用它 —— `record` 仍然是非阻塞的。
+    pub async fn flush(&self) -> Result<()> {
+        self.writer.flush().await
+    }
+
     /// 某会话在时间窗口内的正文（按时间倒序）。
     /// `sender_id` 为 `None` 表示不限发送者；`Some` 只看这个人（「我的词云」）。
     pub async fn recent_texts(
@@ -170,26 +178,24 @@ impl MessageStore {
         target_id: &str,
         sender_id: Option<&str>,
         since: i64,
-        limit: usize,
     ) -> Result<Vec<String>> {
         self.reader
-            .recent_texts(scope.as_str(), target_id, sender_id, since, limit)
+            .recent_texts(scope.as_str(), target_id, sender_id, since)
             .await
     }
 
-    /// 某会话在时间窗口内的**原始事件 JSON**（按时间倒序）。
+    /// 某会话在时间窗口内**最新**的一个附件，没有则 `Ok(None)`。
     ///
-    /// 资源收录靠它找回「上一条带图片的消息」—— 附件不在 `content` 里，
-    /// 只有原文有。
-    pub async fn recent_raw(
+    /// 资源收录靠它找回「上一条带图片的消息」：附件不在 `content` 里，
+    /// 而是落成了 `message_attachments` 的行。
+    pub async fn latest_attachment(
         &self,
         scope: Scope,
         target_id: &str,
         since: i64,
-        limit: usize,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Option<StoredAttachment>> {
         self.reader
-            .recent_raw(scope.as_str(), target_id, since, limit)
+            .latest_attachment(scope.as_str(), target_id, since)
             .await
     }
 

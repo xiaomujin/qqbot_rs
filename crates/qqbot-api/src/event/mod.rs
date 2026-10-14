@@ -9,6 +9,7 @@ pub mod notice;
 
 pub use message::{
     ArkData, MessageAttachment, MessageEvent, MessageScene, MsgElement, User,
+    QUOTED_MESSAGE_TYPE,
 };
 pub use notice::{InteractionCreate, RawNotice};
 

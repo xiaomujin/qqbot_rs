@@ -47,7 +47,7 @@ pub use group::{
     UpdateStrategyRequest, UpdateStrategyResponse, VerifyInfo, VerifyMethod, WhitelistOp,
     WhitelistUsersRequest, WhitelistUsersResponse,
 };
-pub use event::{Event, MessageEvent, RawNotice, User};
+pub use event::{Event, MessageEvent, RawNotice, User, QUOTED_MESSAGE_TYPE};
 pub use intents::Intents;
 pub use message::{
     Button, ButtonAction, InteractionCode, InteractionResponse, Keyboard, KeyboardContent,

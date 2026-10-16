@@ -39,11 +39,14 @@ use rusqlite::Connection;
 /// v12 升级时清空过塔科夫缓存 —— 正文只能由上游数据重算，库里的行救不回来。
 /// 它是上游的副本，系统控制者发一次「更新任务」就重建。
 ///
-/// v13 增加 `message_attachments`：附件落成行，不再靠「把原始 JSON 存进 messages.raw、
-/// 读的时候再解析回来」。附件是查询条件（按会话取最近一条），不是一串待解析的文本。
+/// v13 增加 `message_attachments`（附件落成行）。
+/// v14 **删掉它**：那张表唯一的读者是「收录」的第 3 级回查（回消息库找最近一条带附件的
+/// 消息），而这一级在 v14 被整条移除 —— 收录改为只认「本条消息自带的附件」与
+/// 「被引用消息的附件」。一张没有读者的表就是一处没有测试面的状态，而它正是
+/// 「按 `(created_at, ordinal)` 取最新」那个排序 bug 的栖身之处。
 ///
 /// 从 v13 起**不再迁移旧库**：版本不等一律报错要求删库重建，理由见 `migrate`。
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
@@ -68,33 +71,6 @@ CREATE INDEX IF NOT EXISTS idx_messages_scope_target_time
 -- 保留期清理走 created_at
 CREATE INDEX IF NOT EXISTS idx_messages_created_at
     ON messages(created_at);
-
--- 消息附件。一行 = 一条消息里的一个附件。
---
--- 为什么不继续从 `messages.raw` 里解析：附件是**查询条件**
--- （「这个会话最近一张图是哪张」），而 raw 是一串只能整段取回、再在应用层
--- 反序列化的文本 —— 回查要扫最近几十条原文，还要求解析形状与当时的协议版本一致。
--- 落成行之后，「最近一条带附件的消息」就是一条走索引的 SQL。
-CREATE TABLE IF NOT EXISTS message_attachments (
-    msg_id       TEXT    NOT NULL,
-    -- 同一消息内附件的下标。主键的一部分，保证重复推送时幂等。
-    ordinal      INTEGER NOT NULL,
-    scope        TEXT    NOT NULL CHECK(scope IN ('group','c2c')),
-    target_id    TEXT    NOT NULL,
-    created_at   INTEGER NOT NULL,
-    -- 1 = 来自被引用的消息（msg_elements 里 message_type = 103）。
-    -- 引用图与本条图在「收录」时优先级不同，所以要能区分。
-    quoted       INTEGER NOT NULL DEFAULT 0,
-    url          TEXT    NOT NULL,
-    content_type TEXT,
-    filename     TEXT,
-    size         INTEGER,
-    PRIMARY KEY (msg_id, ordinal)
-);
-
--- 回查「最近一张附件」走 (scope, target_id, created_at DESC)。
-CREATE INDEX IF NOT EXISTS idx_attachments_target_time
-    ON message_attachments(scope, target_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -372,8 +348,12 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5_000i64)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    // 删除大量历史消息后可按需回收空间。必须在建表前设置，否则要 VACUUM 才生效。
-    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    // 刻意不设 `auto_vacuum`。实测（sqlite 3.53.1）：在 `journal_mode=WAL` 之后设它会被
+    // **静默忽略**（`PRAGMA auto_vacuum` 读回 0），而即便设对了，一次
+    // `PRAGMA incremental_vacuum` 也只回收 **1 页** —— 空 1977 页要调 1977 次。
+    // 更要紧的是真实库里 `freelist_count` 恒为 0：保留期删掉的页立刻被新消息复用，
+    // 文件在「一个保留期的高水位」处就稳定了，本来就没有空闲页可回收。
+    // 缩容手段是手动 `VACUUM`（或按 ADR 0001 第 11 条删库重建），不是这个 pragma。
     Ok(())
 }
 
@@ -389,9 +369,10 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 
 /// 建表并写入 schema 版本。三条规则：
 ///
-/// 1. **新库**（连 `meta` 表都没有，或有表但没有版本行）→ 建表 + 写版本 + 播种默认资源；
+/// 1. **新库**（连 `meta` 表都没有）→ 建表 + 写版本 + 播种默认资源，三件事一个事务；
 /// 2. 版本**恰好相等** → 直接用，什么都不做；
-/// 3. 版本**不等**（旧库或更新的库）→ 返回明确错误，**不建表、不迁移**。
+/// 3. 版本**不等**（旧库或更新的库）→ 返回明确错误，**不建表、不迁移**；
+/// 4. `meta` 表在、版本行不在 → 也返回明确错误（见下），**不建表**。
 ///
 /// 第 3 条是 ADR 0001 第 11 条的授权结果：本次重构允许重建数据库，
 /// 所以加表加列只需要改 `DDL` 并提 `SCHEMA_VERSION`，不必再维护跨版本的
@@ -408,6 +389,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     //   (c) 值不是整数   → 数据损坏，必须上报
     // (b)/(c) 若混进 None 分支，会撞上 meta.key 主键约束，报出一条毫无指向性的
     // "UNIQUE constraint failed"，进而让 main 静默把整个持久化降级掉。
+    //
+    // ⚠️ 「`meta` 表在、版本行不在」**不是**新库。它只可能来自手改数据库，或
+    // 「建表成功、写版本行之前进程退出」。当成新库的后果很隐蔽：`CREATE TABLE
+    // IF NOT EXISTS` 修不了已存在表的形状，版本却被写成当前值 —— 库看起来一切正常，
+    // 直到运行期报 `no such column`，而写线程对 SQL 失败只 warn 后丢批
+    // （消息一条不落库，日志里只有一行 warn）。所以这里明确报错。
     let current: Option<i64> = if !table_exists(conn, "meta")? {
         None
     } else {
@@ -420,7 +407,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 v.parse()
                     .with_context(|| format!("meta.schema_version 不是整数: {v:?}"))?,
             ),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                anyhow::bail!(
+                    "数据库里有 meta 表却没有 schema_version 行，无法判断版本。\
+                     删掉 data/qqbot.db 后重启即可重建"
+                );
+            }
             Err(err) => return Err(err).context("读取 schema_version 失败"),
         }
     };
@@ -436,15 +428,20 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         None => {}
     }
 
-    conn.execute_batch(DDL).context("建表失败")?;
-    conn.execute(
+    // 建表、写版本、播种必须在**同一个事务**里。否则「建了表却没写版本行」这个半残
+    // 状态就能由崩溃产生 —— 而它正是上面那条报错要挡住的东西。
+    // 用 `unchecked_transaction`：`migrate` 只拿得到 `&Connection`。
+    let tx = conn.unchecked_transaction().context("开启建库事务失败")?;
+    tx.execute_batch(DDL).context("建表失败")?;
+    tx.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [SCHEMA_VERSION.to_string()],
     )?;
-    tracing::info!(version = SCHEMA_VERSION, "数据库 schema 已初始化");
     // 只在**首次建库**时播种。之后控制者清空列表不会让默认值复活。
-    crate::resource::seed_defaults(conn)?;
+    crate::resource::seed_defaults(&tx)?;
+    tx.commit().context("提交建库事务失败")?;
+    tracing::info!(version = SCHEMA_VERSION, "数据库 schema 已初始化");
     Ok(())
 }
 
@@ -469,14 +466,12 @@ mod tests {
             let err = format!("{:#}", migrate(&conn).unwrap_err());
             assert!(err.contains("删掉 data/qqbot.db"), "版本 {v} 应提示删库重建: {err}");
             assert!(!table_exists(&conn, "messages").unwrap(), "版本 {v} 时不该建表");
-            assert!(!table_exists(&conn, "message_attachments").unwrap(), "版本 {v} 时不该建表");
         }
     }
 
     #[test]
     fn migrate_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL").unwrap();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
@@ -484,8 +479,26 @@ mod tests {
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION.to_string());
-        // v13 的新表必须建出来 —— 重复调用不会把它建第二遍（IF NOT EXISTS）。
-        assert!(table_exists(&conn, "message_attachments").unwrap());
+        // 表必须建出来 —— 重复调用不会把它建第二遍（IF NOT EXISTS）。
+        assert!(table_exists(&conn, "messages").unwrap());
+    }
+
+    /// 回归：「`meta` 表在、版本行不在」**不是**新库。
+    ///
+    /// 当成新库的后果很隐蔽：`CREATE TABLE IF NOT EXISTS` 修不了已存在表的形状，
+    /// 版本却被写成当前值 —— 库看起来一切正常，直到运行期报 `no such column`。
+    #[test]
+    fn meta_without_version_row_is_an_error_not_a_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+
+        let err = format!("{:#}", migrate(&conn).unwrap_err());
+        assert!(err.contains("删掉 data/qqbot.db"), "应提示删库重建，实际: {err}");
+        // 这段文案由多行字面量拼成：丢掉行尾的续行反斜杠会把缩进原样印进报错，
+        // 症状是运维看到句子中间二十来个空格。测试钉住「渲染出来的文案是干净的」。
+        assert!(!err.contains("  "), "报错文案里不该有连续空格（续行反斜杠丢了？）: {err}");
+        assert!(!table_exists(&conn, "messages").unwrap(), "不该把表建进这个库");
     }
 
     /// 回归：损坏的 schema_version 必须报出**真实原因**。

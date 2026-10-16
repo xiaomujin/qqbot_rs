@@ -71,6 +71,17 @@ pub struct MessageAttachment {
     pub asr_refer_text: Option<String>,
 }
 
+impl MessageAttachment {
+    /// 能下载的 url：字段缺失与空串都算「没有」。
+    ///
+    /// 协议允许附件没有 url（实测引用元素里就有 `"url":""`），而空地址必定下载失败。
+    /// 「空 url 不算数」这条规则放在字段旁边，收录路径按需取用 ——
+    /// 返回 `Option<&str>` 而不是 `bool`，是为了让调用方**结构性地**拿不到那个空串。
+    pub fn usable_url(&self) -> Option<&str> {
+        self.url.as_deref().filter(|u| !u.is_empty())
+    }
+}
+
 /// 结构化卡片数据。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ArkData {
@@ -204,22 +215,26 @@ impl MessageEvent {
         text
     }
 
-    /// 第一个附件（常用于取用户发送的图片）。
+    /// 第一个附件。
+    ///
+    /// **只用于日志**（定位「发了图却没被识别」）：它刻意不过滤空 url ——
+    /// 日志要如实反映事件里有什么。要挑「能下载的那张」请用
+    /// [`Self::quoted_attachments`] 那一侧的做法，由调用方过滤。
     pub fn first_attachment(&self) -> Option<&MessageAttachment> {
         self.attachments.first()
     }
 
-    /// **被引用消息**的附件：`msg_elements` 里第一个 `message_type = 103`
-    /// 且带附件的元素的第一项。
+    /// **被引用消息**里的所有附件，按 `msg_elements` 的顺序展开。
     ///
-    /// 与 [`Self::first_attachment`] 是两个不同的来源，优先级也不同：
-    /// 本条消息自带的附件在前，引用消息的在后。协议知识（那个 103）
+    /// 返回迭代器而不是「第一个」：附件允许没有 url（协议如此，且这种附件必定下载
+    /// 失败），调用方要能继续往后找那一张真图 —— 返回 `Option` 会让「第一个恰好
+    /// 没有 url」变成「这张消息没有图」。协议知识（那个 103）
     /// 留在协议类型旁边，插件不必自己解析原文。
-    pub fn quoted_attachment(&self) -> Option<&MessageAttachment> {
+    pub fn quoted_attachments(&self) -> impl Iterator<Item = &MessageAttachment> {
         self.msg_elements
             .iter()
             .filter(|e| e.message_type == Some(QUOTED_MESSAGE_TYPE))
-            .find_map(|e| e.attachments.first())
+            .flat_map(|e| e.attachments.iter())
     }
 }
 
@@ -311,10 +326,10 @@ mod tests {
     /// 实测结构：回复一条带图的消息时，被引用消息的附件在 `msg_elements` 里，
     /// 该元素的 `message_type = 103`，`message_scene.ext` 同时多出 `ref_msg_idx`。
     #[test]
-    fn quoted_attachment_comes_from_the_103_element() {
+    fn quoted_attachments_come_from_the_103_element() {
         let raw = r#"{"id":"M1","content":" 收录 引用图","group_openid":"G1","message_type":103,"message_scene":{"ext":["ref_msg_idx=REFIDX_AAA","msg_idx=REFIDX_BBB","auth_token=T"],"source":"default"},"msg_elements":[{"message_type":103,"content":"1\n2","msg_idx":"REFIDX_AAA","attachments":[{"content":"","content_type":"image/jpeg","filename":"a.jpeg","height":440,"size":47195,"url":"https://example.invalid/quoted.jpeg","width":583}]}]}"#;
         let ev: MessageEvent = serde_json::from_str(raw).unwrap();
-        let att = ev.quoted_attachment().expect("应当从引用消息里取到附件");
+        let att = ev.quoted_attachments().next().expect("应当从引用消息里取到附件");
         assert_eq!(att.url.as_deref(), Some("https://example.invalid/quoted.jpeg"));
         assert_eq!(att.filename.as_deref(), Some("a.jpeg"));
         assert_eq!(att.size, Some(47195));
@@ -324,22 +339,51 @@ mod tests {
     }
 
     #[test]
-    fn quoted_attachment_ignores_other_element_types() {
+    fn quoted_attachments_ignore_other_element_types() {
         // message_type 不是 103 的元素不是「被引用的消息」，不能当成图源。
         let ev: MessageEvent = serde_json::from_str(
             r#"{"id":"M1","msg_elements":[{"message_type":0,"attachments":[{"url":"https://x/a.png"}]}]}"#,
         )
         .unwrap();
-        assert!(ev.quoted_attachment().is_none());
+        assert_eq!(ev.quoted_attachments().count(), 0);
     }
 
     #[test]
-    fn quoted_attachment_is_none_without_attachments() {
+    fn quoted_attachments_is_empty_without_attachments() {
         let ev: MessageEvent = serde_json::from_str(
             r#"{"id":"M1","msg_elements":[{"message_type":103,"content":"纯文本"}]}"#,
         )
         .unwrap();
-        assert!(ev.quoted_attachment().is_none());
+        assert_eq!(ev.quoted_attachments().count(), 0);
+    }
+
+    /// 回归：引用消息里**第一个**附件没有 url 时，迭代器必须能给出第二个。
+    ///
+    /// 收录原来只取「第一个」再在别处过滤空 url，于是这种情况会被当成
+    /// 「这条消息没有图」，转而回查历史消息 —— 拿到上一条消息的图且不报错。
+    #[test]
+    fn quoted_attachments_keep_going_past_an_empty_url() {
+        let ev: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","msg_elements":[{"message_type":103,"attachments":[{"url":""},{"url":"https://example.invalid/real.png"}]}]}"#,
+        )
+        .unwrap();
+        let urls: Vec<_> = ev.quoted_attachments().filter_map(|a| a.url.as_deref()).collect();
+        assert_eq!(urls, vec!["", "https://example.invalid/real.png"]);
+    }
+
+    /// 多个 103 元素（多层引用）按出现顺序展开。
+    #[test]
+    fn quoted_attachments_flatten_every_103_element() {
+        let ev: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","msg_elements":[
+                 {"message_type":103,"attachments":[{"url":"https://x/1.png"}]},
+                 {"message_type":0,"attachments":[{"url":"https://x/ignored.png"}]},
+                 {"message_type":103,"attachments":[{"url":"https://x/2.png"}]}
+               ]}"#,
+        )
+        .unwrap();
+        let urls: Vec<_> = ev.quoted_attachments().filter_map(|a| a.url.as_deref()).collect();
+        assert_eq!(urls, vec!["https://x/1.png", "https://x/2.png"]);
     }
 
     #[test]
@@ -353,8 +397,19 @@ mod tests {
             Some("https://example.invalid/own.png")
         );
         assert_eq!(
-            ev.quoted_attachment().and_then(|a| a.url.as_deref()),
+            ev.quoted_attachments().next().and_then(|a| a.url.as_deref()),
             Some("https://example.invalid/quoted.png")
         );
+    }
+
+    #[test]
+    fn usable_url_rejects_missing_and_empty() {
+        let att = |url: Option<&str>| MessageAttachment {
+            url: url.map(str::to_string),
+            ..MessageAttachment::default()
+        };
+        assert_eq!(att(Some("https://x/a.png")).usable_url(), Some("https://x/a.png"));
+        assert_eq!(att(Some("")).usable_url(), None, "空串必须当成「没有」");
+        assert_eq!(att(None).usable_url(), None);
     }
 }

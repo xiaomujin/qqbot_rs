@@ -102,8 +102,8 @@ impl BaPlugin {
     async fn fetch(&self, name: &str) -> Result<BaResponse, crate::http::FetchError> {
         // 名字要转义：用户可能输入 `&`、空格、日文假名。
         let url = format!("{}{}", self.config.api, urlencode(name));
-        let body = crate::http::fetch_text(&self.http, &url).await?;
-        serde_json::from_str(&body).map_err(crate::http::FetchError::from)
+        // 直接反序列化：解析失败要报「响应内容无法解析」，不能伪装成「下载内容为空」。
+        crate::http::fetch_json(&self.http, &url).await
     }
 
     async fn download(&self, path: &str) -> Result<(String, Vec<u8>), crate::http::FetchError> {

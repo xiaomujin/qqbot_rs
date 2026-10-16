@@ -36,8 +36,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-pub use model::{fmt_unix, now_unix, NewAttachment, NewMessage, Scope, MAX_CONTENT_CHARS};
-pub use reader::StoredAttachment;
+pub use model::{fmt_unix, now_unix, NewMessage, Scope, MAX_CONTENT_CHARS};
 pub use resource::{
     Ammo, TarkovItem, TarkovObjective, TarkovPrereq, TarkovReward, TarkovSuccessor, TarkovTask,
     TarkovTaskDetail, TarkovTaskFail, TarkovTaskKey,
@@ -108,9 +107,17 @@ impl StoreConfig {
 #[derive(Debug, Clone)]
 pub struct StoreStats {
     pub rows: u64,
+    /// 已入队的记录数。
     pub enqueued: u64,
+    /// 已提交入库的记录数。
     pub written: u64,
+    /// **从未入队**的记录数（队列满 / 写线程已退出）。
     pub dropped: u64,
+    /// 已入队、却因 SQL 失败随整批丢掉的行数。
+    ///
+    /// 与 `dropped` 分开：`written + failed_rows == enqueued` 才是那条能一眼看出
+    /// 「写入有没有落库」的不变量。混在一起会让 SQL 失败伪装成队列压力。
+    pub failed_rows: u64,
     pub batches: u64,
     pub retention_days: u64,
 }
@@ -184,21 +191,6 @@ impl MessageStore {
             .await
     }
 
-    /// 某会话在时间窗口内**最新**的一个附件，没有则 `Ok(None)`。
-    ///
-    /// 资源收录靠它找回「上一条带图片的消息」：附件不在 `content` 里，
-    /// 而是落成了 `message_attachments` 的行。
-    pub async fn latest_attachment(
-        &self,
-        scope: Scope,
-        target_id: &str,
-        since: i64,
-    ) -> Result<Option<StoredAttachment>> {
-        self.reader
-            .latest_attachment(scope.as_str(), target_id, since)
-            .await
-    }
-
     /// 删除早于 `cutoff`（Unix 秒）的消息，返回删除行数。
     pub async fn purge_before(&self, cutoff: i64) -> Result<usize> {
         self.reader.purge_before(cutoff).await
@@ -224,6 +216,7 @@ impl MessageStore {
             enqueued: s.enqueued.load(Ordering::Relaxed),
             written: s.written.load(Ordering::Relaxed),
             dropped: s.dropped.load(Ordering::Relaxed),
+            failed_rows: s.failed_rows.load(Ordering::Relaxed),
             batches: s.batches.load(Ordering::Relaxed),
             retention_days: self.cfg.retention_days(),
         })

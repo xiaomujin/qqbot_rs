@@ -1,7 +1,7 @@
 //! 存储层集成测试。
 //!
 //! 这里验证的是**行为契约**，不是实现细节：
-//! 幂等、隔离、保留期边界、附件落行、以及「写入永不阻塞调用方」。
+//! 幂等、隔离、保留期边界、屏障语义、以及「写入永不阻塞调用方」。
 //!
 //! 需要看到写入的断言一律先 `store.flush()`，**不 sleep 猜写线程什么时候提交** ——
 //! 猜短了会假失败，猜长了白等。
@@ -9,9 +9,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use qqbot_store::{
-    now_unix, MessageStore, NewAttachment, NewMessage, Scope, StoreConfig, DAY_SECS,
-};
+use qqbot_store::{now_unix, MessageStore, NewMessage, Scope, StoreConfig, DAY_SECS};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -53,24 +51,8 @@ fn msg(id: &str, scope: Scope, target: &str, content: &str, ts: i64) -> NewMessa
         },
         content: content.into(),
         raw: None,
-        attachments: Vec::new(),
         created_at: ts,
     }
-}
-
-/// 给消息挂上附件。数组下标就是入库后的 `ordinal`。
-fn with_attachments(mut m: NewMessage, urls: &[&str]) -> NewMessage {
-    m.attachments = urls
-        .iter()
-        .map(|url| NewAttachment {
-            quoted: false,
-            url: (*url).to_string(),
-            content_type: Some("image/png".to_string()),
-            filename: None,
-            size: Some(16),
-        })
-        .collect();
-    m
 }
 
 #[tokio::test]
@@ -299,135 +281,74 @@ async fn sweeper_task_runs_and_purges_expired_rows() {
     assert_eq!(texts, vec!["刚刚"]);
 }
 
-/// 附件落成行：`ordinal` 按 Vec 下标，同一条消息重推不产生重复行。
-///
-/// 直接读表而不是走公开 API：公开面只暴露「最新一条附件」，
-/// 看不到 `ordinal`，也看不出有没有重复行 —— 而这两点正是本测试要守的东西。
-/// `messages.raw` 也顺便在这里确认仍然在写（它还有别的用途）。
+/// 原始事件 JSON 仍然入库（将来要重新提取未声明的字段只能靠它）。
 #[tokio::test]
-async fn attachments_keep_their_order_and_reinsert_is_idempotent() {
+async fn raw_event_json_is_still_stored() {
     let path = temp_db();
     let store = MessageStore::open(cfg(path.clone())).unwrap();
 
-    let mut m = with_attachments(
-        msg("M_ATT", Scope::Group, "G1", "两张图", 1000),
-        &["https://example.invalid/1.png", "https://example.invalid/2.png"],
-    );
-    m.raw = Some(r#"{"id":"M_ATT"}"#.to_string());
-    store.record(m.clone());
-    // QQ 会重推同一条消息 —— 附件行也必须幂等。
+    let mut m = msg("M_RAW", Scope::Group, "G1", "带原文", 1000);
+    m.raw = Some(r#"{"id":"M_RAW"}"#.to_string());
     store.record(m);
     store.flush().await.unwrap();
 
     let conn = rusqlite::Connection::open(&path).unwrap();
-    let mut stmt = conn
-        .prepare("SELECT ordinal, url FROM message_attachments WHERE msg_id = 'M_ATT' ORDER BY ordinal")
-        .unwrap();
-    let rows: Vec<(i64, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    assert_eq!(
-        rows,
-        vec![
-            (0, "https://example.invalid/1.png".to_string()),
-            (1, "https://example.invalid/2.png".to_string()),
-        ],
-        "ordinal 必须按 Vec 下标写，且重推不产生重复行"
-    );
-
     let raw: Option<String> = conn
-        .query_row("SELECT raw FROM messages WHERE id = 'M_ATT'", [], |r| r.get(0))
+        .query_row("SELECT raw FROM messages WHERE id = 'M_RAW'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(raw.as_deref(), Some(r#"{"id":"M_ATT"}"#), "原始事件 JSON 仍然要入库");
-
-    // 同一条消息内，`ordinal` 大的更「新」。
-    let latest = store.latest_attachment(Scope::Group, "G1", 0).await.unwrap().unwrap();
-    assert_eq!(latest.url, "https://example.invalid/2.png");
+    assert_eq!(raw.as_deref(), Some(r#"{"id":"M_RAW"}"#));
 }
 
-/// `latest_attachment` 取的是**最新**那条、不跨会话、且遵守时间窗。
-#[tokio::test]
-async fn latest_attachment_is_newest_and_scoped() {
-    let store = MessageStore::open(cfg(temp_db())).unwrap();
-    let now = 1_800_000_000i64;
-
-    store.record(with_attachments(
-        msg("A_OLD", Scope::Group, "G1", "", now - 1000),
-        &["https://example.invalid/old.png"],
-    ));
-    store.record(with_attachments(
-        msg("A_NEW", Scope::Group, "G1", "", now),
-        &["https://example.invalid/new.png"],
-    ));
-    store.record(with_attachments(
-        msg("A_OTHER", Scope::Group, "G2", "", now),
-        &["https://example.invalid/other.png"],
-    ));
-    store.record(with_attachments(
-        msg("A_C2C", Scope::C2c, "G1", "", now),
-        &["https://example.invalid/c2c.png"],
-    ));
-    // 没有附件的消息不该影响结果。
-    store.record(msg("A_PLAIN", Scope::Group, "G1", "纯文本", now + 1));
-    store.flush().await.unwrap();
-
-    let latest = store.latest_attachment(Scope::Group, "G1", 0).await.unwrap().expect("应当有附件");
-    assert_eq!(latest.url, "https://example.invalid/new.png", "取最新的那条");
-    assert_eq!(latest.content_type.as_deref(), Some("image/png"));
-    assert_eq!(latest.size, Some(16));
-    assert!(!latest.quoted);
-    assert_eq!(latest.created_at, now);
-
-    // 会话与场景都要隔离，否则会捞到别的群的图。
-    assert_eq!(
-        store.latest_attachment(Scope::Group, "G2", 0).await.unwrap().unwrap().url,
-        "https://example.invalid/other.png"
-    );
-    assert_eq!(
-        store.latest_attachment(Scope::C2c, "G1", 0).await.unwrap().unwrap().url,
-        "https://example.invalid/c2c.png"
-    );
-
-    // 时间窗：把窗口外的旧图挡在外面。
-    assert_eq!(
-        store.latest_attachment(Scope::Group, "G1", now).await.unwrap().unwrap().url,
-        "https://example.invalid/new.png"
-    );
-    assert!(
-        store.latest_attachment(Scope::Group, "G1", now + 1).await.unwrap().is_none(),
-        "窗口内没有附件时应当是 None，而不是退回更早那条"
-    );
-}
-
-/// 保留期清理必须连**附件行**一起删。
+/// 回归：写线程丢批时 `flush()` 必须返回 `Err`，不能回一句 `Ok(())`。
 ///
-/// 附件表是自己的 `created_at`，按同一个 cutoff 直接删即可。漏掉这一步的话，
-/// 消息删了、附件行却永远留着 —— 保留期只对一半数据生效，库只增不减。
+/// 修复前它无条件回成功，于是「本批最多 512 条已丢弃」只留下一条 warn 日志，
+/// 而屏障的调用方以为「此前入队的都已提交」。
 #[tokio::test]
-async fn purge_removes_attachment_rows_too() {
+async fn flush_reports_a_failed_batch_instead_of_claiming_success() {
+    let path = temp_db();
+    // 故意把间隔拉长：让写线程**只**在屏障到来时提交，否则它可能抢先把这批刷掉，
+    // 屏障看到的缓冲区就是空的（那时无错可报，测试会偶发失败）。
+    let store = MessageStore::open(StoreConfig {
+        flush_interval: Duration::from_secs(30),
+        ..cfg(path.clone())
+    })
+    .unwrap();
+
+    // 让写入必然失败：把 messages 换成形状不兼容的同名表。
+    // 保留一张表（而不是 DROP 掉）是为了让 `stats()` 里的 count 仍然能跑。
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE messages; CREATE TABLE messages (wrong TEXT);").unwrap();
+    }
+
+    store.record(msg("M1", Scope::Group, "G", "写不进去", 1000));
+    let err = store.flush().await.expect_err("写失败必须报错");
+    assert!(format!("{err:#}").contains("存储写入失败"), "{err:#}");
+
+    let stats = store.stats().await.unwrap();
+    assert_eq!(stats.failed_rows, 1, "失败的行数要单独计数: {stats:?}");
+    assert_eq!(stats.written, 0, "{stats:?}");
+    assert_eq!(stats.dropped, 0, "SQL 失败不是「未入队」: {stats:?}");
+}
+
+/// 保留期清理的边界：严格早于 cutoff 的删掉，正好等于 cutoff 的留着。
+#[tokio::test]
+async fn purge_keeps_the_boundary_row() {
     let path = temp_db();
     let store = MessageStore::open(cfg(path.clone())).unwrap();
     let now = 1_800_000_000i64;
     let cutoff = now - 365 * DAY_SECS as i64;
 
-    store.record(with_attachments(
-        msg("A_OLD", Scope::Group, "G", "", cutoff - 1),
-        &["https://example.invalid/old.png"],
-    ));
-    store.record(with_attachments(
-        msg("A_EDGE", Scope::Group, "G", "", cutoff),
-        &["https://example.invalid/edge.png"],
-    ));
+    store.record(msg("A_OLD", Scope::Group, "G", "过期", cutoff - 1));
+    store.record(msg("A_EDGE", Scope::Group, "G", "边界", cutoff));
     store.flush().await.unwrap();
 
     assert_eq!(store.purge_before(cutoff).await.unwrap(), 1, "只有严格早于 cutoff 的消息被删");
 
     let conn = rusqlite::Connection::open(&path).unwrap();
-    let mut stmt = conn.prepare("SELECT msg_id FROM message_attachments ORDER BY msg_id").unwrap();
+    let mut stmt = conn.prepare("SELECT id FROM messages ORDER BY id").unwrap();
     let left: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
-    assert_eq!(left, vec!["A_EDGE"], "边界上的附件要留着，过期的那条要跟着消息一起删");
+    assert_eq!(left, vec!["A_EDGE"], "边界上的那条要留着");
 }
 
 /// 「我的词云」靠发送者过滤：同一会话里只取某个人说的话。

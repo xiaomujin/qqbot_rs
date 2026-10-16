@@ -133,7 +133,11 @@ fn parse_token_response(status: u16, body: &str) -> Result<TokenGrant, ApiError>
         .to_string();
 
     // 官方返回示例中 expires_in 是字符串 "7200"，这里同时兼容数字。
-    let expires_in = v.get("expires_in").and_then(parse_secs).unwrap_or(7200);
+    // `0` 当成「没给」：它会算出 lifetime = 0 → refresh_at = now →
+    // `usable_at` 永远为假 → **每次调用都重取 token**，而重取持有刷新互斥锁，
+    // 并发调用因此退化成串行。只夹上界挡不住这个 —— 它是下界问题。
+    let expires_in =
+        v.get("expires_in").and_then(parse_secs).filter(|secs| *secs > 0).unwrap_or(7200);
 
     // 服务端数值不可信：夹住上界防溢出；余量不得超过寿命的一半，
     // 否则会出现「刚刷新完就判定过期」的空刷循环（线上日志见过 expires_in=271/214）。
@@ -1083,6 +1087,16 @@ mod tests {
         // 上界夹住，防 `Instant + Duration` 溢出
         let g = parse_token_response(200, &grant_body("T", serde_json::json!(u64::MAX))).unwrap();
         assert_eq!(g.lifetime, MAX_TOKEN_LIFETIME);
+    }
+
+    /// 回归：`expires_in = 0` 必须当成「没给」，回落默认寿命。
+    ///
+    /// 修复前它算出 lifetime = 0 → `refresh_at == now` → `usable_at` 恒为假 →
+    /// 每次调用都重取 token，而重取持锁，并发调用退化成串行。
+    #[test]
+    fn zero_expires_in_falls_back_to_the_default_lifetime() {
+        let g = parse_token_response(200, &grant_body("T", serde_json::json!(0))).unwrap();
+        assert_eq!(g.lifetime, Duration::from_secs(7200));
     }
 
     #[test]

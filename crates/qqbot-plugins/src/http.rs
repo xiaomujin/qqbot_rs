@@ -50,6 +50,9 @@ pub enum FetchError {
     #[error("下载内容为空")]
     Empty,
     /// 下载内容超过调用方给的 limit。
+    ///
+    /// `size` 是「已读到的字节数」**或**上游声明的 `Content-Length` —— 声明长度超限时
+    /// 一个字节都不读就报错，所以它可能大于实际收到的内容。
     #[error("下载内容过大：{size} 字节，上限 {limit} 字节")]
     TooLarge { size: usize, limit: usize },
     /// 响应读到了、但反序列化失败。
@@ -70,11 +73,25 @@ pub fn build_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder().timeout(TIMEOUT).user_agent(USER_AGENT).build()
 }
 
+/// 发送请求，**只把传输失败**归一成 [`FetchError::Request`]，不看状态码。
+///
+/// 给「状态码不重要、只要响应头」的调用点用：`delta` 的握手预热只为了拿
+/// `Set-Cookie`，而站点在 403 / 302 上照样会下发会话标记 —— 状态码闸门会把整段
+/// 握手掐掉，反而更脆。要按状态码判成败的调用点用 [`send`]。
+///
+/// # Errors
+///
+/// - [`FetchError::Request`]：请求没发出去或中途失败。
+pub async fn send_raw(req: reqwest::RequestBuilder) -> Result<reqwest::Response, FetchError> {
+    req.send().await.map_err(FetchError::Request)
+}
+
 /// 发送请求，并把「传输失败」与「非 2xx」归一成 [`FetchError`]。
 ///
-/// 需要原始 [`reqwest::Response`] 的两个调用点走这里：`delta` 要读 `Set-Cookie`
-/// 维护会话，`bili::resolve_short` 要拿重定向后的 `res.url()`。其余调用点用
-/// [`fetch_text`] / [`fetch_json`] / [`fetch_bytes`]。
+/// 需要原始 [`reqwest::Response`] 且**要按状态码判成败**的调用点走这里：
+/// `bili::resolve_short` 要拿重定向后的 `res.url()`。其余调用点用
+/// [`fetch_text`] / [`fetch_json`] / [`fetch_bytes`]；
+/// 只要响应头、不在意状态码的用 [`send_raw`]。
 ///
 /// # Errors
 ///
@@ -82,7 +99,7 @@ pub fn build_client() -> Result<reqwest::Client, reqwest::Error> {
 /// - [`FetchError::Status`]：上游返回非 2xx（3xx 也算 —— client 默认跟重定向，
 ///   只有跟不动或超过上限时才会以 3xx 出现在这里）。
 pub async fn send(req: reqwest::RequestBuilder) -> Result<reqwest::Response, FetchError> {
-    let res = req.send().await.map_err(FetchError::Request)?;
+    let res = send_raw(req).await?;
     let status = res.status();
     if !status.is_success() {
         return Err(FetchError::Status(status.as_u16()));
@@ -128,15 +145,33 @@ pub async fn fetch_bytes(
     url: &str,
     limit: usize,
 ) -> Result<Vec<u8>, FetchError> {
-    let res = send(client.get(url)).await?;
-    let bytes = res.bytes().await.map_err(FetchError::Body)?;
-    if bytes.is_empty() {
+    let mut res = send(client.get(url)).await?;
+
+    // 先看**声明**的长度：上游声明 500 MB 时，下面那条流式累计要读满 limit 才报错，
+    // 而这里一个字节都不读。gzip 时这里是压缩后的长度，所以它只是提前退出，
+    // 真正的判定仍然靠下面的累计 —— 两者都要。
+    if let Some(len) = res.content_length()
+        && len > limit as u64
+    {
+        return Err(FetchError::TooLarge { size: usize::try_from(len).unwrap_or(usize::MAX), limit });
+    }
+
+    // 边读边数，而不是把整个响应体先吃进内存再判上限 ——
+    // 后者对「声明长度不实」的上游毫无防御，几百 MB 会直接进内存。
+    let mut buf: Vec<u8> = Vec::with_capacity(
+        usize::try_from(res.content_length().unwrap_or(0).min(limit as u64)).unwrap_or(0),
+    );
+    while let Some(chunk) = res.chunk().await.map_err(FetchError::Body)? {
+        let size = buf.len() + chunk.len();
+        if size > limit {
+            return Err(FetchError::TooLarge { size, limit });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    if buf.is_empty() {
         return Err(FetchError::Empty);
     }
-    if bytes.len() > limit {
-        return Err(FetchError::TooLarge { size: bytes.len(), limit });
-    }
-    Ok(bytes.to_vec())
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -263,6 +298,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declared_length_over_limit_fails_before_reading_the_body() {
+        // 只发响应头、不发正文，然后立刻关掉连接。
+        // 「先读完再判上限」的实现会在这里报 Body（正文不完整）；
+        // 提前看 Content-Length 才是 TooLarge —— 这正是本测试要固定住的差别。
+        let (url, handle) = one_shot(|_| {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 999999\r\n\r\n".to_vec()
+        })
+        .await;
+        let err = fetch_bytes(&client(), &url, 32).await.expect_err("声明超限必须报错");
+        match err {
+            FetchError::TooLarge { size, limit } => assert_eq!((size, limit), (999999, 32)),
+            other => panic!("应当是 TooLarge，实际 {other:?}"),
+        }
+        handle.await.expect("mock 服务器任务不应 panic");
+    }
+
+    #[tokio::test]
     async fn text_body_comes_back_verbatim() {
         let (url, handle) = serve("200 OK", "更新于 2026-09-29").await;
         let body = fetch_text(&client(), &url).await.expect("应当读到正文");
@@ -323,6 +375,25 @@ mod tests {
             .unwrap_or_default();
         assert!(cookie.starts_with("PHPSESSID=abc"), "{cookie}");
         assert_eq!(res.text().await.expect("读正文"), "ok");
+        handle.await.expect("mock 服务器任务不应 panic");
+    }
+
+    #[tokio::test]
+    async fn send_raw_keeps_a_non_success_response() {
+        // delta 的握手预热只为了拿 Set-Cookie：站点在 403 上照样下发会话标记，
+        // 所以这一步不能被状态码闸门掐掉（这正是改造中一度丢掉的语义）。
+        let (url, handle) = one_shot(|_| {
+            response("403 Forbidden", &[("Set-Cookie", "PHPSESSID=xyz; Path=/")], "denied")
+        })
+        .await;
+        let res = send_raw(client().get(&url)).await.expect("403 也必须拿到响应");
+        assert_eq!(res.status().as_u16(), 403);
+        let cookie = res
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(cookie.starts_with("PHPSESSID=xyz"), "{cookie}");
         handle.await.expect("mock 服务器任务不应 panic");
     }
 

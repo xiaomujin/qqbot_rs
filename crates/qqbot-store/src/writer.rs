@@ -5,7 +5,8 @@
 //! 真正的 SQLite 事务提交全部发生在独立的 OS 线程上。
 //!
 //! 需要「确定的时刻」时用 `flush()`：它是走**同一条队列**的屏障，
-//! 返回即表示此前入队的记录都已提交。热路径不用它。
+//! 返回即表示此前入队的记录都已提交；**提交失败会把错误带回来**，
+//! 不会用一句 `Ok` 掩盖「这一批已经丢了」。热路径不用它。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -23,11 +24,6 @@ const INSERT_SQL: &str = "INSERT OR IGNORE INTO messages
     (id, scope, target_id, sender_id, sender_name, event_name, content, raw, created_at)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 
-/// 附件行。主键 (msg_id, ordinal) → 同一条消息重复推送（重推是常态）天然幂等。
-const INSERT_ATTACHMENT_SQL: &str = "INSERT OR IGNORE INTO message_attachments
-    (msg_id, ordinal, scope, target_id, created_at, quoted, url, content_type, filename, size)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
-
 /// flush 屏障的总超时。
 ///
 /// 写线程正常情况下毫秒级就能确认；超过它说明写线程卡死了（例如 SQLite 被
@@ -42,7 +38,11 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 enum WriteMsg {
     Record(NewMessage),
     /// 收到它的写线程先把已攒的记录提交，再通过 oneshot 应答。
-    Flush(oneshot::Sender<()>),
+    ///
+    /// 应答里带 `Result`：提交失败时**必须**让调用方知道。原来固定回 `Ok(())`，
+    /// 于是一次 SQL 失败（本批最多 512 条）只留下一条 warn 日志，
+    /// 而 `flush()` 的调用方以为「此前入队的都已提交」。
+    Flush(oneshot::Sender<Result<(), String>>),
 }
 
 /// 写入侧计数器，用于观测丢弃率。
@@ -50,7 +50,14 @@ enum WriteMsg {
 pub struct WriteStats {
     pub enqueued: AtomicU64,
     pub written: AtomicU64,
+    /// **从未入队**的记录数（队列满 / 写线程已退出）。与 `failed_rows` 是两回事。
     pub dropped: AtomicU64,
+    /// 已入队、却因 SQL 失败随整批丢掉的**行数**。
+    ///
+    /// 单独计数而不是并进 `dropped`：并进去的话，同一个批次既算进 `enqueued`
+    /// 又算进 `dropped`，`enqueued + dropped == 总条数` 这条不变量在真出 SQL 错误时
+    /// 就会以「计数不准」的面目失败，把「写入根本没落库」这个真因盖掉。
+    pub failed_rows: AtomicU64,
     pub batches: AtomicU64,
 }
 
@@ -105,8 +112,11 @@ impl WriteHandle {
     ///
     /// 这里刻意不阻塞：本函数是 `async`，可能跑在 runtime 的 worker 线程上，
     /// 而 `SyncSender::send` 是同步阻塞调用 —— 写线程正忙时它会把 worker
-    /// 整个卡住。所以队列满时用 `try_send` + `yield_now()` 重试：
+    /// 整个卡住。所以队列满时用 `try_send` 重试，每次让出 1ms：
     /// 只要写线程还在消费，队列迟早会腾出位置。
+    ///
+    /// 让出 1ms 而不是 `yield_now()`：写线程是**独立 OS 线程**，`yield_now` 只是把
+    /// 当前任务放回 runtime 队列，队列持续满载时它会变成跑满整个超时的忙等。
     pub async fn flush(&self) -> Result<()> {
         let (ack, rx) = oneshot::channel();
         let mut pending = WriteMsg::Flush(ack);
@@ -120,8 +130,8 @@ impl WriteHandle {
                     if Instant::now() >= deadline {
                         anyhow::bail!("存储写队列持续满载，flush 未能在 {FLUSH_TIMEOUT:?} 内入队");
                     }
-                    // 让出当前任务：写线程是独立 OS 线程，这里空转没有意义。
-                    tokio::task::yield_now().await;
+                    // 真的睡一小会儿：写线程是独立 OS 线程，空转让不出任何东西给它。
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     anyhow::bail!("存储写线程已退出，无法 flush");
@@ -131,7 +141,9 @@ impl WriteHandle {
 
         let left = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(left, rx).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(Ok(()))) => Ok(()),
+            // 写线程明确报告「这一批没进去」—— 屏障不能假装成功。
+            Ok(Ok(Err(err))) => anyhow::bail!("存储写入失败：{err}"),
             // oneshot 发送端被丢弃：写线程在提交之前退出了。
             Ok(Err(_)) => anyhow::bail!("存储写线程在确认 flush 之前退出"),
             Err(_) => anyhow::bail!("等待存储写线程 flush 超时（{FLUSH_TIMEOUT:?}）"),
@@ -159,8 +171,12 @@ fn writer_loop(
 
     loop {
         // 到期就提交。放在循环开头统一处理，超时分支因此无需重复逻辑。
+        //
+        // 定时路径刻意丢掉 flush 的返回值：这里**没有**调用方可以告知，
+        // 而失败已经由 flush 自己 warn + 计数（failed_rows）。
+        // 有调用方的那条路径是下面的屏障分支，它必须把错误传出去。
         if !buf.is_empty() && Instant::now() >= deadline {
-            flush(&mut conn, &mut buf, &stats);
+            let _ = flush(&mut conn, &mut buf, &stats);
             deadline = Instant::now() + flush_interval;
         }
 
@@ -173,7 +189,8 @@ fn writer_loop(
                 }
                 buf.push(msg);
                 if buf.len() >= flush_batch {
-                    flush(&mut conn, &mut buf, &stats);
+                    // 同定时路径：攒满就提交，失败已由 flush 自己记录，无人可告知。
+                    let _ = flush(&mut conn, &mut buf, &stats);
                     deadline = Instant::now() + flush_interval;
                 }
             }
@@ -181,17 +198,20 @@ fn writer_loop(
                 // 屏障：**先提交再应答**。反过来的话，调用方在收到 ack 之后
                 // 立刻查库会查不到自己刚写的东西 —— 屏障就没意义了。
                 // 通道是 FIFO，所以此刻缓冲区里已经包含所有先于它入队的记录。
-                if !buf.is_empty() {
-                    flush(&mut conn, &mut buf, &stats);
+                let outcome = if buf.is_empty() {
+                    Ok(())
+                } else {
+                    let outcome = flush(&mut conn, &mut buf, &stats);
                     deadline = Instant::now() + flush_interval;
-                }
+                    outcome
+                };
                 // 调用方可能已经超时放弃（接收端被 drop）—— 不是错误。
-                let _ = ack.send(());
+                let _ = ack.send(outcome);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 if !buf.is_empty() {
-                    flush(&mut conn, &mut buf, &stats);
+                    let _ = flush(&mut conn, &mut buf, &stats);
                 }
                 tracing::info!("消息存储写线程退出");
                 return;
@@ -200,7 +220,12 @@ fn writer_loop(
     }
 }
 
-fn flush(conn: &mut Connection, buf: &mut Vec<NewMessage>, stats: &WriteStats) {
+/// 提交一批。返回 `Err` 时**整批都已丢弃**，调用方（屏障）必须把这件事传出去。
+fn flush(
+    conn: &mut Connection,
+    buf: &mut Vec<NewMessage>,
+    stats: &WriteStats,
+) -> Result<(), String> {
     let started = Instant::now();
     let rows = buf.len();
 
@@ -208,7 +233,6 @@ fn flush(conn: &mut Connection, buf: &mut Vec<NewMessage>, stats: &WriteStats) {
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(INSERT_SQL)?;
-            let mut att_stmt = tx.prepare_cached(INSERT_ATTACHMENT_SQL)?;
             for m in buf.iter() {
                 stmt.execute(rusqlite::params![
                     m.id,
@@ -221,31 +245,12 @@ fn flush(conn: &mut Connection, buf: &mut Vec<NewMessage>, stats: &WriteStats) {
                     m.raw,
                     m.created_at,
                 ])?;
-                // 附件与消息在**同一个事务**里。分成两个事务的话，
-                // 中间那一刻库里的消息是没有附件的，而「最近一张图」
-                // 恰恰是按附件行找的 —— 回查会漏掉刚发的那张。
-                for (ordinal, att) in m.attachments.iter().enumerate() {
-                    att_stmt.execute(rusqlite::params![
-                        m.id,
-                        ordinal as i64,
-                        m.scope.as_str(),
-                        m.target_id,
-                        m.created_at,
-                        att.quoted,
-                        att.url,
-                        att.content_type,
-                        att.filename,
-                        // size 是 u64 而 SQLite 只有 i64：超范围就存 NULL，
-                        // 而不是回绕成一个负数让上限检查失效。
-                        att.size.and_then(|s| i64::try_from(s).ok()),
-                    ])?;
-                }
             }
         }
         tx.commit()
     })();
 
-    match result {
+    let outcome = match result {
         Ok(()) => {
             stats.written.fetch_add(rows as u64, Ordering::Relaxed);
             stats.batches.fetch_add(1, Ordering::Relaxed);
@@ -253,13 +258,18 @@ fn flush(conn: &mut Connection, buf: &mut Vec<NewMessage>, stats: &WriteStats) {
             metrics::histogram!("qqbot_store_flush_seconds")
                 .record(started.elapsed().as_secs_f64());
             tracing::debug!(rows, elapsed_ms = started.elapsed().as_millis() as u64, "消息已入库");
+            Ok(())
         }
         Err(err) => {
-            // 写失败不 panic：丢一批总比整个机器人挂掉好。
-            tracing::warn!(rows, error = %err, "消息批量入库失败，本批丢弃");
-            metrics::counter!("qqbot_store_write_dropped_total", "reason" => "sql_error")
+            // 写失败不 panic：丢一批总比整个机器人挂掉好。但**要报出去** ——
+            // 热路径的 record 没有回调可报，屏障有。
+            stats.failed_rows.fetch_add(rows as u64, Ordering::Relaxed);
+            metrics::counter!("qqbot_store_write_failed_total", "reason" => "sql_error")
                 .increment(rows as u64);
+            tracing::warn!(rows, error = %err, "消息批量入库失败，本批丢弃");
+            Err(format!("{err}"))
         }
-    }
+    };
     buf.clear();
+    outcome
 }

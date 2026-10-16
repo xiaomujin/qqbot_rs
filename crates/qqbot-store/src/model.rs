@@ -41,26 +41,8 @@ pub struct NewMessage {
     pub content: String,
     /// 原始事件 JSON。`None` 表示调用方没提供（例如老数据或测试）。
     pub raw: Option<String>,
-    /// 本条消息携带的附件，按出现顺序。入库时连同消息写进同一事务。
-    pub attachments: Vec<NewAttachment>,
     /// Unix 秒。
     pub created_at: i64,
-}
-
-/// 一条待入库的附件。
-///
-/// 单独落表而不是塞进 `raw`：附件是**查询条件**（「这个会话最近一张图是哪张」），
-/// 存成原文就只能整段取回再在应用层反序列化。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewAttachment {
-    /// `true` = 来自**被引用的消息**（`msg_elements` 里 `message_type = 103`）。
-    /// 收录时它排在「本条消息自带的附件」之后。
-    pub quoted: bool,
-    /// 附件地址。调用方应保证非空 —— 空地址必定上传失败，不该入库。
-    pub url: String,
-    pub content_type: Option<String>,
-    pub filename: Option<String>,
-    pub size: Option<u64>,
 }
 
 impl NewMessage {
@@ -105,7 +87,6 @@ mod tests {
             event_name: "GROUP_MESSAGE_CREATE".into(),
             content: content.into(),
             raw: None,
-            attachments: Vec::new(),
             created_at: 0,
         }
     }

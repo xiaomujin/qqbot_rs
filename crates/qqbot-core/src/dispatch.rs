@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use futures_util::FutureExt;
 use moka::sync::Cache;
 use qqbot_api::{Event, InteractionResponse};
-use qqbot_store::{now_unix, NewAttachment, NewMessage, Scope};
+use qqbot_store::{now_unix, NewMessage, Scope};
 use tokio::sync::Semaphore;
 
 use crate::ctx::{Ctx, Services};
@@ -143,9 +143,9 @@ impl Dispatcher {
                 content: message.trimmed().to_string(),
                 // 原文一并入库：类型里只声明了文档写到的字段，没声明的会在
                 // 反序列化时丢掉 —— 留一份原文，将来才能重新提取。
-                // 附件已经单独落表（见下面的 `collect_attachments`），不再依赖它。
+                // 附件就在这份原文里：v14 删掉了 `message_attachments` 表，
+                // 收录不再回查历史消息（见 ADR 0002 的修订小节）。
                 raw: message.raw.clone(),
-                attachments: collect_attachments(&message),
                 created_at: event_unix(&message),
             });
         }
@@ -157,6 +157,8 @@ impl Dispatcher {
         // 用 INFO：这是运维判断「事件到底有没有送达」的唯一依据。
         // 正文截断，避免把整篇消息灌进日志；但**附件地址与元素个数不截断** ——
         // 「发了图却没被识别」这类问题只能靠它们定位。
+        // 两个来源都要打：v14 之后「回复一张图 + 收录」走的是 `msg_elements` 那条路，
+        // 只打本条消息的附件会让日志显示成「没收到图」，而那正是要排查的场景。
         // 完整原始载荷见 `qqbot_api::event` 的 DEBUG 日志。
         tracing::info!(
             event = name,
@@ -167,6 +169,13 @@ impl Dispatcher {
             attachment_url = %ctx
                 .message
                 .first_attachment()
+                .and_then(|a| a.url.as_deref())
+                .unwrap_or("-"),
+            quoted = ctx.message.quoted_attachments().count(),
+            quoted_url = %ctx
+                .message
+                .quoted_attachments()
+                .next()
                 .and_then(|a| a.url.as_deref())
                 .unwrap_or("-"),
             elements = ctx.message.msg_elements.len(),
@@ -264,37 +273,6 @@ async fn handle_interaction(
             );
         }
     }
-}
-
-/// 把一条消息里的附件摊平成待入库的行。
-///
-/// 顺序固定为「**本条在前、引用在后**」：附件表按 `(created_at, ordinal)` 取最新，
-/// 而收录也要求本条消息自带的附件优先 —— 两处顺序必须一致，
-/// 否则「回复一张图、同时自己又发了一张」时会收录到另一张。
-///
-/// 没有 `url` 或 `url` 为空的行直接丢掉：空地址必定下载失败，
-/// 而它会占住「最新一条附件」的位置，让回查拿不到更早那张真正的图。
-fn collect_attachments(message: &qqbot_api::MessageEvent) -> Vec<NewAttachment> {
-    let own = message.attachments.iter().map(|a| (false, a));
-    let quoted = message
-        .msg_elements
-        .iter()
-        .filter(|e| e.message_type == Some(qqbot_api::QUOTED_MESSAGE_TYPE))
-        .flat_map(|e| e.attachments.iter())
-        .map(|a| (true, a));
-
-    own.chain(quoted)
-        .filter_map(|(quoted, att)| {
-            let url = att.url.as_deref().filter(|u| !u.is_empty())?;
-            Some(NewAttachment {
-                quoted,
-                url: url.to_string(),
-                content_type: att.content_type.clone(),
-                filename: att.filename.clone(),
-                size: att.size,
-            })
-        })
-        .collect()
 }
 
 /// 事件时间戳转 Unix 秒。

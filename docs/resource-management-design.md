@@ -229,10 +229,13 @@ fn lookup(&self, group: Option<&str>, keyword: &str) -> Option<i64> {
 db_path 置为空串会关掉持久化（store 为 None），此时资源功能**整体不可用**。
 处理方式与日报一致：不注册这些命令，启动时打一条 warn。
 
-SCHEMA_VERSION 从 1 提到 2，三张表加进 DDL。
-**不需要写数据迁移** —— DDL 用的是 CREATE TABLE IF NOT EXISTS，
-migrate() 里 v < SCHEMA_VERSION 的分支本来就会更新版本号，
-新表与 messages 无关联，保留期清理与 incremental_vacuum 都不受影响。
+SCHEMA_VERSION 从 1 提到 2，三张表加进 DDL，**不需要写数据迁移** ——
+DDL 用的是 CREATE TABLE IF NOT EXISTS，新表与 messages 无关联，保留期清理不受影响。
+
+**注意**：自 [ADR 0002](adr/0002-runtime-seams.md) 起这条路收紧了 —— **旧库不再迁移**。
+版本与 SCHEMA_VERSION 不等（旧库或更新的库）会在建表之前直接报错，要求删掉
+data/qqbot.db 后重启。所以现在加表加列只需改 DDL 并把 SCHEMA_VERSION 加一，
+**不必**再写跨版本的 ALTER。
 
 ⚠️ 唯一要留意的是播种：默认控制者只在「首次到达 v2」时写入，见第 2 节。
 
@@ -242,42 +245,45 @@ migrate() 里 v < SCHEMA_VERSION 的分支本来就会更新版本号，
 
 | 做法 | 文件落在哪 |
 |---|---|
-| `收录 关键词`（本条消息带图，或上一条消息带图） | 下载后存进 `basepath`，再记录路径 |
+| `收录 关键词`（本条消息带图，或**回复**那条带图的消息） | 下载后存进 `basepath`，再记录路径 |
 | `收录 关键词 服务器本地路径 [说明]` | **不复制**，直接记录该路径 |
 
 本地导入是**保真通道**：塔科夫地图这类高分辨率图走 QQ 转发会被压糊到看不清小字。
 
 ### 图不在命令消息里时怎么办
 
-**三级回退，从最精确到最宽松：**
+**两级回退，从最精确到最宽松：**
 
 | 顺序 | 来源 | 适用场景 |
 |---|---|---|
 | 1 | 本条消息的 `attachments` | 图片与命令发在同一条消息 |
 | 2 | `msg_elements` 里 `message_type = 103` 的附件 | **回复**那条带图的消息 |
-| 3 | 消息库里最近一条带附件的记录 | 先发图、再发命令（两条无回复关系的消息） |
 
 第 2 级是实测出来的：回复时事件里会带 `message_type = 103` 与 `ref_msg_idx`，
 **被引用消息的附件就在 `msg_elements[].attachments` 里**。
 （早先基于一条非回复消息的 `msg_elements: null` 得出过「引用内容不在事件里」的
 结论，那是错的 —— 非回复消息本来就不会有 `msg_elements`。）
 
-第 3 级落在 `message_attachments` 表上（B 簇的存储重构，schema v13）：附件在入库时
-就随消息落成行，回查是一条走 `(scope, target_id, created_at DESC)` 索引的 SQL，
-而不是「取回最近 N 条原文再逐条反序列化」。前两级也各有类型化访问器
-（`MessageEvent::first_attachment` / `quoted_attachment`），协议知识不再漏给插件。
+两级各有类型化访问器（`MessageEvent::first_attachment` / `quoted_attachments`），
+协议知识不再漏给插件；「空 url 不算数」统一由 `MessageAttachment::usable_url()` 判定。
 
-为什么不另建内存缓存：消息本来就落库了，再存一份只是多一处需要保持一致的状态，
-而且进程重启就没了。
+> **曾经有第 3 级**（回消息库找「上一条带附件的消息」，支撑「先发图、再发命令」），
+> 落在 `message_attachments` 表上。schema v14 把它与那张表一起删掉了：
+> 它的排序键恰好取到被引用的那张，而秒级的 `created_at` 又让同一秒的两条消息
+> 可能取到更旧那条；它服务的用法又有同样自然的替代（回复那张图）。
+> 详见 [ADR 0002](adr/0002-runtime-seams.md) 的修订小节。
 
 **同会话内不限制发送者** —— 群里常见的用法就是「有人发了张图，管理员顺手收录」。
+被引用消息的**作者不在事件里**（`msg_elements` 里只有内容与附件），所以这条策略在插件层
+**没有可观察的测试面**：能校验的只有命令发送者（群管理员 / 系统控制者），
+图片来自谁根本无从得知，也就没有可回归的代码分支。
 
 ### 为什么要存原始 JSON
 
 `MessageEvent` 只声明了文档写到的字段，**没声明的会在反序列化时静默丢掉** ——
 实测 `attachments[].content` 就是文档没写但确实存在的字段。
 所以「存原文」不是冗余：它是唯一能事后重新提取的结构。
-（附件本身已经单独落表，不再依赖原文；保留 `raw` 是为了**其它**尚未声明的结构。）
+（v14 之前附件单独落表、不依赖原文；现在 `raw` 是唯一的结构来源。）
 
 这也回答了「CQ 码还是 JSON」：**存 JSON**。CQ 码是 OneBot v11 的私有格式，
 官方 API 从不产生它；引入它要自己写 parser + serializer，而 JSON 是官方原生的，

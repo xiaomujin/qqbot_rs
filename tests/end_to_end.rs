@@ -1269,36 +1269,24 @@ async fn non_resource_keyword_falls_through() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 用户的实际用法：**先发图片，再发命令**（两条独立消息）。
+/// 同一条消息里既带图又带命令 —— v14 之后这是**主推**的收录方式。
 ///
-/// 图片消息的 content 是空的，命令消息本身没有附件 —— 两者靠
-/// 「回消息库找上一条带附件的消息」关联起来。
+/// 图片消息的 content 是空的，而命令消息通常没有附件；v14 删掉了「回消息库找上一条
+/// 带附件的消息」那一级（见 ADR 0002 的修订小节），所以图和命令必须在同一条消息里，
+/// 或者用「回复那张图」的形式（见下面的引用用例）。
 #[tokio::test]
-async fn collect_picks_up_an_image_from_a_previous_message() {
+async fn collect_reads_the_attachment_of_the_same_message() {
     let mock = MockServer::start().await;
     let dir = resource_dir("collect-img");
     let app = build_resource_app(&mock, &dir).await;
     let store = app.resources.as_ref().expect("资源库应当已打开").store.clone();
-    let messages = app.store.clone().expect("消息库应当已打开");
     let dispatcher = app.dispatcher;
 
-    // 1) 先发图片：content 为空，图片在 attachments 里。
     let url = format!("{}/test-image.png", mock.base_url());
-    let img = format!(
-        r#"{{"id":"IN_IMG","author":{{"member_openid":"U1"}},"content":"","group_openid":"GCOL","attachments":[{{"url":"{url}","content_type":"image/png","filename":"a.png","size":16}}]}}"#
+    let both = format!(
+        r#"{{"id":"IN_IMG","author":{{"member_openid":"U1","member_role":"admin"}},"content":"收录 测试","group_openid":"GCOL","attachments":[{{"url":"{url}","content_type":"image/png","filename":"a.png","size":16}}]}}"#
     );
-    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
-    // 入库是**异步批量**的（写线程每 flush_interval 提交一次）。
-    // 用 flush 屏障等它真的落库：命令必须跑在图片后面，否则回查会落空。
-    messages.flush().await.expect("flush 消息库");
-
-    // 2) 再发命令：本身没有附件，必须回消息库找回上一条的图。
-    feed(
-        &dispatcher,
-        "GROUP_MESSAGE_CREATE",
-        r#"{"id":"IN_CMD","author":{"member_openid":"U1","member_role":"admin"},"content":"收录 测试","group_openid":"GCOL"}"#,
-    )
-    .await;
+    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &both).await;
 
     let items = store
         .list(qqbot_store::ResourceScope::Group, "GCOL")
@@ -1312,47 +1300,15 @@ async fn collect_picks_up_an_image_from_a_previous_message() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **允许收录别人发的图**：同会话内不做发送者限制。
-///
-/// 群里常见的用法就是「有人发了张图，管理员顺手收录」。
-#[tokio::test]
-async fn collect_accepts_another_senders_image() {
-    let mock = MockServer::start().await;
-    let dir = resource_dir("other");
-    let app = build_resource_app(&mock, &dir).await;
-    let store = app.resources.as_ref().expect("资源库应当已打开").store.clone();
-    let messages = app.store.clone().expect("消息库应当已打开");
-    let dispatcher = app.dispatcher;
-
-    // U1 发图，U2 收录。
-    let img = format!(
-        r#"{{"id":"IN_IMG2","author":{{"member_openid":"U1"}},"content":"","group_openid":"GST","attachments":[{{"url":"{}/test-image.png"}}]}}"#,
-        mock.base_url()
-    );
-    feed(&dispatcher, "GROUP_MESSAGE_CREATE", &img).await;
-    messages.flush().await.expect("flush 消息库");
-
-    feed(
-        &dispatcher,
-        "GROUP_MESSAGE_CREATE",
-        r#"{"id":"IN_CMD2","author":{"member_openid":"U2","member_role":"admin"},"content":"收录 别人发的","group_openid":"GST"}"#,
-    )
-    .await;
-
-    let items = store
-        .list(qqbot_store::ResourceScope::Group, "GST")
-        .await
-        .expect("列资源");
-    assert_eq!(items.len(), 1, "别人发的图也应当能收录");
-    assert_eq!(items[0].name, "别人发的");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// **回复收录**：命令消息本身带 `message_type = 103` 与 `msg_elements`，
 /// 被引用消息的图片就在里面。
 ///
-/// 这条路比「扫消息库」精确得多，而且不依赖消息是否已落盘 ——
-/// 所以它排在扫库之前。
+/// v14 之后这是**两级**回退里的第二级：附件就在事件里，不依赖任何落库状态。
+///
+/// 被引用消息的**作者不在事件里**（`msg_elements` 里只有内容与附件），所以
+/// 「同会话内不限制发送者」这条策略在插件层**没有可观察的测试面** ——
+/// 它记在 `docs/resource-management-design.md` 第 9 节，
+/// 而不是由一条假装在验证它的用例守着。
 #[tokio::test]
 async fn collect_reads_the_quoted_message_attachment() {
     let mock = MockServer::start().await;
@@ -1362,11 +1318,11 @@ async fn collect_reads_the_quoted_message_attachment() {
     let dispatcher = app.dispatcher;
 
     // 结构照抄实测的回复消息：content 是用户输入，图在被引用的消息里。
+    // 第一个附件刻意留空 url（实测引用元素里就有 `"url":""`）：收录必须跳过它取第二个 ——
+    // v14 之前这种情况会被判成「这条消息没有图」，转而回查历史消息拿到一张不相干的图。
     let url = format!("{}/test-image.png", mock.base_url());
     let reply = format!(
-        concat!(
-            r#"{{"id":"IN_QUOTE","author":{{"member_openid":"U1","member_role":"admin"}},"content":" 收录 引用图","group_openid":"GQ","message_type":103,"msg_elements":[{{"message_type":103,"content":"1\n2","attachments":[{{"content_type":"image/jpeg","filename":"a.jpeg","size":47195,"url":"{}"}}]}}]}}"#
-        ),
+        r#"{{"id":"IN_QUOTE","author":{{"member_openid":"U1","member_role":"admin"}},"content":" 收录 引用图","group_openid":"GQ","message_type":103,"msg_elements":[{{"message_type":103,"content":"1\n2","attachments":[{{"url":""}},{{"content_type":"image/jpeg","filename":"a.jpeg","size":47195,"url":"{}"}}]}}]}}"#,
         url
     );
     feed(&dispatcher, "GROUP_MESSAGE_CREATE", &reply).await;
@@ -1383,7 +1339,7 @@ async fn collect_reads_the_quoted_message_attachment() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 三级回退的**顺序**：本条消息自带的附件优先于被引用的那张。
+/// 两级回退的**顺序**：本条消息自带的附件优先于被引用的那张。
 ///
 /// 让被引用的那张指向一个 mock 不认识的路径（404）：顺序一旦反了，
 /// 下载就会失败，收录不会成功。
@@ -1418,7 +1374,7 @@ async fn collect_prefers_the_own_attachment_over_the_quoted_one() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 三级都没命中时，回执要说清「怎么才能成功」—— 这是用户唯一的线索。
+/// 两级都没命中时，回执要说清「怎么才能成功」—— 这是用户唯一的线索。
 #[tokio::test]
 async fn collect_without_any_attachment_explains_what_to_do() {
     let mock = MockServer::start().await;
@@ -1437,8 +1393,8 @@ async fn collect_without_any_attachment_explains_what_to_do() {
     let send = mock.find(|h| h.path == "/v2/groups/GNONE/messages").expect("应当有回执");
     let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
     let md = body["markdown"]["content"].as_str().unwrap_or_default();
-    assert!(md.contains("没有找到可收录的图片"), "三级都没命中时要告诉用户怎么办: {md}");
-    assert!(md.contains("先发图片再发命令"), "提示里要含用法: {md}");
+    assert!(md.contains("没有找到可收录的图片"), "两级都没命中时要告诉用户怎么办: {md}");
+    assert!(md.contains("回复那张图片"), "提示里要含用法: {md}");
     assert!(
         store.list(qqbot_store::ResourceScope::Group, "GNONE").await.unwrap().is_empty(),
         "没找到图就不该写进资源库"

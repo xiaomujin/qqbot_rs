@@ -17,18 +17,6 @@ const MAX_TEXT_ROWS: usize = 20_000;
 /// 单次查询累计正文字符上限，避免超大群把内存吃满。
 const MAX_TEXT_CHARS: usize = 8 * 1024 * 1024;
 
-/// 一条落库的附件。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredAttachment {
-    pub url: String,
-    pub content_type: Option<String>,
-    pub filename: Option<String>,
-    pub size: Option<u64>,
-    /// `true` = 来自被引用的消息（`msg_elements` 里 `message_type = 103`）。
-    pub quoted: bool,
-    pub created_at: i64,
-}
-
 pub enum ReadReq {
     RecentTexts {
         scope: String,
@@ -37,16 +25,6 @@ pub enum ReadReq {
         sender_id: Option<String>,
         since: i64,
         reply: oneshot::Sender<Result<Vec<String>>>,
-    },
-    /// 该会话在时间窗口内**最新**的一个附件。
-    ///
-    /// 取代了原先「取回最近 50 条原始 JSON、在插件里解析」的做法：
-    /// 附件已经落成行，取最新一条是一条走索引的 SQL，而不是 50 次反序列化。
-    LatestAttachment {
-        scope: String,
-        target_id: String,
-        since: i64,
-        reply: oneshot::Sender<Result<Option<StoredAttachment>>>,
     },
     PurgeBefore {
         cutoff: i64,
@@ -94,23 +72,6 @@ impl ReadHandle {
         rx.await.context("存储读线程未回复")?
     }
 
-    /// 该会话在时间窗口内**最新**的一个附件，没有则 `Ok(None)`。
-    pub async fn latest_attachment(
-        &self,
-        scope: &str,
-        target_id: &str,
-        since: i64,
-    ) -> Result<Option<StoredAttachment>> {
-        let (reply, rx) = oneshot::channel();
-        self.dispatch(ReadReq::LatestAttachment {
-            scope: scope.to_string(),
-            target_id: target_id.to_string(),
-            since,
-            reply,
-        })?;
-        rx.await.context("存储读线程未回复")?
-    }
-
     pub async fn purge_before(&self, cutoff: i64) -> Result<usize> {
         let (reply, rx) = oneshot::channel();
         self.dispatch(ReadReq::PurgeBefore { cutoff, reply })?;
@@ -135,9 +96,6 @@ fn reader_loop(conn: Connection, rx: Receiver<ReadReq>) {
                     sender_id.as_deref(),
                     since,
                 ));
-            }
-            ReadReq::LatestAttachment { scope, target_id, since, reply } => {
-                let _ = reply.send(latest_attachment(&conn, &scope, &target_id, since));
             }
             ReadReq::PurgeBefore { cutoff, reply } => {
                 let _ = reply.send(purge_before(&conn, cutoff));
@@ -191,54 +149,15 @@ fn recent_texts(
     Ok(out)
 }
 
-/// 取某会话在时间窗口内**最新**的一个附件。
-///
-/// 排序键是 `(created_at DESC, ordinal DESC)`：同一毫秒/同一秒内，
-/// 后一个附件更「新」。`since` 把窗口外的旧图挡掉 —— 否则「先发图再发命令」
-/// 会捞到十天前那张图。
-fn latest_attachment(
-    conn: &Connection,
-    scope: &str,
-    target_id: &str,
-    since: i64,
-) -> Result<Option<StoredAttachment>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT url, content_type, filename, size, quoted, created_at FROM message_attachments
-          WHERE scope = ?1 AND target_id = ?2 AND created_at >= ?3
-          ORDER BY created_at DESC, ordinal DESC
-          LIMIT 1",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![scope, target_id, since])?;
-    let Some(row) = rows.next()? else { return Ok(None) };
-    Ok(Some(StoredAttachment {
-        url: row.get(0)?,
-        content_type: row.get(1)?,
-        filename: row.get(2)?,
-        // 存进去时就是 i64；负数只可能来自手改数据库，当成「未知大小」。
-        size: row.get::<_, Option<i64>>(3)?.and_then(|v| u64::try_from(v).ok()),
-        quoted: row.get(4)?,
-        created_at: row.get(5)?,
-    }))
-}
-
 fn purge_before(conn: &Connection, cutoff: i64) -> Result<usize> {
     let started = Instant::now();
     let deleted = conn
         .execute("DELETE FROM messages WHERE created_at < ?1", [cutoff])
         .context("删除过期消息失败")?;
-    // 附件行一起删。它自带 created_at / scope / target_id，按同一个 cutoff 直接删
-    // 即可，不需要 JOIN。漏掉这一步的话消息删了、附件行却永远留着 ——
-    // 保留期就只对一半数据生效，库只增不减。
-    conn.execute("DELETE FROM message_attachments WHERE created_at < ?1", [cutoff])
-        .context("删除过期附件失败")?;
-
-    if deleted > 0 {
-        // 删除只把页标记为空闲，这里按需归还给文件系统，
-        // 避免长期运行后数据库文件只增不减。
-        if let Err(err) = conn.execute_batch("PRAGMA incremental_vacuum;") {
-            tracing::debug!(error = %err, "incremental_vacuum 失败（不影响清理结果）");
-        }
-    }
+    // 这里**不做** `incremental_vacuum`：删掉的页会被后续消息复用，真实库里
+    // `freelist_count` 恒为 0，本来就没有空闲页可回收；`auto_vacuum` 也已在
+    // `apply_pragmas` 里刻意不设（理由见那里）。文件在「一个保留期的高水位」处
+    // 稳定下来，要缩容得手动 `VACUUM`。
     tracing::debug!(
         deleted,
         cutoff,

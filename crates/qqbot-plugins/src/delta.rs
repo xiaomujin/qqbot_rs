@@ -264,10 +264,10 @@ impl DeltaPlugin {
     async fn handshake(&self, state: &mut DeltaState) -> Result<(), String> {
         for url in [&self.config.home_url, &self.config.overview_url] {
             // 这两步只为了拿 Set-Cookie，页面本身是什么状态码无关紧要 ——
-            // 首页返回 403 / 302 时照样会下发会话标记，因为状态码把整段握手
-            // 掐掉反而更脆。所以这里**刻意不做**非 2xx 检查（与改造前一致）。
+            // 首页返回 403 / 302 时照样会下发会话标记，而状态码闸门把整段握手
+            // 掐掉反而更脆。所以这里走 `send_raw`（**不过**状态码闸门）。
             // UA 走下面的 `UA` 常量（站点按 UA 拦），这里只补会话 cookie。
-            let sent = crate::http::send(
+            let sent = crate::http::send_raw(
                 self.http
                     .get(url)
                     .header("Cookie", state.cookie.clone().unwrap_or_default())

@@ -32,8 +32,14 @@ async fn main() -> anyhow::Result<()> {
     let Some(days) = days else {
         let stats = store.stats().await?;
         println!(
-            "{db}: 共 {} 行；已入队 {} / 已写入 {} / 丢弃 {} / 批次数 {}；保留期 {} 天",
-            stats.rows, stats.enqueued, stats.written, stats.dropped, stats.batches,
+            "{db}: 共 {} 行；已入队 {} / 已写入 {} / 未入队 {} / 入库失败 {} / 批次数 {}；\
+             保留期 {} 天",
+            stats.rows,
+            stats.enqueued,
+            stats.written,
+            stats.dropped,
+            stats.failed_rows,
+            stats.batches,
             stats.retention_days
         );
         return Ok(());
@@ -46,7 +52,6 @@ async fn main() -> anyhow::Result<()> {
         sender_name: Some("seed".into()),
         event_name: "SEED".into(),
         raw: None,
-        attachments: Vec::new(),
         content,
         created_at: now_unix() - days * DAY_SECS as i64,
     });

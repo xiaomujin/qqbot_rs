@@ -22,17 +22,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use qqbot_core::{Ctx, FnHandler, Handled, Handler, Matcher, Router, Rule, Scope};
 use qqbot_media::FileType;
-// 存储层的 `Scope`（group/c2c）与插件层的 `Scope`（群/单聊/全部）同名但无关，
-// 所以给前者起个别名 —— 直接用会让 `latest_attachment` 收到错误的类型。
-use qqbot_store::{
-    now_unix, KeywordEntry, MessageStore, Resource, ResourceScope, ResourceSpec, ResourceStore,
-    Scope as MessageScope, StoredAttachment, SYSTEM_OWNER,
-};
+use qqbot_store::{KeywordEntry, Resource, ResourceScope, ResourceSpec, ResourceStore, SYSTEM_OWNER};
 
 /// 触发监听器的优先级。
 ///
@@ -42,39 +36,6 @@ const TRIGGER_PRIORITY: i32 = -100;
 
 /// 从消息收录时允许的最大字节数。
 const MAX_RESOURCE_BYTES: u64 = 32 * 1024 * 1024;
-
-/// 回查多远。
-///
-/// 用户习惯是「先发图，再发命令」，所以命令到达时附件在**上一条**消息里。
-/// 这个常量只决定「回查」这一级的时间窗，不影响本条消息与引用消息。
-const ATTACHMENT_WINDOW: Duration = Duration::from_secs(600);
-
-/// 把「本条消息 / 引用消息」的附件转成存储层的形状。
-///
-/// 三级回退统一返回 `StoredAttachment`，于是不再需要
-/// 「协议原文 → 中间镜像类型」的第二套结构 —— 协议知识（那个 `message_type`
-/// 取值）留在 `qqbot-api` 的 `MessageEvent::quoted_attachment` 里。
-///
-/// 前两级没有独立的入库时间，`created_at` 用当前时间：这条消息就是刚收到的，
-/// 而收录路径并不读这个字段（它只对第三级的排序有意义）。
-fn pending_attachment(
-    url: Option<&str>,
-    content_type: Option<&str>,
-    filename: Option<&str>,
-    size: Option<u64>,
-    quoted: bool,
-) -> Option<StoredAttachment> {
-    // 空地址要当成「没有」，否则会把一个必定失败的上传留到后面才炸。
-    let url = url.filter(|u| !u.is_empty())?;
-    Some(StoredAttachment {
-        url: url.to_string(),
-        content_type: content_type.map(str::to_string),
-        filename: filename.map(str::to_string),
-        size,
-        quoted,
-        created_at: now_unix(),
-    })
-}
 
 /// 保留命令名。
 ///
@@ -95,9 +56,6 @@ const RESERVED: &[&str] = &[
 #[derive(Clone)]
 pub struct ResourcesConfig {
     pub store: Arc<ResourceStore>,
-    /// 消息库。收录时靠它找回「上一条带图片的消息」——
-    /// 不再另建内存缓存：消息本来就落库了，再存一份只会多一处不一致。
-    pub messages: Arc<MessageStore>,
     /// 从消息收录的素材保存目录（basepath）。
     pub basepath: PathBuf,
     /// 显式配置的系统控制者。`Some` 时**覆盖数据库**，也是锁定恢复通道。
@@ -161,7 +119,6 @@ struct State {
 /// 共享状态与逻辑。
 struct Core {
     store: Arc<ResourceStore>,
-    messages: Arc<MessageStore>,
     basepath: PathBuf,
     /// 下载附件用。与其它插件共用同一个客户端，超时策略统一。
     http: reqwest::Client,
@@ -186,7 +143,6 @@ impl Core {
         let index = Index::build(&cfg.store.keywords().await?);
         Ok(Arc::new(Self {
             store: cfg.store,
-            messages: cfg.messages,
             basepath: cfg.basepath,
             http,
             state: RwLock::new(State { index, controllers }),
@@ -317,7 +273,10 @@ impl Core {
             }
             Err(err) => {
                 tracing::warn!(error = %err, name, "收录失败");
-                self.reply_markdown(ctx, format!("收录失败：{err}")).await;
+                // `{err:#}` 而不是 `{err}`：anyhow 的 `Display` 只印最外层，
+                // `.context("下载附件失败")` 会把「下载内容过大 / 返回 HTTP 403」
+                // 这些真正的死因吃掉。
+                self.reply_markdown(ctx, format!("收录失败：{err:#}")).await;
             }
         }
         Handled::Consumed
@@ -344,54 +303,6 @@ impl Core {
         Ok((id, size))
     }
 
-    /// 决定这次「收录」用哪张图。
-    ///
-    /// 三级回退，从最精确到最宽松，**全部走类型化的接口**：
-    ///
-    /// 1. 本条消息自带的附件（`MessageEvent::first_attachment`）；
-    /// 2. **被引用的消息**的附件（`MessageEvent::quoted_attachment`，
-    ///    对应 `msg_elements` 里 `message_type = 103` 的那个元素）；
-    /// 3. 回消息库找该会话最近一条带附件的消息 —— 覆盖「先发图、再发命令」
-    ///    这种图片和命令分属两条消息、且没有回复关系的用法。
-    ///
-    /// 第 2 级比第 3 级精确：附件就在事件里，不受「消息是否已落盘」的影响。
-    /// 第 3 级去库里找而不是另建内存缓存：消息本来就落库了，再存一份只是多一处
-    /// 需要保持一致的状态，而它并不会更准确。
-    async fn resolve_pending(&self, ctx: &Ctx) -> Option<StoredAttachment> {
-        if let Some(att) = ctx.message.first_attachment()
-            && let Some(found) = pending_attachment(
-                att.url.as_deref(),
-                att.content_type.as_deref(),
-                att.filename.as_deref(),
-                att.size,
-                false,
-            )
-        {
-            return Some(found);
-        }
-
-        if let Some(att) = ctx.message.quoted_attachment()
-            && let Some(found) = pending_attachment(
-                att.url.as_deref(),
-                att.content_type.as_deref(),
-                att.filename.as_deref(),
-                att.size,
-                true,
-            )
-        {
-            return Some(found);
-        }
-
-        let scope = if ctx.is_group() { MessageScope::Group } else { MessageScope::C2c };
-        let since = now_unix() - ATTACHMENT_WINDOW.as_secs() as i64;
-        self.messages
-            .latest_attachment(scope, ctx.target.id(), since)
-            .await
-            .map_err(|err| tracing::warn!(error = %err, "回查消息库失败"))
-            .ok()
-            .flatten()
-    }
-
     async fn collect_from_attachment(
         &self,
         ctx: &Ctx,
@@ -399,17 +310,35 @@ impl Core {
         owner: &str,
         name: &str,
     ) -> Result<(i64, u64)> {
-        let pending = self.resolve_pending(ctx).await.ok_or_else(|| {
-            anyhow!(
-                "没有找到可收录的图片。把图片和命令发在同一条消息里，或先发图片再发命令（10 分钟内有效）"
-            )
+        // 两级回退，从最精确到最宽松：
+        //
+        // 1. 本条消息自带的附件；
+        // 2. **被引用的消息**的附件（`msg_elements` 里 `message_type = 103` 的那个元素）。
+        //
+        // 两级都跳过没有 url 的附件（`MessageAttachment::usable_url`）：空地址必定
+        // 下载失败，而把它当成「这条消息没有图」会让收录去别处找一张不相干的图。
+        //
+        // 第 3 级（回消息库找「上一条带附件的消息」）在 v14 被删除，见
+        // ADR 0002 的修订小节 —— 代价是「先发图、再发命令」不再被支持。
+        let picked = ctx
+            .message
+            .attachments
+            .iter()
+            .find_map(|att| att.usable_url().map(|url| (att, url)))
+            .or_else(|| {
+                ctx.message
+                    .quoted_attachments()
+                    .find_map(|att| att.usable_url().map(|url| (att, url)))
+            });
+        let (pending, url) = picked.ok_or_else(|| {
+            anyhow!("没有找到可收录的图片。把图片和命令发在同一条消息里，或回复那张图片")
         })?;
+
         if let Some(size) = pending.size
             && size > MAX_RESOURCE_BYTES
         {
             return Err(anyhow!("附件过大（{size} 字节），上限 {MAX_RESOURCE_BYTES} 字节"));
         }
-        let url = pending.url.as_str();
 
         // 空体与上限的兜底检查在 fetch_bytes 里；上面那次是拿附件**声明**的
         // size 做的预检，两者互补，都要保留。
@@ -702,7 +631,7 @@ impl Core {
     fn usage(&self, scope: ResourceScope) -> String {
         let cmd = self.cmd(scope, "收录");
         format!(
-            "用法：{cmd} 关键词 —— 图片与命令发在同一条消息里，或先发图片再发命令；\
+            "用法：{cmd} 关键词 —— 图片与命令发在同一条消息里，或回复那张图片；\
              也可用 {cmd} 关键词 文件路径 [说明] 从服务器本地导入"
         )
     }
@@ -980,49 +909,6 @@ mod tests {
         }
         assert!(RESERVED.contains(&"资源列表"));
         assert!(RESERVED.contains(&"系统控制者"));
-    }
-    /// 前两级（本条 / 引用）的附件只有协议字段，第三级来自库里；
-    /// 这个构造器负责把它们补齐成同一种形状。
-    ///
-    /// 「本条优先、其次引用、最后回查」这条顺序不再靠解析原文实现，
-    /// 所以断言也搬了家：协议侧的取值由 `qqbot-api` 的
-    /// `quoted_attachment` 单测守着，顺序本身由 `tests/end_to_end.rs`
-    /// 的 `collect_prefers_the_own_attachment_over_the_quoted_one` 守着。
-    #[test]
-    fn pending_attachment_maps_fields_and_rejects_empty_url() {
-        let found = pending_attachment(
-            Some("https://example.invalid/x.jpg"),
-            Some("image/jpeg"),
-            Some("a.jpg"),
-            Some(1434766),
-            false,
-        )
-        .expect("应当转出一个附件");
-        assert_eq!(found.url, "https://example.invalid/x.jpg");
-        assert_eq!(found.content_type.as_deref(), Some("image/jpeg"));
-        assert_eq!(found.filename.as_deref(), Some("a.jpg"));
-        assert_eq!(found.size, Some(1434766));
-        assert!(!found.quoted);
-
-        assert!(pending_attachment(None, None, None, None, false).is_none(), "没有地址就没有附件");
-        // 空地址要当成没有，否则会把一个必定失败的上传留到后面才炸。
-        assert!(pending_attachment(Some(""), None, None, None, false).is_none());
-    }
-
-    #[test]
-    fn pending_attachment_keeps_the_quoted_marker() {
-        let found = pending_attachment(
-            Some("https://example.invalid/quoted.jpeg"),
-            None,
-            None,
-            None,
-            true,
-        )
-        .expect("只有 url 也应当可用");
-        assert!(found.quoted, "引用来源要能区分出来");
-        assert!(found.content_type.is_none());
-        assert!(found.filename.is_none());
-        assert!(found.size.is_none());
     }
 }
 

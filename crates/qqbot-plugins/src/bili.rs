@@ -509,7 +509,12 @@ impl Handler for BiliPlugin {
             _ => {}
         }
 
-        let Some(link) = find_link(ctx.content()) else {
+        // 正文里没有链接时再看结构化卡片：只有图文分享（`ark_type = "tuwen"`）带
+        // `jump_url`；小程序卡片（`miniapp`）里只有标题和预览图，没有地址 —— 见
+        // `MessageEvent::ark_jump_url` 的说明。
+        let Some(link) =
+            find_link(ctx.content()).or_else(|| ctx.message.ark_jump_url().and_then(find_link))
+        else {
             return Handled::Next;
         };
 

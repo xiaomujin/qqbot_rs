@@ -361,6 +361,16 @@ content="我第一次下载给的6块<@28800DF7B8FE4F830E9FF7C6DB937E35>"
 
 **ARKData**：`prompt`、`ark_type`（tuwen / feed / miniapp / map / contact_card / video_share / music_together / picture）、`ark_name`、`fields`（tag/title/desc/jump_url/preview/source/nickname/avatar/address…）
 
+> ⚠️ **卡片消息里能不能拿到链接，取决于 `ark_type`**（2026-11 实测，38 张卡片统计）：
+>
+> - `tuwen`（图文分享，3 张）：`fields.jump_url` 就是真实地址，B 站分享常见 `https://b23.tv/…`；
+> - `miniapp`（小程序卡片，26 张）：`fields` **只有 `title` / `preview` / `source` / `source_logo`**，
+>   没有 URL。从 App 直接分享到群里默认生成的就是这一种 —— 消息里根本不存在视频地址，
+>   任何代码都救不回来，只能请用户改贴链接；
+> - `map`（位置卡片）：只有 `address` / `desc`。
+>
+> 解析一律走 `MessageEvent::ark_jump_url()`，不要在插件里自己摸 `fields` 的字段名。
+
 **MsgElement**：`msg_idx`、`author`、`message_type`（0 文本 / 3 结构化卡片 / 101 并行消息 / 102 聊天记录 / 103 引用消息）、`content`、`attachments`、`ark_data`、`msg_elements`（递归）
 
 ---

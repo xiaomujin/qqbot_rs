@@ -271,6 +271,20 @@ impl MessageEvent {
         Cow::Owned(out)
     }
 
+    /// 结构化卡片里的跳转地址（`ark_data.fields.jump_url`）。
+    ///
+    /// 实测两种卡片，差别决定「能不能解析」：
+    /// - `ark_type = "tuwen"`（图文分享）带 `jump_url`，B 站分享常见
+    ///   `https://b23.tv/…` —— 这是卡片消息里**唯一**能拿到的真实地址；
+    /// - `ark_type = "miniapp"`（小程序卡片）的 fields 只有
+    ///   `title` / `preview` / `source`，**根本没有链接**。从 App 直接分享到群里
+    ///   默认生成的就是这一种，任何代码都救不回来，只能请用户贴链接。
+    ///
+    /// 协议知识放在这里：调用方不要再自己去 `fields` 里摸字段名。
+    pub fn ark_jump_url(&self) -> Option<&str> {
+        self.ark_data.as_ref()?.fields.as_ref()?.get("jump_url")?.as_str()
+    }
+
     /// 第一个附件。
     ///
     /// **只用于日志**（定位「发了图却没被识别」）：它刻意不过滤空 url ——
@@ -386,6 +400,28 @@ mod tests {
         assert!(ev.mentions[0].is_you);
         assert!(!ev.mentions[1].is_you, "字段缺省必须是 false，不能默认成 true");
         assert_eq!(ev.plain_text(), "帮助");
+    }
+
+    /// 卡片消息：只有图文分享（`tuwen`）带 `jump_url`，小程序卡片里没有链接。
+    #[test]
+    fn ark_jump_url_is_only_on_tuwen_cards() {
+        let tuwen: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","message_type":3,"ark_data":{"ark_name":"图文","ark_type":"tuwen","fields":{
+                 "tag":"哔哩哔哩","title":"t","desc":"UP主: x",
+                 "jump_url":"https://b23.tv/AkGRfOj?share_medium=android"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(tuwen.ark_jump_url(), Some("https://b23.tv/AkGRfOj?share_medium=android"));
+
+        let miniapp: MessageEvent = serde_json::from_str(
+            r#"{"id":"M2","message_type":3,"ark_data":{"ark_name":"小程序","ark_type":"miniapp","fields":{
+                 "title":"t","preview":"https://x/y","source":"哔哩哔哩"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(miniapp.ark_jump_url(), None, "小程序卡片里根本没有链接");
+
+        let plain: MessageEvent = serde_json::from_str(r#"{"id":"M3","content":"hi"}"#).unwrap();
+        assert_eq!(plain.ark_jump_url(), None, "没有卡片时不能凭空造一个");
     }
 
     #[test]

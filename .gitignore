@@ -15,9 +15,14 @@ target/selftest/
 .vscode/
 .idea/
 *.swp
+/.openidea/
 
 # 运行时数据（SQLite）
 /data
+
+# 发布运行目录：release 二进制 + 它自己的一份 config.toml 与 data/。
+# 里面有 AppSecret 与真实消息库，绝不能入库（它是「独立目录」，不是仓库的一部分）。
+/run
 
 # /docs 不再整体忽略：协议速查与审计报告要跟着代码入库，
 # 否则 ARCHITECTURE.md / README.md 里的链接在 clone 后是断的。

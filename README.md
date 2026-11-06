@@ -32,10 +32,14 @@ export QQBOT_APP_SECRET=你的AppSecret
 ### 2. 运行
 
 ```bash
-cargo run                  # 连接网关并开始服务
+cargo run --release        # 连接网关并开始服务
 cargo run -- check         # 只校验凭据与网关信息，不建立长连接
 cargo run -- self-test     # 离线渲染自检（无需网络与凭据）
 ```
+
+**对外跑一律 release**：渲染慢 20~30 倍的 debug 构建会把大卡片顶破
+`render.timeout_secs`（默认 5 秒）而降级成文字；debug 只用来 `cargo check` /
+`test` / `clippy`。长期部署用独立的 `run\` 目录（`.\deploy.ps1`），见[部署](#部署)。
 
 日志级别用 `RUST_LOG` 控制，例如 `RUST_LOG=debug`。
 
@@ -222,10 +226,30 @@ cargo run -p qqbot-store --example seed -- data/qqbot.db 400 "旧消息"
 需要 **Rust 1.88+**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取较高者）。
 SQLite 走 `rusqlite` 的 `bundled` 特性，源码随依赖一起编译，**无需预装 SQLite**。
 
-```bash
-cargo build --release
-./target/release/qqbot
+发布与测试用**两个互不相干的运行目录**，同一份代码、各自一份配置与数据：
+
+| | 发布 | 测试 |
+|---|---|---|
+| 目录 | `run\`（**独立目录，不入库**） | `target\devrun\`（在 `/target` 里） |
+| 构建 | `cargo build --release` | `cargo build`（debug） |
+| 配置 | `run\config.toml` | 仓库根 `config.toml` |
+| 数据 / 日志 | `run\data\`、`run\logs\` | `data\`、`target\live.log` |
+| 一条命令 | `.\deploy.ps1` | `.\dev.ps1` |
+
+```powershell
+copy config.toml run\config.toml   # 首次：发布目录自带一份配置
+.\deploy.ps1                       # 构建 release → 部署到 run\ → 重启
+.\dev.ps1                          # 测试：构建 debug → 从 target\devrun 重启
 ```
+
+`run\` 只依赖自己：二进制静态链接、模板编译期嵌入，运行时只读自己的
+`config.toml` 与 `data\`，不读仓库里的任何文件（`.gitignore` 已忽略 `/run`）。
+⚠️ 它**必须**自带 `config.toml` —— 程序会从工作目录**向上**找配置，缺了就静默用上
+仓库根那份，「独立」就成假的，而启动照样成功。
+
+**同一 AppID 只能有一个实例在线**，否则同一条消息会被回两遍 —— 所以两个脚本都会先停掉
+所有 `qqbot` 进程：**测试期间发布实例是停着的**，这是刻意的（要一边测一边正常服务，
+得用第二个 AppID）。
 
 单一静态二进制，无运行时依赖。运行期不需要 Redis / 数据库
 （会话状态、去重、缓存在进程内）；需要横向扩容时再引入外部存储。

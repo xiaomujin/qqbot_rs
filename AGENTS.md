@@ -33,55 +33,73 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | release 构建 | `cargo build --release --workspace` |
 | 渲染自检（离线，无需网络与凭据） | `cargo run -- self-test`（逐个渲染**所有**内置模板 + 一张 `Card` + 词云） |
 | 凭据与网关连通性 | `cargo run -- check` |
-| 启动机器人 | `cargo run` |
+| 启动机器人（发布） | `.\deploy.ps1`（见下面「两个运行环境」） |
+| 启动机器人（测试） | `.\dev.ps1` |
 | 消息库统计 | `cargo run -p qqbot-store --example seed -- data/qqbot.db` |
 
 日志级别用 `RUST_LOG`（如 `RUST_LOG=debug`）。
 
-### 与机器人同时构建
+### 两个运行环境：发布 `run\`，测试 `target\devrun\`
 
-Windows 会锁住**正在运行的那个** exe。所以**开发期一律从副本启动**，
-让 `target/debug/qqbot.exe` 保持自由 —— 边跑边编，不用停机器人：
+同一份代码、同一个 AppID，但**运行时状态互不相干**：
 
-```powershell
-# 启动 / 换二进制
-Get-Process qqbot -ErrorAction SilentlyContinue | Stop-Process -Force
-cargo build
-Copy-Item -Force target\debug\qqbot.exe target\devrun\qqbot.exe
-# 旧实例占着 exe 时 Copy-Item 会**报错但不中断**（非终止性错误），
-# 于是你以为换了二进制，其实还在跑旧的 —— 症状是「改了代码但行为没变」。
-# 所以必须校验哈希，别信 Copy-Item 有没有抛。
-if ((Get-FileHash target\debug\qqbot.exe).Hash -ne (Get-FileHash target\devrun\qqbot.exe).Hash) {
-    throw '二进制没换成功：旧实例还在跑？'
-}
-Remove-Item target\live.log -ErrorAction SilentlyContinue
-$env:RUST_LOG='info'
-& .\target\devrun\qqbot.exe run 2>&1 | Tee-Object -FilePath target\live.log
-```
+| | 发布 | 测试 |
+|---|---|---|
+| 目录 | `E:\qqbot\run\`（**独立目录，不入库**） | `E:\qqbot\target\devrun\`（在 `/target` 里） |
+| 二进制 | `cargo build --release` | `cargo build`（debug） |
+| 配置 | `run\config.toml`（自带一份） | 项目根 `config.toml` |
+| 数据 / 日志 | `run\data\`、`run\logs\` | `data\`、`target\live.log` |
+| 一条命令 | `.\deploy.ps1` | `.\dev.ps1` |
 
-`target\devrun\` 落在 `/target` 忽略范围内，不会入库。
+`run\` 是**独立目录**：二进制静态链接、模板编译期嵌入，运行时只认自己的
+`config.toml` 与 `data\`，不读项目里的任何文件。⚠️ 所以它**必须**自带 `config.toml` ——
+`discover` 会从 cwd **向上**找配置，缺了就静默用上项目根那份，「独立」当场变成假的，
+而启动照样成功。唯一能看出来的地方是启动日志第一行：
+`配置已加载 sources=... 配置文件(E:\qqbot\run\config.toml)`。
+两份配置**各改各的**：它是独立的一份拷贝，不会跟着仓库的 `config.toml` 走 ——
+所以加插件配置 / 换 token 时，要用的那份得手动同步。两边的 `data\` 同理，
+从发布那一刻起各记各的消息（发布那份是仓库 `data\` 的快照）。
 
-只有**改了代码**时才会撞锁（cargo 需要重新链接）。`cargo test` 与 `cargo clippy`
-**永远不受影响** —— 它们只写 `target/debug/deps/`，不重写这个 exe。
-万一直接跑了 `target/debug/qqbot.exe`，症状是 `failed to remove file ... 拒绝访问 (os error 5)`；
+**同一 AppID 只能有一个实例在线**：发布与测试同时跑，同一条消息会被回两遍。
+两个脚本都会先停掉**所有** `qqbot` 进程再启动 —— 所以**测试期间线上是停着的**，
+这是刻意的；要一边测一边正常服务，得用第二个 AppID（另建 `run-test\` 与它自己的配置）。
+
+两边都从**副本 / 独立目录**启动的原因：Windows 会锁住正在运行的那个 exe。发布跑
+`run\qqbot.exe`（不是 `target\release\qqbot.exe`）、测试跑 `target\devrun\qqbot.exe`
+（不是 `target\debug\qqbot.exe`），cargo 才能随时重链。`cargo check` / `test` / `clippy`
+走 debug profile，只写 `target/debug/deps/`，**永远不受影响**。
+万一直接跑了 `target\release\qqbot.exe`，症状是 `failed to remove file ... 拒绝访问 (os error 5)`；
 **不要**为了构建去杀进程或改锁，停掉机器人再编即可。
 
-### debug 构建的代价（实测）
+### 为什么发布必须 release（实测）
 
-渲染慢 **25~31 倍**：卡片 1184ms / 词云 2727ms（release 分别是 47ms / 88ms）。
-仍在 `render.timeout_secs` 默认的 5s 之内，所以**不会**降级成纯文本，但余量只有 1.8 倍 ——
-调试期间别同时堆多个词云请求。
+`render.timeout_secs` 的 5 秒是照 release 的预算定的，而 debug 构建的渲染慢 **20~30 倍**：
 
-**测试与 `self-test` 里把渲染超时放宽到 120 秒**（产品是 5 秒）。原因同上：
-几十个测试并行会把渲染服务挤爆，10 秒会被偶发超过，
-表现为「渲染超时 → 插件降级成文字」，于是断言图片的测试随机失败。
-这不是产品问题，但测试必须稳定，所以不按产品的预算来。
-`self-test` 同理：它是诊断工具，失败应当意味着「渲染不出来」，
-而不是「机器忙」—— 机器人正在跑的时候词云实测 3.2 秒，
-按 5 秒预算会随机报「渲染超时」。
+| 场景 | debug | release |
+|---|---|---|
+| 卡片（3 行） | 1184ms | 47ms |
+| 词云 | 2727ms | 88ms |
+| 番剧卡片（20 行，2000×2312） | 3530ms | 152ms |
+| 8 张番剧卡片并发 | 5900ms | 330ms |
 
-好处是 debug 打开整数溢出检查：`retention_days * DAY_SECS` 这类乘法一旦回绕会
-**直接 panic**，而不是在 release 下静默算出错误结果。
+2026-10 就有一段时间拿 debug 副本对外跑：番剧那张 20 行卡 3.5 秒，并发几张就顶破 5 秒，
+于是随机降级成文字 —— 群里的话是「又渲染超时了，这毛病比我摸鱼还稳定」
+（`target/live.log` 里的 `渲染错误: 渲染超时`）。**这不是超时预算太小，是跑错了构建**：
+release 下余量 20 倍以上，不用动 `render.timeout_secs`。
+
+代价是 release 有 `lto = "thin"` + `codegen-units = 1`，全量构建慢、改一个 crate 也要重新
+LTO 链接。所以**迭代用 debug**（`cargo check` / `test` / `clippy`），只有**要上线的那一次**
+才 `cargo build --release`。也不要为了「让 debug 也快」去调
+`[profile.dev.package."*"]` —— 那会让本机跑起来的样子和线上不一样，CPU 密集的渲染路径
+尤其经不起这种偏差。
+
+debug 唯一比 release 强的地方是整数溢出检查：`retention_days * DAY_SECS` 这类乘法
+回绕会直接 panic，release 下则静默算出错误结果。所以**配置上界**（`MAX_RETENTION_DAYS`
+等）是功能性代码，不是洁癖 —— 线上没有那层网。
+
+**测试与 `self-test` 里仍把渲染超时放宽到 120 秒**（产品是 5 秒）：
+几十个测试并行会把渲染服务挤爆，断言图片的测试随机失败没人受得了；
+`self-test` 是诊断工具，失败应当意味着「渲染不出来」而不是「机器忙」。
 
 ---
 

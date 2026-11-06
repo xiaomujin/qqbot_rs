@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use async_trait::async_trait;
 use qqbot_core::{Ctx, Handled, Handler};
 
@@ -48,38 +46,6 @@ enum Roll {
     Range { min: i64, max: i64 },
 }
 
-/// 去掉正文里**任意位置**的 `<@openid>` 提及。
-///
-/// 全局的 `MessageEvent::trimmed()` 只剥**开头**的提及，而 QQ 把提及插在光标处：
-/// 先打字再点 @ 就落在**结尾**（库里真实样本：`我第一次下载给的6块<@28800DF7…>`）。
-/// 这种消息的参数会被污染成 `2d10<@…>`，NdM 解析失败后**掉回默认的 1d100** ——
-/// 从用户角度看就是「@ 和不 @ 结果不一样」。
-///
-/// 只在骰子内部清，**不动全局 `trimmed()`**：别的插件（词云语料、资源关键词）
-/// 依赖「正文原样」的语义，改成剥任意位置会牵连它们。
-///
-/// 返回 `Cow`：绝大多数消息里根本没有提及，那时直接借用，连一次分配都省掉。
-fn strip_mentions(text: &str) -> Cow<'_, str> {
-    if !text.contains("<@") {
-        return Cow::Borrowed(text);
-    }
-
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("<@") {
-        // 没有闭合尖括号就不猜：原样留下（`<@unterminated` 不是提及，是正文）。
-        let Some(end) = rest[start + 2..].find('>') else {
-            break;
-        };
-        out.push_str(&rest[..start]);
-        // 提及当空白：`r 2d10<@X>` 与 `r 2d10` 等价。
-        out.push(' ');
-        rest = &rest[start + 2 + end + 1..];
-    }
-    out.push_str(rest);
-    Cow::Owned(out)
-}
-
 /// 取出参数部分：`.r` / `。r` 前缀之后，或命令 token 之后。
 ///
 /// 两种句点都认：中文输入法下 `.` 很容易打成 `。`。
@@ -98,8 +64,9 @@ fn arg_text(text: &str) -> &str {
 ///
 /// 规则：**含 `d`/`D` → NdM；否则 1~2 个纯整数 → 区间；无参数 → 1d100**。
 fn parse_roll(text: &str) -> Option<Roll> {
-    let cleaned = strip_mentions(text);
-    let args: Vec<&str> = arg_text(cleaned.trim()).split_whitespace().collect();
+    // 提及由 `Ctx::content()`（`MessageEvent::plain_text`）统一清掉，
+    // 这里拿到的已经是干净文本 —— 不要再自己解析一遍协议。
+    let args: Vec<&str> = arg_text(text.trim()).split_whitespace().collect();
     match args.split_first() {
         // 无参数：与改动前 `骰子` 的默认一致。
         None => Some(Roll::Ndm { count: 1, faces: 100 }),
@@ -206,9 +173,6 @@ impl Handler for DicePlugin {
 mod tests {
     use super::*;
 
-    /// 机器人 openid 按群下发，形状固定为 `<@32位十六进制>`。
-    const MENTION: &str = "<@9FC256316DBE9D176956F7672CA573F5>";
-
     #[test]
     fn parses_standard_specs() {
         assert_eq!(parse_spec("3d6"), Some((3, 6)));
@@ -227,13 +191,6 @@ mod tests {
         assert_eq!(parse_spec("d"), None);
         assert_eq!(parse_spec("d0"), None);
         assert_eq!(parse_spec("0d6"), None, "数量 0 依然非法");
-    }
-
-    #[test]
-    fn strip_mentions_borrows_when_there_is_no_mention() {
-        // 快路径：没有 `<@` 就不该分配。
-        assert!(matches!(strip_mentions("骰子 3d6"), Cow::Borrowed(_)));
-        assert!(matches!(strip_mentions("r 2d10<@X>"), Cow::Owned(_)));
     }
 
     #[test]
@@ -266,28 +223,6 @@ mod tests {
         assert_eq!(parse_roll("骰子"), ndm(1, 100));
         assert_eq!(parse_roll("r"), ndm(1, 100));
         assert_eq!(parse_roll(".r"), ndm(1, 100));
-    }
-
-    #[test]
-    fn mentions_anywhere_do_not_pollute_arguments() {
-        // 先打字再点 @：提及落在结尾，参数会被粘上 `<@…>`。
-        assert_eq!(parse_roll(&format!("r 2d10{MENTION}")), Some(Roll::Ndm { count: 2, faces: 10 }));
-        assert_eq!(parse_roll(&format!(".r 50{MENTION}")), Some(Roll::Range { min: 1, max: 50 }));
-        // 开头，以及和命令贴在一起（中间没有空格）
-        assert_eq!(
-            parse_roll(&format!("{MENTION} .r 5 10")),
-            Some(Roll::Range { min: 5, max: 10 })
-        );
-        assert_eq!(parse_roll(&format!("{MENTION}骰子 3d6")), Some(Roll::Ndm { count: 3, faces: 6 }));
-        // 正文中间的提及同理
-        assert_eq!(parse_roll(&format!("骰子{MENTION} 3d6")), Some(Roll::Ndm { count: 3, faces: 6 }));
-    }
-
-    #[test]
-    fn strip_mentions_keeps_unterminated_text() {
-        // 没有闭合尖括号时不能吃掉正文，也不能死循环。
-        assert_eq!(strip_mentions("喊 <@unterminated 来"), "喊 <@unterminated 来");
-        assert_eq!(strip_mentions("a<@X>b<@Y>c"), "a b c");
     }
 
     #[test]

@@ -140,7 +140,11 @@ impl Dispatcher {
                 sender_id: message.sender_openid().map(str::to_string),
                 sender_name: message.author.username.clone(),
                 event_name: name.to_string(),
-                content: message.trimmed().to_string(),
+                // 入库的是**插件视图**（提及已当空白）：消息库的主要消费者是词云语料，
+                // 与 `Ctx::content()` 用同一份文本 —— 否则「内存语料」与「库语料」
+                // 口径不一致，同一个词云换个路径统计出的结果就不一样。
+                // 保真度不受影响：原文在 `raw` 列。
+                content: message.plain_text().to_string(),
                 // 原文一并入库：类型里只声明了文档写到的字段，没声明的会在
                 // 反序列化时丢掉 —— 留一份原文，将来才能重新提取。
                 // 附件就在这份原文里：v14 删掉了 `message_attachments` 表，

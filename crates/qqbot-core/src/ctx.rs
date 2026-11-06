@@ -104,6 +104,9 @@ pub struct Ctx {
     pub target: Target,
     /// 这条消息的回复句柄。凭证在构造时就已挂上，插件不必（也不能）再补。
     pub reply: Reply,
+    /// 命令文本：任意位置的 `<@openid>` 都当空白（见 `MessageEvent::plain_text`）。
+    ///
+    /// 在这里算一次、全链路共用：路由匹配、`args` / `rest`、日志、入库都读它。
     content: String,
     args: Vec<String>,
 }
@@ -112,13 +115,17 @@ impl Ctx {
     /// 由入站消息构造；无法推导发送目标时返回 `None`。
     pub fn new(services: Arc<Services>, message: Arc<MessageEvent>) -> Option<Self> {
         let target = message.target()?;
-        let content = message.trimmed().to_string();
+        // 用 plain_text 而不是 trimmed：官方把提及内联在光标处，只剥开头的话
+        // 参数会被污染成 `2d10<@…>`，解析失败后**静默**退回默认值。
+        let content = message.plain_text().to_string();
         let args = content.split_whitespace().skip(1).map(str::to_string).collect();
         let reply = Reply::for_message(services.clone(), target.clone(), message.id.clone());
         Some(Self { services, message, target, reply, content, args })
     }
 
-    /// 去掉首尾空白后的全文（路由匹配依据）。
+    /// 去掉首尾空白、且把任意位置的 `<@openid>` 当空白后的全文。
+    ///
+    /// 这是路由匹配与插件解析的**唯一**依据；原文在 `ctx.message.content`。
     pub fn content(&self) -> &str {
         &self.content
     }
@@ -195,6 +202,18 @@ mod tests {
         assert_eq!(ctx.rest(), "价格 显卡");
         assert!(ctx.is_group());
         assert_eq!(ctx.target, Target::group("G1"));
+    }
+
+    /// 提及落在**参数后面**时不能污染参数（实测最常见的形态：先打字再点 @）。
+    #[tokio::test]
+    async fn mid_text_mention_does_not_pollute_args() {
+        let m = message(
+            r#"{"id":"M4","author":{"member_openid":"U1"},"content":"查子弹 7N39<@BOT>","group_openid":"G1"}"#,
+        );
+        let ctx = Ctx::new(services(), m).unwrap();
+        assert_eq!(ctx.content(), "查子弹 7N39");
+        assert_eq!(ctx.arg(0), Some("7N39"));
+        assert_eq!(ctx.rest(), "7N39");
     }
 
     #[tokio::test]

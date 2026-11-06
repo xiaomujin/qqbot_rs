@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::Deserialize;
 
 use crate::message::Target;
@@ -22,6 +24,13 @@ pub struct User {
     pub username: Option<String>,
     #[serde(default)]
     pub bot: bool,
+    /// 这条提及是否指**本机器人**（实测：只有机器人自己被 @ 时为 `true`）。
+    ///
+    /// 机器人 openid 是按群下发的，事先无从得知，所以这是判断「是否被 @」的
+    /// **唯一**可靠依据 —— 不要拿 openid 去比。文档没写这个字段，类型里不声明
+    /// 就会被反序列化静默丢掉。
+    #[serde(default)]
+    pub is_you: bool,
     #[serde(default)]
     pub union_openid: Option<String>,
     #[serde(default)]
@@ -128,7 +137,7 @@ pub struct MessageEvent {
     ///
     /// ⚠️ **全量模式下 @机器人 不会被剥离**：`GROUP_MESSAGE_CREATE` 的 content
     /// 形如 `<@9FC25631...> 日报`（实测）。只有 `GROUP_AT_MESSAGE_CREATE` 才带
-    /// 剥离行为，而全量模式不会下发该事件。因此匹配前必须走 [`Self::trimmed`]。
+    /// 剥离行为，而全量模式不会下发该事件。因此匹配前必须走 [`Self::plain_text`]。
     #[serde(default)]
     pub content: String,
     /// 群聊场景存在，单聊场景为空。
@@ -196,9 +205,13 @@ impl MessageEvent {
         matches!(self.sender_role(), Some("admin") | Some("owner"))
     }
 
-    /// 去除首尾空白与**开头 @提及**后的命令文本。
+    /// 去除首尾空白与**开头 @提及**后的文本 —— 协议层的**最小**视图。
     ///
-    /// 这是路由匹配的唯一依据。全量模式下官方不剥离 @机器人 前缀，
+    /// 只剥开头，正文中间/结尾的提及原样保留，因此**不要**拿它当插件面的命令文本：
+    /// 需要干净参数的调用方走 [`Self::plain_text`]（`Ctx::content()` 用的就是它）。
+    /// 保留这个方法是因为它精确对应「官方剥了什么」，排障时要能区分两者。
+    ///
+    /// 全量模式下官方不剥离 @机器人 前缀，
     /// content 形如 `<@9FC25631...> 日报`；不处理的话，
     /// 用户 **@机器人 发命令永远匹配不上**（裸关键词却正常，很容易误判成权限问题）。
     ///
@@ -213,6 +226,49 @@ impl MessageEvent {
             text = rest[end + 1..].trim_start();
         }
         text
+    }
+
+    /// 插件面的**干净文本**：任意位置的 `<@openid>` 一律当空白，再 trim。
+    ///
+    /// 与 [`Self::trimmed`] 的差别只在「提及出现在哪」：官方把提及内联在**光标处**，
+    /// 先打字再点 @ 就落在结尾（库里真实样本：`我第一次下载给的6块<@28800DF7…>`），
+    /// 于是 `r 2d10<@…>` 的参数会变成 `2d10<@…>`，解析失败后悄悄退回默认值 ——
+    /// 从用户角度看就是「@ 和不 @ 结果不一样」。
+    ///
+    /// 早先只在骰子内部清，理由是「别的插件（词云语料、资源关键词）依赖正文原样」。
+    /// 后来核了一遍消费方：用 `content()` 做**解析**的有十来处、用 `args()` 的只有
+    /// 两处，局部清洗等于没修；而那两个被点名的消费者本来就希望文本干净 ——
+    /// 语料里的 `<@…>` 只会变成垃圾词，资源关键词是**整串**匹配，带提及就查不到。
+    /// 所以清洗上移到这一层，骰子那份私有实现随之删除。
+    ///
+    /// 提及替换为**一个空格**而不是直接删掉：`a<@X>b` 不能粘成 `ab`。
+    /// 不做空白折叠 —— `Ctx` 的 `args` 走 `split_whitespace`，而 `content` 保留
+    /// 原样对词云更友好。未闭合的 `<@` 原样保留（那不是提及，是正文）。
+    ///
+    /// 返回 `Cow`：绝大多数消息里根本没有提及，那时直接借用，连一次分配都省掉。
+    pub fn plain_text(&self) -> Cow<'_, str> {
+        let text = self.content.as_str();
+        if !text.contains("<@") {
+            return Cow::Borrowed(text.trim());
+        }
+
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find("<@") {
+            // 没有闭合尖括号就不猜：原样留下（`<@unterminated` 不是提及，是正文）。
+            let Some(end) = rest[start + 2..].find('>') else {
+                break;
+            };
+            out.push_str(&rest[..start]);
+            out.push(' ');
+            rest = &rest[start + 2 + end + 1..];
+        }
+        out.push_str(rest);
+
+        // 替换出来的空格可能落在首尾：`日报<@X>` → `日报 `。
+        let needs_trim = out.trim().len() != out.len();
+        let out = if needs_trim { out.trim().to_string() } else { out };
+        Cow::Owned(out)
     }
 
     /// 第一个附件。
@@ -287,6 +343,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ev.trimmed(), "");
+    }
+
+    /// 提及替换为**一个空格**再 trim；未闭合的尖括号原样保留。
+    #[test]
+    fn plain_text_strips_mentions_anywhere() {
+        let ev = |content: &str| -> MessageEvent {
+            let quoted = serde_json::to_string(content).unwrap();
+            serde_json::from_str(&format!(r#"{{"id":"M1","content":{quoted}}}"#)).unwrap()
+        };
+
+        // 结尾（先打字再点 @）与开头
+        assert_eq!(ev("r 2d10<@AAA>").plain_text(), "r 2d10");
+        assert_eq!(ev("<@AAA> 日报").plain_text(), "日报");
+        // 中间：提及当空白，不能把前后粘成一个词
+        assert_eq!(ev("a<@AAA>b<@BBB>c").plain_text(), "a b c");
+        // 纯提及 → 空串
+        assert_eq!(ev("<@AAA>").plain_text(), "");
+        // 未闭合的尖括号是正文，不能吃掉
+        assert_eq!(ev("喊 <@unterminated 来").plain_text(), "喊 <@unterminated 来");
+    }
+
+    /// 没有提及时必须借用：这是每条消息都要过的热路径。
+    #[test]
+    fn plain_text_borrows_when_no_mention() {
+        let ev: MessageEvent =
+            serde_json::from_str(r#"{"id":"M1","content":"  骰子 3d6  "}"#).unwrap();
+        assert!(matches!(ev.plain_text(), Cow::Borrowed(_)));
+        assert_eq!(ev.plain_text(), "骰子 3d6", "借用路径同样要 trim");
+    }
+
+    /// `mentions[].is_you` 是判断「是否被 @」的唯一可靠依据，不能丢。
+    #[test]
+    fn mention_is_you_is_kept() {
+        let ev: MessageEvent = serde_json::from_str(
+            r#"{"id":"M1","content":"<@BOT> 帮助","group_openid":"G1","mentions":[
+                 {"id":"BOT","member_openid":"BOT","is_you":true,"bot":true,"username":"黑猫Bot"},
+                 {"id":"U2","member_openid":"U2","username":"小明"}
+               ]}"#,
+        )
+        .unwrap();
+        assert!(ev.mentions[0].is_you);
+        assert!(!ev.mentions[1].is_you, "字段缺省必须是 false，不能默认成 true");
+        assert_eq!(ev.plain_text(), "帮助");
     }
 
     #[test]

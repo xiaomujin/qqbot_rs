@@ -41,7 +41,10 @@ rand = "0.10.3"
 regex = "1.13.1"
 # 刻意关掉默认特性并显式选 native-tls：aws-lc-rs 需要 cmake/nasm，本机没有。
 # query 特性用于分页接口（cursor / limit）的查询串编码，只多带一个 serde_urlencoded。
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "charset", "native-tls", "query"] }
+# gzip 不是省流量用的，是**正确性**：不带 Accept-Encoding 的请求会被 alapi
+# 当成爬虫直接回 code=429（HTTP 仍是 200），日报因此常年「请求次数过多」。见
+# crates/qqbot-plugins/src/http.rs 的 build_client。
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "charset", "native-tls", "query", "gzip"] }
 resvg = "0.48.1"
 # bundled = 自带 SQLite 源码一起编译，不依赖系统库。
 # 0.40.x 的 MSRV 是 1.88（0.40.2 的 release note: "Lower MSRV to 1.88.0"），

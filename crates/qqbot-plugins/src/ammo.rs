@@ -3,46 +3,52 @@
 //! 数据来自 `json.tarkov.dev/regular/items` —— **静态 JSON**，与 GraphQL 是同一份
 //! 数据源，但 GraphQL 后端挂掉时它照样能用（2026-09 实测）。
 //!
+//! 本模块**只读**：下载与写库全在 `tarkov_data`（一次刷新同时刷弹药 / 物品 / 任务）。
+//! 这里保留 `parse_ammo` / `parse_item_lang` / `item_name`，因为刷新器要用它们。
+//!
 //! 中文名来自 `regular/items_zh` 语言包（键是 `<物品 id> Name`）——
 //! 静态 JSON 里的 `name` 是翻译键，语言包才是它的字典，不再依赖 GraphQL。
 //! 检索同时匹配 `normalizedName` 与中文名：玩家打 `m855`、`bp`、`5.45`、`穿甲` 都能命中。
+//!
+//! # 为什么是 Markdown + 列表 / 详情
+//!
+//! 与跳蚤市场同一套版式（`market.rs`）：查子弹是为了**比**几发弹，所以先给列表、
+//! 列表里每发都能点进详情。而群聊里唯一可点的是 `qqbot-cmd-input`（插入输入框），
+//! 它只能出现在 `msg_type=2` 的 Markdown 里 —— 富媒体卡片的 `content` 是纯文本，
+//! 塞不进这种标签，两者只能二选一。于是整个插件从卡片改成 Markdown。
+//!
+//! 弹道数据只在本表（`ammo`），而**价格 / 图片 / 链接在物品表（`tarkov_item`）**，
+//! 同一个 id 一行；详情视图按 id 各取一次，缺了物品行就只印弹道。
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use qqbot_core::{Ctx, Handled, Handler};
-use qqbot_render::{Card, CardRow};
-use qqbot_store::{Ammo, ResourceStore};
+use qqbot_store::{Ammo, ResourceStore, TarkovItem};
 use serde::Deserialize;
 
-/// 数据源。
-const ITEMS_URL: &str = "https://json.tarkov.dev/regular/items";
-/// 物品名语言包。中文名从这里来，不再依赖 GraphQL 的 `lang: zh`。
-const ITEMS_ZH_URL: &str = "https://json.tarkov.dev/regular/items_zh";
+use crate::md::{
+    BR, image_block, is_item_id, labelled, link_line, md_safe, price_lines, scan_footer,
+    trader_line,
+};
+use crate::task::cmd_input;
+
 /// 一次最多列几发。
-const MAX_ROWS: usize = 12;
+///
+/// 十条照抄跳蚤列表：两行一发、十条一屏多一点；再多用户也不会读完，
+/// 而消息长度与「补个关键词」的成本都在涨。
+const LIST_LIMIT: usize = 10;
 
 /// 弹药插件配置。
 // 不派生 Debug：ResourceStore 没有有意义的 Debug 表示。
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct AmmoConfig {
-    /// 静态 JSON 地址。
-    pub items_url: String,
-    /// 物品名语言包（`<id> Name`）。弹药名在上游是翻译键，没有它就只剩 slug。
-    pub items_zh_url: String,
     /// 弹药表。`None` 表示未启用持久化。
+    ///
+    /// 没有 URL 字段：数据由 `tarkov_data` 的刷新器写入，这个插件只读。
     pub store: Option<Arc<ResourceStore>>,
-}
-
-impl Default for AmmoConfig {
-    fn default() -> Self {
-        Self {
-            items_url: ITEMS_URL.into(),
-            items_zh_url: ITEMS_ZH_URL.into(),
-            store: None,
-        }
-    }
 }
 
 /// 物品名语言包：`<id> Name` → 中文。跳蚤市场也用它。
@@ -181,154 +187,209 @@ pub fn query_tokens(raw: &str) -> Vec<String> {
         .collect()
 }
 
+// ---- 排版 ----
 
-/// 卡片行：左边名称，右边三项关键数值。
-pub fn format_rows(items: &[Ammo]) -> Vec<CardRow> {
-    items
-        .iter()
-        .map(|a| {
-            CardRow::Item {
-                label: a.name_zh.as_deref().unwrap_or(&a.normalized_name).to_string(),
-                value: format!("伤{} 穿{} 甲伤{}", a.damage, a.penetration_power, a.armor_damage),
-            }
-        })
-        .collect()
+/// 列表第二行：`伤害51｜穿透37｜甲伤42｜<详情>`。
+///
+/// 用**全称**而不是缩写：三段全称加上「详情」正好 28 个显示单位，
+/// 仍在手机行宽（30）以内；`伤51｜穿37` 省下的两个单位换不来可读性。
+fn summary(a: &Ammo) -> String {
+    format!(
+        "伤害{}｜穿透{}｜甲伤{}｜{}",
+        a.damage,
+        a.penetration_power,
+        a.armor_damage,
+        // 可点文本：点一下只是把「查子弹 <id>」插进输入框，用户还得按发送
+        // （群聊不支持 qqbot-cmd-enter，见协议文档 §12.1）。
+        cmd_input(&format!("查子弹 {}", a.id), "详情")
+    )
 }
 
-/// `Clone` 是必需的：同一个实例要挂到两条命令路由上。
+/// 检索结果（Markdown）。
+///
+/// 每发两行：`- **名称**` + 缩进的 `伤害…｜穿透…｜甲伤…｜详情`，
+/// 与跳蚤列表刻意保持一致（同一套「一件两行 + 可点详情」的习惯）。
+pub fn render_list(items: &[Ammo], total: i64) -> String {
+    let mut out = String::new();
+    // 只有「被截断」时才提示条数：没截断还写一行，纯属噪音。
+    if total > items.len() as i64 {
+        let _ = writeln!(
+            out,
+            "匹配 {total} 发，显示前 {} 发。补个关键词能缩小范围。",
+            items.len()
+        );
+        out.push('\n');
+    }
+    for a in items {
+        let _ = writeln!(out, "- **{}**{BR}", md_safe(a.display_name()));
+        let _ = writeln!(out, "  {}{BR}", summary(a));
+    }
+    out
+}
+
+/// 弹道段。伤害 / 穿透 / 甲伤是「查子弹」的全部理由，所以**必定出现**。
+fn ballistics_line(a: &Ammo) -> String {
+    let values = vec![
+        format!("伤害 {}", a.damage),
+        format!("穿透 {}", a.penetration_power),
+        format!("甲伤 {}", a.armor_damage),
+    ];
+    labelled("弹道", &values).unwrap_or_default()
+}
+
+/// 飞行特性段。初速与碎弹率必定出现；弹丸数与曳光只在有信息量时出现
+/// （`projectile_count` 导入时已兜底成 1，写「弹丸 1」是噪音）。
+fn flight_line(a: &Ammo) -> String {
+    let mut values = vec![
+        format!("初速 {} m/s", a.initial_speed),
+        format!("碎弹 {:.0}%", a.fragmentation_chance * 100.0),
+    ];
+    if a.projectile_count > 1 {
+        values.push(format!("弹丸 {}", a.projectile_count));
+    }
+    if a.tracer {
+        values.push("曳光".into());
+    }
+    labelled("飞行", &values).unwrap_or_default()
+}
+
+/// 详情页（Markdown）。
+///
+/// `item` 是同 id 在 `tarkov_item` 里的那一行 —— **价格 / 图片 / wiki 链接只在
+/// 那张表里**（弹药表只存弹道）。缺了它（旧数据、上游没给）就只印弹道，
+/// 不印空的价格段：一行「跳蚤 均价 -」比不印更糟。
+///
+/// ⚠️ 上游 `regular/items` 里 **200 发弹药全部没有跳蚤价**（实测 0/200，
+/// 而全表 3551/5498 有），所以弹药详情通常只出「商人」与「24h 挂单 N 条」，
+/// 跳蚤 / 48h 两段不会出现。这不是漏取字段，是静态 JSON 本来就没有 ——
+/// 要跳蚤价得改走 GraphQL，而那正是本模块刻意避开的东西（见文件头）。
+pub fn render_detail(ammo: &Ammo, item: Option<&TarkovItem>) -> String {
+    let name = md_safe(ammo.display_name());
+    let mut blocks: Vec<String> = vec![format!("# {name}")];
+
+    blocks.extend(image_block(&name, item.and_then(|it| it.image_url.as_deref())));
+    blocks.push(ballistics_line(ammo));
+    blocks.push(flight_line(ammo));
+
+    if let Some(item) = item {
+        // 分割线**只在这一处**：线上是性能，线下是钱。
+        let mut prices: Vec<String> = Vec::new();
+        prices.extend(trader_line(item));
+        prices.extend(price_lines(item));
+        if !prices.is_empty() {
+            blocks.push("***".to_string());
+            blocks.push(prices.join("\n"));
+        }
+        blocks.extend(link_line(item));
+        blocks.push(scan_footer(item));
+    }
+
+    blocks.join("\n\n")
+}
+
+/// 用法提示。空参数与「参数里全是符号」共用同一句。
+async fn usage(ctx: &Ctx) {
+    let _ = ctx
+        .reply
+        .markdown("用法：`查子弹 <名称片段>`（可多关键词，空格分隔），或 `查子弹 <24位物品id>`")
+        .await;
+}
+
+/// 弹药插件：只读本地表。
+///
+/// 数据由 `tarkov_data::TarkovData` 每小时刷新 —— 这里没有任何 HTTP。
 #[derive(Clone)]
 pub struct AmmoPlugin {
     config: AmmoConfig,
-    http: reqwest::Client,
 }
 
 impl AmmoPlugin {
-    pub fn new(config: AmmoConfig, http: reqwest::Client) -> Self {
-        Self { config, http }
+    pub fn new(config: AmmoConfig) -> Self {
+        Self { config }
     }
 
-    /// `更新子弹`：整表重导。
-    async fn reload(&self, ctx: &Ctx) -> Handled {
-        if !ctx.is_group() || !ctx.is_admin() {
-            let _ = ctx.reply.text("只有群管理员能更新弹药数据").await;
-            return Handled::Consumed;
-        }
+    /// `查子弹<空格可有可无> <24位id | 关键词…>`。
+    async fn query(&self, ctx: &Ctx, raw: &str) -> Handled {
         let Some(store) = &self.config.store else {
             let _ = ctx.reply.text("未启用持久化，弹药功能不可用").await;
             return Handled::Consumed;
         };
 
-        let (body, lang) = match tokio::try_join!(
-            self.fetch(&self.config.items_url),
-            self.fetch(&self.config.items_zh_url)
-        ) {
-            Ok(pair) => pair,
-            Err(reason) => {
-                tracing::warn!(error = %reason, "下载弹药数据失败");
-                let _ = ctx.reply.text(format!("下载失败：{reason}")).await;
+        // 24 位十六进制 → 详情视图；否则当关键词搜。
+        let markdown = if is_item_id(raw) {
+            let ammo = match store.get_ammo(raw).await {
+                Ok(Some(ammo)) => ammo,
+                Ok(None) => {
+                    let hint = self.empty_hint(store, "没有这个 id 对应的弹药").await;
+                    let _ = ctx.reply.text(hint).await;
+                    return Handled::Consumed;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "按 id 取弹药失败");
+                    let _ = ctx.reply.text("查询失败，稍后再试").await;
+                    return Handled::Consumed;
+                }
+            };
+            // 价格 / 图片 / 链接在物品表里。读不到就退化成纯弹道视图 —— 不是错误。
+            let item = store.get_item(raw).await.unwrap_or(None);
+            render_detail(&ammo, item.as_ref())
+        } else {
+            let tokens = query_tokens(raw);
+            if tokens.is_empty() {
+                usage(ctx).await;
                 return Handled::Consumed;
             }
-        };
-        let pack = match parse_item_lang(&lang) {
-            Ok(pack) => pack,
-            Err(reason) => {
-                tracing::warn!(error = %reason, "弹药语言包解析失败");
-                let _ = ctx.reply.text(format!("语言包解析失败：{reason}")).await;
+            let items = match store.search_ammo(tokens.clone(), LIST_LIMIT).await {
+                Ok(items) => items,
+                Err(err) => {
+                    tracing::warn!(error = %err, "检索弹药失败");
+                    let _ = ctx.reply.text("查询失败，稍后再试").await;
+                    return Handled::Consumed;
+                }
+            };
+            if items.is_empty() {
+                // 空表与「查不到」要给不同的话：前者是没导入，后者是关键词不对。
+                let hint = self.empty_hint(store, "没有匹配的弹药").await;
+                let _ = ctx.reply.text(hint).await;
                 return Handled::Consumed;
             }
-        };
-        let items = match parse_ammo(&body, &pack) {
-            Ok(items) if !items.is_empty() => items,
-            Ok(_) => {
-                let _ = ctx.reply.text("解析出 0 条弹药，上游格式可能变了").await;
-                return Handled::Consumed;
-            }
-            Err(reason) => {
-                tracing::warn!(error = %reason, "解析弹药数据失败");
-                let _ = ctx.reply.text(format!("解析失败：{reason}")).await;
-                return Handled::Consumed;
-            }
+            let total = store.count_ammo(tokens).await.unwrap_or(items.len() as i64);
+            render_list(&items, total)
         };
 
-        match store.replace_ammo(items).await {
-            Ok(count) => {
-                let _ = ctx.reply.text(format!("弹药数据已更新，共 {count} 条")).await;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "写入弹药数据失败");
-                let _ = ctx.reply.text("写入失败，稍后再试").await;
-            }
+        if let Err(err) = ctx.reply.markdown(markdown).await {
+            // 不降级成纯文本摘要：用户已经等了同样久，再发一条更难看的消息没有意义。
+            tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "弹药消息发送失败");
+            let _ = ctx.reply.text(format!("弹药消息发送失败：{err}")).await;
         }
         Handled::Consumed
     }
 
-    /// `查子弹 <关键词>`。
-    async fn search(&self, ctx: &Ctx) -> Handled {
-        let query = ctx.content().trim().strip_prefix("查子弹").unwrap_or("").trim();
-        let tokens = query_tokens(query);
-        if tokens.is_empty() {
-            let _ = ctx.reply.text("用法：查子弹 <名称片段>，例如 查子弹 m855").await;
-            return Handled::Consumed;
+    /// 查不到时的话术。空表与「关键词不对」要给不同的话。
+    async fn empty_hint(&self, store: &ResourceStore, miss: &str) -> String {
+        match store.ammo_count().await {
+            Ok(0) => "弹药数据还没导入，请系统控制者发「塔科夫更新数据」".to_string(),
+            _ => format!("{miss}，换个关键词试试"),
         }
-        let Some(store) = &self.config.store else {
-            let _ = ctx.reply.text("未启用持久化，弹药功能不可用").await;
-            return Handled::Consumed;
-        };
-
-        let items = match store.search_ammo(tokens, MAX_ROWS).await {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(error = %err, "检索弹药失败");
-                let _ = ctx.reply.text("查询失败，稍后再试").await;
-                return Handled::Consumed;
-            }
-        };
-
-        if items.is_empty() {
-            // 空表与「查不到」要给不同的话：前者是没导入，后者是关键词不对。
-            let hint = match store.ammo_count().await {
-                Ok(0) => "弹药数据还没导入，请管理员发「更新子弹」",
-                _ => "没有匹配的弹药，换个关键词试试",
-            };
-            let _ = ctx.reply.text(hint).await;
-            return Handled::Consumed;
-        }
-
-        // 宽度与页脚都用 `Card` 的默认值（统一 1000 / 模板默认页脚）。
-        let mut card = Card::new(format!("弹药 · {query}"));
-        for row in format_rows(&items) {
-            card = match row {
-                CardRow::Item { label, value } => card.row(label, value),
-                CardRow::Section { label } => card.section(label),
-            };
-        }
-        if let Err(err) = ctx.reply.card(&card).await {
-            tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "弹药卡片发送失败");
-            let _ = ctx.reply.text(format!("卡片生成失败：{err}")).await;
-        }
-        Handled::Consumed
-    }
-
-    async fn fetch(&self, url: &str) -> Result<String, crate::http::FetchError> {
-        crate::http::fetch_text(&self.http, url).await
     }
 }
 
 #[async_trait]
 impl Handler for AmmoPlugin {
     async fn handle(&self, ctx: &Ctx) -> Handled {
-        match ctx.content().split_whitespace().next().unwrap_or_default() {
-            "更新子弹" => self.reload(ctx).await,
-            "查子弹" => self.search(ctx).await,
-            _ => Handled::Next,
-        }
+        let content = ctx.content().trim();
+        // 路由用 `Matcher::Prefix("查子弹")`，所以 `查子弹 m855` 与 `查子弹m855`
+        // 都会到这里 —— 差别只在 strip 之后有没有前导空格。
+        let Some(rest) = content.strip_prefix("查子弹") else {
+            return Handled::Next;
+        };
+        self.query(ctx, rest.trim()).await
     }
 
     fn name(&self) -> &'static str {
         "塔科夫弹药"
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +407,41 @@ mod tests {
         r#""noslug":{"normalizedName":"","properties":{"propertiesType":"ItemPropertiesAmmo"}}"#,
         r#"}}}"#,
     );
+
+    fn ammo_stub() -> Ammo {
+        Ammo {
+            id: "5c0d5e4486f77478390952fe".into(),
+            normalized_name: "545x39mm-bp".into(),
+            name_zh: Some("5.45 BP".into()),
+            caliber: "Caliber545x39".into(),
+            damage: 51,
+            penetration_power: 37,
+            armor_damage: 42,
+            fragmentation_chance: 0.16,
+            initial_speed: 890,
+            projectile_count: 1,
+            tracer: false,
+            base_price: 110,
+        }
+    }
+
+    /// 物品表里同一 id 的那一行：价格 / 图片 / 链接都在那儿。
+    fn item_stub() -> TarkovItem {
+        TarkovItem {
+            id: "5c0d5e4486f77478390952fe".into(),
+            normalized_name: "545x39mm-bp".into(),
+            name_zh: Some("5.45 BP".into()),
+            base_price: 110,
+            sell_trader_name: Some("Prapor".into()),
+            sell_trader_price: Some(87),
+            avg24h_price: Some(12_000),
+            last_low_price: Some(11_000),
+            image_url: Some("https://assets/bp-grid.webp".into()),
+            wiki_link: Some("https://wiki/bp".into()),
+            last_scan: Some(1_794_538_082),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn keeps_only_real_ammo() {
@@ -411,4 +507,77 @@ mod tests {
         }
     }
 
+    /// 列表：每发两行，第二行是弹道与可点的「详情」。
+    #[test]
+    fn list_puts_ballistics_and_clickable_detail() {
+        let md = render_list(&[ammo_stub()], 1);
+        assert!(md.contains("- **5.45 BP**"), "第一行是名称: {md}");
+        assert!(md.contains("伤害51｜穿透37｜甲伤42"), "第二行是弹道: {md}");
+        assert!(md.contains("<qqbot-cmd-input "), "详情必须是可点文本: {md}");
+        // 点一下插入的是「查子弹 <id>」，urlencode 之后就是这个前缀。
+        assert!(
+            md.contains("text=\"%E6%9F%A5%E5%AD%90%E5%BC%B9%20"),
+            "点一下要插入「查子弹 <id>」: {md}"
+        );
+        assert!(md.contains('\u{200B}'), "行末要有零宽空格，否则不换行: {md}");
+        assert!(!md.contains("匹配"), "没被截断就不该提条数: {md}");
+    }
+
+    #[test]
+    fn list_says_when_it_truncated() {
+        let items: Vec<Ammo> = (0..10)
+            .map(|i| {
+                let mut a = ammo_stub();
+                a.id = format!("id{i}");
+                a
+            })
+            .collect();
+        let md = render_list(&items, 137);
+        assert!(md.starts_with("匹配 137 发，显示前 10 发"), "要说明被截断: {md}");
+        assert!(md.contains("补个关键词"), "{md}");
+    }
+
+    /// 详情：图片、弹道、飞行、价格、链接、页脚一个都不少。
+    #[test]
+    fn detail_shows_ballistics_prices_and_links() {
+        let item = item_stub();
+        let md = render_detail(&ammo_stub(), Some(&item));
+        assert!(md.starts_with("# 5.45 BP\n"), "{md}");
+        assert!(
+            md.contains("![5.45 BP #96px #96px](https://assets/bp-grid.webp)"),
+            "图片来自物品表: {md}"
+        );
+        assert!(md.contains("**弹道** 伤害 51｜穿透 37｜甲伤 42"), "{md}");
+        assert!(md.contains("**飞行** 初速 890 m/s｜碎弹 16%"), "{md}");
+        assert!(!md.contains("弹丸 1"), "单发弹不印「弹丸 1」: {md}");
+        assert!(md.contains("**商人** 基准 110｜最高收购 87（Prapor）"), "{md}");
+        assert!(md.contains("**跳蚤** 均价 1.20万｜最低挂牌 1.10万"), "{md}");
+        assert!(md.contains("[wiki](https://wiki/bp)"), "{md}");
+        assert!(md.ends_with("> 价格数据：2026-11-13 10:48:02"), "页脚是扫描时刻: {md}");
+        // 分割线要落在「性能」与「价格」之间，而不是随便插一行。
+        let sep = md.find("***").expect("要有分割线");
+        assert!(sep > md.find("**弹道**").unwrap(), "分割线在弹道之后: {md}");
+        assert!(sep < md.find("**商人**").unwrap(), "分割线在商人段之前: {md}");
+    }
+
+    /// 物品表里缺这一行时只印弹道，不能印出空的价格段。
+    #[test]
+    fn detail_without_the_item_row_is_ballistics_only() {
+        let md = render_detail(&ammo_stub(), None);
+        assert!(md.contains("**弹道**"), "{md}");
+        assert!(!md.contains("!["), "没有物品行就没有图: {md}");
+        assert!(!md.contains("***"), "没有价格段就不该有分割线: {md}");
+        assert!(!md.contains("**商人**"), "{md}");
+        assert!(!md.contains("价格数据"), "没有物品行就没有扫描时刻: {md}");
+    }
+
+    #[test]
+    fn shotgun_pellets_and_tracer_show_up() {
+        let mut a = ammo_stub();
+        a.projectile_count = 9;
+        a.tracer = true;
+        let md = render_detail(&a, None);
+        assert!(md.contains("弹丸 9"), "霰弹要说几颗: {md}");
+        assert!(md.contains("曳光"), "{md}");
+    }
 }

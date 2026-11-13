@@ -30,6 +30,13 @@ const SYSTEM_CONTROLLERS_KEY: &str = "system_controllers";
 /// 而「同一作用域内关键词唯一」正是靠它保证的。
 pub const SYSTEM_OWNER: &str = "";
 
+/// 上一次**成功**刷新塔科夫数据的时刻（unix 秒，存在 `settings` 表里）。
+///
+/// 刷新器用它判断「启动时该不该立刻回填」，`ensure_tarkov_tables` 重建表时删它。
+/// 放在 `settings` 而不是 `meta`：它是运维可见的运行状态，与系统控制者名单同类；
+/// `meta` 只放结构性的版本号。
+pub const REFRESH_SETTING_KEY: &str = "tarkov_refreshed_at";
+
 /// 资源作用域。
 ///
 /// 与消息的 [`crate::Scope`] 名字相近但语义无关，所以刻意分开命名。
@@ -133,6 +140,16 @@ pub struct Ammo {
     pub tracer: bool,
     pub base_price: i64,
 }
+impl Ammo {
+    /// 显示名：中文名 → slug。
+    ///
+    /// 语言包缺条目时（上游偶发）退回 slug，不显示空字符串 ——
+    /// 列表第一行空着比显示 slug 更像坏了。
+    pub fn display_name(&self) -> &str {
+        self.name_zh.as_deref().unwrap_or(&self.normalized_name)
+    }
+}
+
 
 /// 一个塔科夫任务。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,7 +282,13 @@ pub struct TarkovTaskDetail {
 }
 
 /// 一件塔科夫物品（含跳蚤价格）。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// 字段口径逐条说明见 `schema.rs` 的 `tarkov_item` DDL —— 这里只强调两件事：
+/// 价格类字段**可以为 None**（5148 件里近 2000 件没有跳蚤数据），
+/// 而 `None` 与 0 是两种完全不同的意思，渲染层必须区分。
+///
+/// 派生 `Default` 只为测试与占位（全是 0 / 空）：生产路径一律来自 `read_item`。
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct TarkovItem {
     pub id: String,
     /// 可读 slug，如 `colt-m4a1-556x45-assault-rifle`。
@@ -274,12 +297,56 @@ pub struct TarkovItem {
     pub name_zh: Option<String>,
     /// 商人基础价。
     pub base_price: i64,
-    /// 跳蚤市场价。`None` 表示这件物品没有跳蚤数据（实测 5442 件里只有 3525 件有）。
+    /// 跳蚤市场价。`None` 表示这件物品没有跳蚤数据（实测 5498 件里 3550 件有）。
     pub last_low_price: Option<i64>,
     pub avg24h_price: Option<i64>,
     pub low24h_price: Option<i64>,
     pub high24h_price: Option<i64>,
+    /// 48 小时绝对变化（RUB，可负）。
+    pub change_48h: Option<i64>,
+    /// 48 小时百分比变化（`-27.38` 表示 −27.38%），上游算好的。
+    pub change_48h_percent: Option<f64>,
+    /// 当前挂单数。
+    pub offer_count: Option<i64>,
+    /// 卖给商人最赚的那一家的昵称与 RUB 报价。
+    pub sell_trader_name: Option<String>,
+    pub sell_trader_price: Option<i64>,
+    /// 跳蚤市场准入等级（0 表示未给）。
+    pub min_level_flea: i64,
+    pub grid_w: i64,
+    pub grid_h: i64,
     pub weight: f64,
+    pub icon_url: Option<String>,
+    pub image_url: Option<String>,
+    pub wiki_link: Option<String>,
+    pub dev_link: Option<String>,
+    /// 上游价格扫描时刻（unix 秒）。
+    pub last_scan: Option<i64>,
+}
+
+impl TarkovItem {
+    /// 显示名：中文名 → slug。
+    pub fn display_name(&self) -> &str {
+        self.name_zh.as_deref().unwrap_or(&self.normalized_name)
+    }
+
+    /// 跳蚤参考价：24 小时均价优先，其次最低挂牌。
+    ///
+    /// 两者都没有就是 `None` —— 绝不能回退成 0，那会被读成「不值钱」。
+    pub fn flea_price(&self) -> Option<i64> {
+        self.avg24h_price.or(self.last_low_price)
+    }
+
+    /// 每格价值：跳蚤参考价 ÷ 占格数。占格为 0（上游没给）或没有跳蚤价时为 `None`。
+    ///
+    /// 塔科夫玩家的核心指标：同样 10 万，占 1 格与占 6 格不是一回事。
+    pub fn value_per_slot(&self) -> Option<i64> {
+        let slots = self.grid_w * self.grid_h;
+        if slots <= 0 {
+            return None;
+        }
+        self.flea_price().map(|price| price / slots)
+    }
 }
 
 /// 拼出「按 slug 片段检索」的 SQL 与参数。
@@ -319,18 +386,54 @@ fn like_query(
     (sql, params)
 }
 
+/// 「按名称片段检索」的 WHERE 子句（含前导空格）与参数。弹药表列名一致，`count_ammo` 也用它。
+///
+/// 与 `like_query` 分开只为一点：物品要按**相关性**排序，而 `like_query` 把
+/// `ORDER BY` 写死成 slug 字母序。把 WHERE 单独抽出来，排序与计数就能共用同一段条件
+/// —— 否则「列表里的条数」与「顶部的命中总数」迟早不一致。
+fn item_where(tokens: &[String]) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = String::from(" WHERE 1 = 1");
+    let mut params = Vec::with_capacity(tokens.len());
+    for (i, token) in tokens.iter().enumerate() {
+        let n = i + 1;
+        let _ = write!(sql, " AND (normalized_name LIKE ?{n} OR name_zh LIKE ?{n})");
+        params.push(rusqlite::types::Value::Text(format!("%{token}%")));
+    }
+    (sql, params)
+}
+
 const SELECT_AMMO: &str = "SELECT id, normalized_name, name_zh, caliber, damage, \
      penetration_power, armor_damage, fragmentation_chance, initial_speed, projectile_count, \
      tracer, base_price FROM ammo";
+/// 从一行读出一发弹药。列顺序必须与 `SELECT_AMMO` 一致。
+fn read_ammo(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ammo> {
+    Ok(Ammo {
+        id: row.get(0)?,
+        normalized_name: row.get(1)?,
+        name_zh: row.get(2)?,
+        caliber: row.get(3)?,
+        damage: row.get(4)?,
+        penetration_power: row.get(5)?,
+        armor_damage: row.get(6)?,
+        fragmentation_chance: row.get(7)?,
+        initial_speed: row.get(8)?,
+        projectile_count: row.get(9)?,
+        tracer: row.get(10)?,
+        base_price: row.get(11)?,
+    })
+}
+
 
 const SELECT_TASKS: &str = "SELECT id, normalized_name, name_zh, name_en, trader, trader_name_zh, \
      trader_image, task_image, map, map_name_zh, min_level, is_kappa, is_lightkeeper, experience, \
      wiki_link, faction, restartable, updated_at FROM tarkov_task";
 
-const SELECT_ITEMS: &str = "SELECT id, normalized_name, name_zh, base_price, last_low_price, \
-     avg24h_price, low24h_price, high24h_price, weight FROM tarkov_item";
+const SELECT_ITEMS: &str = "SELECT id, normalized_name, name_zh, base_price, \
+     last_low_price, avg24h_price, low24h_price, high24h_price, change_48h, \
+     change_48h_percent, offer_count, sell_trader_name, sell_trader_price, min_level_flea, \
+     grid_w, grid_h, weight, icon_url, image_url, wiki_link, dev_link, last_scan FROM tarkov_item";
 
-/// 从一行读出物品。三个查询共用同一段列映射，列顺序必须与 SQL 里一致。
+/// 从一行读出物品。三个查询共用同一段列映射，列顺序必须与 `SELECT_ITEMS` 一致。
 fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<TarkovItem> {
     Ok(TarkovItem {
         id: row.get(0)?,
@@ -341,7 +444,20 @@ fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<TarkovItem> {
         avg24h_price: row.get(5)?,
         low24h_price: row.get(6)?,
         high24h_price: row.get(7)?,
-        weight: row.get(8)?,
+        change_48h: row.get(8)?,
+        change_48h_percent: row.get(9)?,
+        offer_count: row.get(10)?,
+        sell_trader_name: row.get(11)?,
+        sell_trader_price: row.get(12)?,
+        min_level_flea: row.get(13)?,
+        grid_w: row.get(14)?,
+        grid_h: row.get(15)?,
+        weight: row.get(16)?,
+        icon_url: row.get(17)?,
+        image_url: row.get(18)?,
+        wiki_link: row.get(19)?,
+        dev_link: row.get(20)?,
+        last_scan: row.get(21)?,
     })
 }
 
@@ -635,8 +751,12 @@ impl ResourceStore {
             {
                 let mut stmt = tx.prepare_cached(
                     "INSERT OR REPLACE INTO tarkov_item(id, normalized_name, name_zh, base_price, \
-                     last_low_price, avg24h_price, low24h_price, high24h_price, weight) \
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     last_low_price, avg24h_price, low24h_price, high24h_price, change_48h, \
+                     change_48h_percent, offer_count, sell_trader_name, sell_trader_price, \
+                     min_level_flea, grid_w, grid_h, weight, icon_url, image_url, wiki_link, \
+                     dev_link, last_scan) \
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                            ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
                 )?;
                 for it in &items {
                     stmt.execute(rusqlite::params![
@@ -648,7 +768,20 @@ impl ResourceStore {
                         it.avg24h_price,
                         it.low24h_price,
                         it.high24h_price,
+                        it.change_48h,
+                        it.change_48h_percent,
+                        it.offer_count,
+                        it.sell_trader_name,
+                        it.sell_trader_price,
+                        it.min_level_flea,
+                        it.grid_w,
+                        it.grid_h,
                         it.weight,
+                        it.icon_url,
+                        it.image_url,
+                        it.wiki_link,
+                        it.dev_link,
+                        it.last_scan,
                     ])?;
                 }
             }
@@ -658,21 +791,58 @@ impl ResourceStore {
         .await
     }
 
-    /// 按关键词检索物品。`tokens` 的语义同 `search_ammo`。
+    /// 按关键词检索物品，**按相关性排序**。
+    ///
+    /// `tokens` 的语义同 `search_ammo`：全部命中（token 间 AND）、列间 OR。
+    /// `hint` 是用户输入的原样片段（已归一化），**只用于排序**：
+    /// 完全匹配 > 前缀 > 中文名包含 > 其它，同档再按 slug（保证输出稳定）。
+    ///
+    /// 为什么不能只按 slug 排：`跳蚤 弹匣` 这类高频词会命中几十件，
+    /// 字母序会把用户真正想要的那件挤到十条之外，而列表只显示十条。
     pub async fn search_items(
         &self,
         tokens: Vec<String>,
+        hint: String,
         limit: usize,
     ) -> Result<Vec<TarkovItem>> {
         self.with(move |conn| {
-            let (sql, params) =
-                like_query(SELECT_ITEMS, &["normalized_name", "name_zh"], &tokens, limit);
+            let (mut sql, mut params) = item_where(&tokens);
+            let n = tokens.len();
+            let _ = write!(
+                sql,
+                " ORDER BY CASE \
+                   WHEN name_zh LIKE ?{exact} OR normalized_name LIKE ?{exact} THEN 0 \
+                   WHEN name_zh LIKE ?{prefix} OR normalized_name LIKE ?{prefix} THEN 1 \
+                   WHEN name_zh LIKE ?{contains} THEN 2 \
+                   ELSE 3 END, normalized_name LIMIT ?{limit}",
+                exact = n + 1,
+                prefix = n + 2,
+                contains = n + 3,
+                limit = n + 4,
+            );
+            params.push(rusqlite::types::Value::Text(hint.clone()));
+            params.push(rusqlite::types::Value::Text(format!("{hint}%")));
+            params.push(rusqlite::types::Value::Text(format!("%{hint}%")));
+            params.push(rusqlite::types::Value::Integer(
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ));
+            let sql = format!("{SELECT_ITEMS}{sql}");
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params), read_item)?;
-            // 必须先 collect 成 `rusqlite::Result` 再 `?`：
-            // `FromIterator<Result<T, E>>` 要求 E 与目标**完全一致**，
-            // 不会替我们把 rusqlite::Error 转成 anyhow::Error。
+            // 必须先 collect 成 `rusqlite::Result` 再 `?`（理由见 `search_ammo`）。
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// 命中的总条数 —— 列表顶部「匹配 N 件，显示前 M」用它。
+    ///
+    /// 与 [`Self::search_items`] 共用 `item_where`，所以两者条件永远一致。
+    pub async fn count_items(&self, tokens: Vec<String>) -> Result<i64> {
+        self.with(move |conn| {
+            let (sql, params) = item_where(&tokens);
+            let sql = format!("SELECT COUNT(*) FROM tarkov_item{sql}");
+            Ok(conn.query_row(&sql, rusqlite::params_from_iter(params), |r| r.get(0))?)
         })
         .await
     }
@@ -1103,26 +1273,40 @@ impl ResourceStore {
             let (sql, params) =
                 like_query(SELECT_AMMO, &["normalized_name", "name_zh"], &tokens, limit);
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
-                Ok(Ammo {
-                    id: r.get(0)?,
-                    normalized_name: r.get(1)?,
-                    name_zh: r.get(2)?,
-                    caliber: r.get(3)?,
-                    damage: r.get(4)?,
-                    penetration_power: r.get(5)?,
-                    armor_damage: r.get(6)?,
-                    fragmentation_chance: r.get(7)?,
-                    initial_speed: r.get(8)?,
-                    projectile_count: r.get(9)?,
-                    tracer: r.get(10)?,
-                    base_price: r.get(11)?,
-                })
-            })?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), read_ammo)?;
             // 必须先 collect 成 `rusqlite::Result` 再 `?`：
             // `FromIterator<Result<T, E>>` 要求 E 与目标**完全一致**，
             // 不会替我们把 rusqlite::Error 转成 anyhow::Error。
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// 按游戏内 id 精确取一发弹药。详情视图用它。
+    pub async fn get_ammo(&self, id: &str) -> Result<Option<Ammo>> {
+        let id = id.to_string();
+        self.with(move |conn| {
+            let found = conn
+                .query_row(
+                    &format!("{SELECT_AMMO} WHERE id = ?1"),
+                    rusqlite::params![id],
+                    read_ammo,
+                )
+                .optional()?;
+            Ok(found)
+        })
+        .await
+    }
+
+    /// 命中的总条数 —— 列表顶部「匹配 N 发，显示前 M」用它。
+    ///
+    /// 与 [`Self::search_ammo`] 共用 `item_where`（两张表列名一致），
+    /// 所以「列表里的条数」与「顶部的命中总数」永远一致。
+    pub async fn count_ammo(&self, tokens: Vec<String>) -> Result<i64> {
+        self.with(move |conn| {
+            let (sql, params) = item_where(&tokens);
+            let sql = format!("SELECT COUNT(*) FROM ammo{sql}");
+            Ok(conn.query_row(&sql, rusqlite::params_from_iter(params), |r| r.get(0))?)
         })
         .await
     }
@@ -1486,6 +1670,36 @@ mod tests {
         assert_eq!(s.search_ammo(vec!["545".into()], 5).await.unwrap().len(), 5);
     }
 
+    #[tokio::test]
+    async fn ammo_detail_lookup_by_id() {
+        let s = store();
+        s.replace_ammo(vec![ammo("a1", "545x39mm-bp", 37), ammo("a2", "556x45mm-m855", 31)])
+            .await
+            .unwrap();
+
+        let bp = s.get_ammo("a1").await.unwrap().expect("按 id 应当查得到");
+        assert_eq!(bp.normalized_name, "545x39mm-bp");
+        assert_eq!(bp.penetration_power, 37, "数值字段要完整取回");
+        assert!(s.get_ammo("不存在").await.unwrap().is_none(), "查不到是 None，不是错误");
+    }
+
+    #[tokio::test]
+    async fn ammo_count_matches_the_search() {
+        let s = store();
+        s.replace_ammo(vec![
+            ammo("a1", "545x39mm-bp", 37),
+            ammo("a2", "545x39mm-ps", 20),
+            ammo("a3", "556x45mm-m855", 31),
+        ])
+        .await
+        .unwrap();
+
+        // 顶部「匹配 N 发」与列表条数必须来自同一段条件。
+        assert_eq!(s.count_ammo(vec!["545".into()]).await.unwrap(), 2);
+        assert_eq!(s.count_ammo(vec!["545".into(), "bp".into()]).await.unwrap(), 1);
+        assert_eq!(s.count_ammo(vec!["不存在".into()]).await.unwrap(), 0);
+    }
+
     fn task(id: &str, slug: &str, trader: &str, level: i64) -> TarkovTaskDetail {
         TarkovTaskDetail {
             task: TarkovTask {
@@ -1568,7 +1782,20 @@ mod tests {
             avg24h_price: avg,
             low24h_price: avg.map(|v| v - 100),
             high24h_price: avg.map(|v| v + 100),
+            change_48h: Some(215),
+            change_48h_percent: Some(0.4),
+            offer_count: Some(20),
+            sell_trader_name: Some("Prapor".into()),
+            sell_trader_price: Some(8278),
+            min_level_flea: 25,
+            grid_w: 1,
+            grid_h: 1,
             weight: 1.5,
+            icon_url: Some(format!("https://assets/{id}-icon.webp")),
+            image_url: Some(format!("https://assets/{id}-grid.webp")),
+            wiki_link: Some("https://wiki/x".into()),
+            dev_link: Some("https://tarkov.dev/item/x".into()),
+            last_scan: Some(1_700_000_000),
         }
     }
 
@@ -1585,7 +1812,7 @@ mod tests {
         .unwrap();
         assert_eq!(s.item_count().await.unwrap(), 2);
 
-        let found = s.search_items(vec!["m4a1".into()], 10).await.unwrap();
+        let found = s.search_items(vec!["m4a1".into()], "m4a1".into(), 10).await.unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].avg24h_price, Some(93642), "数值字段要完整取回");
 
@@ -1595,9 +1822,29 @@ mod tests {
         assert!(s.get_item("不存在的id").await.unwrap().is_none());
 
         // 缺价要真的存成 NULL，不能变成 0。
-        let slick = s.search_items(vec!["slick".into()], 10).await.unwrap();
+        let slick = s.search_items(vec!["slick".into()], "slick".into(), 10).await.unwrap();
         assert_eq!(slick[0].avg24h_price, None);
         assert_eq!(slick[0].base_price, 1000, "商人价仍在");
+    }
+
+    /// 相关性排序：完全匹配 > 前缀 > 其它；`count_items` 与检索条件必须一致。
+    #[tokio::test]
+    async fn item_search_ranks_matches_and_counts_them() {
+        let s = store();
+        let mut exact = item("i1", "aaa-magazine", Some(1000));
+        exact.name_zh = Some("弹匣".into());
+        let mut prefix = item("i2", "bbb-magazine-60", Some(2000));
+        prefix.name_zh = Some("弹匣 60 发".into());
+        let mut other = item("i3", "ccc-thing", Some(3000));
+        other.name_zh = Some("别的东西".into());
+        // 刻意乱序插入：排序只能来自 SQL，不能来自插入顺序。
+        s.replace_items(vec![prefix, other, exact]).await.unwrap();
+
+        let found = s.search_items(vec!["弹匣".into()], "弹匣".into(), 10).await.unwrap();
+        assert_eq!(found.len(), 2, "只有两件带「弹匣」: {found:?}");
+        assert_eq!(found[0].name_zh.as_deref(), Some("弹匣"), "完全匹配要排第一");
+        assert_eq!(s.count_items(vec!["弹匣".into()]).await.unwrap(), 2);
+        assert_eq!(s.count_items(vec!["没有这个".into()]).await.unwrap(), 0);
     }
 
     /// 子表要跟着主表一起进出，且顺序必须保住。

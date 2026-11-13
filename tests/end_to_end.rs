@@ -258,7 +258,9 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
         return (
             "200 OK",
             json!({"data": {
-                "a1 Name": "M855", "a2 Name": "BP", "a3 Name": "F-1 手雷",
+                "54527a984bdc2d4e668b4567 Name": "5.56x45毫米 M855",
+                "56dff2ced2720bb4668ec70c Name": "5.45x39毫米 BP",
+                "5710c24ad2720bc3a58b4568 Name": "F-1 手雷",
                 "i1 Name": "卢布",
                 "5447a9cd4bdc2dbd208b4567 Name": "柯尔特 M4A1",
                 "5c0e53c886f7744a13f54933 Name": "Slick 防弹衣",
@@ -272,11 +274,12 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
             "200 OK",
             concat!(
                 r#"{"data":{"items":{"#,
-                r#""a1":{"normalizedName":"556x45mm-m855","basePrice":180,"properties":{"propertiesType":"ItemPropertiesAmmo","caliber":"Caliber556x45NATO","damage":54,"penetrationPower":31,"armorDamage":37,"initialSpeed":922,"projectileCount":1,"tracer":false}},"#,
-                r#""a2":{"normalizedName":"545x39mm-bp","basePrice":110,"properties":{"propertiesType":"ItemPropertiesAmmo","caliber":"Caliber545x39","damage":51,"penetrationPower":37,"armorDamage":42,"initialSpeed":890,"projectileCount":1,"tracer":false}},"#,
-                r#""a3":{"normalizedName":"f-1-grenade","basePrice":100,"properties":{"propertiesType":"ItemPropertiesGrenade","damage":80}},"#,
+                r#""54527a984bdc2d4e668b4567":{"normalizedName":"556x45mm-m855","basePrice":180,"properties":{"propertiesType":"ItemPropertiesAmmo","caliber":"Caliber556x45NATO","damage":54,"penetrationPower":31,"armorDamage":37,"initialSpeed":922,"projectileCount":1,"tracer":false}},"#,
+                // 5.45 BP 同时带跳蚤价与图片：弹药详情要按 id 去物品表补价格。
+                r#""56dff2ced2720bb4668ec70c":{"normalizedName":"545x39mm-bp","basePrice":110,"avg24hPrice":12000,"lastLowPrice":11000,"low24hPrice":11000,"high24hPrice":13000,"lastOfferCount":5,"width":1,"height":1,"weight":0.015,"gridImageLink":"https://assets/545-bp-grid.webp","wikiLink":"https://wiki/bp","link":"https://tarkov.dev/item/bp","lastScan":"2026-11-13T02:48:02.000Z","sellToTrader":[{"trader":"t2","price":87,"priceRUB":87}],"properties":{"propertiesType":"ItemPropertiesAmmo","caliber":"Caliber545x39","damage":51,"penetrationPower":37,"armorDamage":42,"initialSpeed":890,"projectileCount":1,"tracer":false}},"#,
+                r#""5710c24ad2720bc3a58b4568":{"normalizedName":"f-1-grenade","basePrice":100,"properties":{"propertiesType":"ItemPropertiesGrenade","damage":80}},"#,
                 // 跳蚤市场用：一件有跳蚤价、一件只有商人价。
-                r#""5447a9cd4bdc2dbd208b4567":{"normalizedName":"colt-m4a1-556x45-assault-rifle","basePrice":18397,"lastLowPrice":23932,"avg24hPrice":93642,"low24hPrice":20000,"high24hPrice":185000,"weight":3.4},"#,
+                r#""5447a9cd4bdc2dbd208b4567":{"normalizedName":"colt-m4a1-556x45-assault-rifle","basePrice":18397,"lastLowPrice":23932,"avg24hPrice":93642,"low24hPrice":20000,"high24hPrice":185000,"changeLast48h":215,"changeLast48hPercent":0.4,"lastOfferCount":20,"minLevelForFlea":25,"width":1,"height":2,"weight":3.4,"iconLink":"https://assets/5447-icon.webp","gridImageLink":"https://assets/5447-grid.webp","wikiLink":"https://wiki/m4","link":"https://tarkov.dev/item/m4","lastScan":"2026-11-13T02:48:02.000Z","sellToTrader":[{"trader":"t1","price":7358,"priceRUB":7358},{"trader":"t2","price":54,"priceRUB":6622}]},"#,
                 r#""5c0e53c886f7744a13f54933":{"normalizedName":"slick-body-armor","basePrice":100000,"lastLowPrice":null,"avg24hPrice":null}"#,
                 r#"}}}"#,
             )
@@ -375,7 +378,10 @@ fn route(method: &str, path: &str, addr: SocketAddr, inner: &MockInner) -> (&'st
     if path.starts_with("/regular/traders") {
         return (
             "200 OK",
-            json!({"data": {"t1": {"normalizedName": "mechanic"}, "t2": {"normalizedName": "prapor"}}})
+            json!({"data": {
+                "t1": {"name": "t1 Nickname", "normalizedName": "mechanic"},
+                "t2": {"name": "t2 Nickname", "normalizedName": "prapor"}
+            }})
                 .to_string(),
         );
     }
@@ -577,29 +583,26 @@ fn mock_plugins(mock: &MockServer) -> PluginsConfig {
         bangumi: qqbot_plugins::BangumiConfig {
             update_url: format!("{}/update", mock.base_url()),
         },
-        ammo: qqbot_plugins::AmmoConfig {
-            items_url: format!("{}/regular/items", mock.base_url()),
-            items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
-            store: None,
-        },
-        market: qqbot_plugins::MarketConfig {
-            items_url: format!("{}/regular/items", mock.base_url()),
-            items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
-            store: None,
-        },
+        ammo: qqbot_plugins::AmmoConfig { store: None },
+        market: qqbot_plugins::MarketConfig { store: None },
+        task: qqbot_plugins::TaskConfig { store: None },
         delta: qqbot_plugins::DeltaConfig {
             home_url: format!("{}/", mock.base_url()),
             overview_url: format!("{}/overview", mock.base_url()),
             menu_url: format!("{}/getMenu", mock.base_url()),
             data_url: format!("{}/getOVData", mock.base_url()),
         },
-        task: qqbot_plugins::TaskConfig {
-            tasks_url: format!("{}/regular/tasks", mock.base_url()),
-            traders_url: format!("{}/regular/traders", mock.base_url()),
-            tasks_zh_url: format!("{}/regular/tasks_zh", mock.base_url()),
+        // 塔科夫数据的唯一写入者：七个静态端点都在 mock 上。
+        // `refresh_hours: 0` 是**刻意**的 —— e2e 不该有人偷偷起一个后台定时器。
+        tarkov_data: qqbot_plugins::TarkovDataConfig {
+            items_url: format!("{}/regular/items", mock.base_url()),
             items_zh_url: format!("{}/regular/items_zh", mock.base_url()),
+            traders_url: format!("{}/regular/traders", mock.base_url()),
             traders_zh_url: format!("{}/regular/traders_zh", mock.base_url()),
+            tasks_url: format!("{}/regular/tasks", mock.base_url()),
+            tasks_zh_url: format!("{}/regular/tasks_zh", mock.base_url()),
             maps_zh_url: format!("{}/regular/maps_zh", mock.base_url()),
+            refresh_hours: 0,
             store: None,
         },
     }
@@ -641,9 +644,21 @@ async fn feed(dispatcher: &Arc<Dispatcher>, name: &str, payload: &str) {
         .expect("事件处理超时");
 }
 
+/// 取某个群**最后一条**回复（解析成 JSON）。
+///
+/// 顺序敏感的断言用它：同一个群可能先后收到「刷新回执」与「查询结果」，
+/// 用 `.find()` 抓第一条容易抓到回执。
+fn last_message(mock: &MockServer, group: &str) -> serde_json::Value {
+    let path = format!("/v2/groups/{group}/messages");
+    mock.all(|h| h.path == path)
+        .last()
+        .and_then(|h| serde_json::from_str(&h.body).ok())
+        .unwrap_or_else(|| panic!("group {group} 没有任何回复"))
+}
+
 /// 把消息体里的 `%CTRL%` 换成真正的系统控制者 openid。
 ///
-/// 管理命令（`更新任务` / `系统收录`）只认系统控制者，所以入站消息的
+/// 管理命令（`塔科夫更新数据` / `系统收录`）只认系统控制者，所以入站消息的
 /// `member_openid` 必须是它。写字面量会把测试与一个**真实的人的 openid**
 /// 绑死：默认控制者一换，这里只会表现成「命令被权限挡掉」，
 /// 看不出是测试数据过期了。占位符让这层关系显式。
@@ -2025,16 +2040,18 @@ async fn caption_is_consumed_by_the_first_image_only() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// B6：管理员导入弹药 → 检索 → 出卡片。
+/// B6：系统控制者刷新塔科夫数据 → 检索弹药 → **Markdown 列表**（带可点「详情」）。
 #[tokio::test]
-async fn ammo_import_then_search_renders_a_card() {
+async fn ammo_import_then_search_renders_a_markdown_list() {
     let mock = MockServer::start().await;
     let (dispatcher, store, dir) = bili_stack(&mock).await;
 
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        r#"{"id":"AM_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新子弹","group_openid":"GAM"}"#,
+        &as_controller(
+            r#"{"id":"AM_1","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GAM"}"#,
+        ),
     )
     .await;
 
@@ -2048,16 +2065,85 @@ async fn ammo_import_then_search_renders_a_card() {
     )
     .await;
 
-    let card = mock
-        .all(|h| h.path == "/v2/groups/GAM/messages")
-        .into_iter()
-        .find(|h| {
-            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
-            body["msg_type"] == 7
-        })
-        .expect("应当回一张卡片");
-    let body: serde_json::Value = serde_json::from_str(&card.body).unwrap();
-    assert!(body["media"]["file_info"].is_string(), "应当走富媒体上传: {body}");
+    let body = last_message(&mock, "GAM");
+    assert_eq!(body["msg_type"], 2, "列表必须是 Markdown: {body}");
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.contains("5.45x39毫米 BP"), "第一行是弹药名: {md}");
+    assert!(md.contains("伤害51｜穿透37｜甲伤42"), "第二行是弹道: {md}");
+    assert!(md.contains("<qqbot-cmd-input "), "详情是可点文本: {md}");
+    // 点一下插入的是「查子弹 <24位id>」，urlencode 之后是这个前缀。
+    assert!(
+        md.contains("text=\"%E6%9F%A5%E5%AD%90%E5%BC%B9%2056dff2ced2720bb4668ec70c\""),
+        "可点文本要能触发按 id 查详情: {md}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `查子弹 <24位id>` 直接出详情 —— 列表里点「详情」走的也是这条路。
+///
+/// 价格 / 图片 / 链接来自**物品表**（弹药表只存弹道），所以这条同时验证了
+/// 「同一个 id 在两张表里各取一半」的拼装是对的。
+#[tokio::test]
+async fn ammo_item_id_gives_the_detail_view() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        &as_controller(
+            r#"{"id":"AM_5","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GAMD"}"#,
+        ),
+    )
+    .await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"AM_6","author":{"member_openid":"U1"},"content":"查子弹 56dff2ced2720bb4668ec70c","group_openid":"GAMD"}"#,
+    )
+    .await;
+
+    let body = last_message(&mock, "GAMD");
+    assert_eq!(body["msg_type"], 2, "详情必须是 Markdown: {body}");
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.starts_with("# 5.45x39毫米 BP"), "标题是弹药名: {md}");
+    assert!(md.contains("![5.45x39毫米 BP #96px #96px](https://assets/545-bp-grid.webp)"), "图片来自物品表: {md}");
+    assert!(md.contains("**弹道** 伤害 51｜穿透 37｜甲伤 42"), "{md}");
+    assert!(md.contains("最高收购 87（"), "商人价来自物品表: {md}");
+    assert!(md.contains("**跳蚤** 均价 1.20万"), "{md}");
+    assert!(md.contains("[wiki](https://wiki/bp)"), "{md}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 路由用 Prefix：`查子弹5.45 bp` 没有空格也要命中。
+#[tokio::test]
+async fn ammo_matches_without_a_space() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        &as_controller(
+            r#"{"id":"AM_7","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GAMN"}"#,
+        ),
+    )
+    .await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"AM_8","author":{"member_openid":"U1"},"content":"查子弹m855","group_openid":"GAMN"}"#,
+    )
+    .await;
+
+    let body = last_message(&mock, "GAMN");
+    assert_eq!(body["msg_type"], 2, "无空格写法也要出列表: {body}");
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.contains("5.56x45毫米 M855"), "应当命中 M855: {md}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2080,21 +2166,21 @@ async fn ammo_search_before_import_says_so() {
         .expect("应当回复提示");
     let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
     let text = body["content"].as_str().unwrap_or_default();
-    assert!(text.contains("更新子弹"), "要告诉用户怎么解决: {text}");
+    assert!(text.contains("塔科夫更新数据"), "要告诉用户怎么解决: {text}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 导入是管理员操作。
+/// 刷新只认系统控制者：群管理员也不行（三条旧命令合并后统一到控制者）。
 #[tokio::test]
-async fn ammo_import_requires_admin() {
+async fn tarkov_refresh_requires_system_controller() {
     let mock = MockServer::start().await;
     let (dispatcher, store, dir) = bili_stack(&mock).await;
 
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        r#"{"id":"AM_4","author":{"member_openid":"U9"},"content":"更新子弹","group_openid":"GAM3"}"#,
+        r#"{"id":"AM_4","author":{"member_openid":"U9"},"content":"塔科夫更新数据","group_openid":"GAM3"}"#,
     )
     .await;
 
@@ -2102,7 +2188,7 @@ async fn ammo_import_requires_admin() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// B4 / B5：管理员导入任务 → 检索 → 出卡片。
+/// B4 / B5：控制者刷新 → 检索任务 → 出卡片。
 #[tokio::test]
 async fn task_import_then_search_renders_a_card() {
     let mock = MockServer::start().await;
@@ -2112,7 +2198,7 @@ async fn task_import_then_search_renders_a_card() {
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
         &as_controller(
-            r#"{"id":"TK_1","author":{"member_openid":"%CTRL%"},"content":"更新任务","group_openid":"GTK"}"#,
+            r#"{"id":"TK_1","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GTK"}"#,
         ),
     )
     .await;
@@ -2128,15 +2214,9 @@ async fn task_import_then_search_renders_a_card() {
     )
     .await;
 
-    let card = mock
-        .all(|h| h.path == "/v2/groups/GTK/messages")
-        .into_iter()
-        .find(|h| {
-            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
-            body["msg_type"] == 2
-        })
-        .expect("应当回一条 Markdown 卡片");
-    let body: serde_json::Value = serde_json::from_str(&card.body).unwrap();
+    // 取最后一条：第一条 Markdown 是刷新回执，不是任务卡片。
+    let body = last_message(&mock, "GTK");
+    assert_eq!(body["msg_type"], 2, "任务详情是 Markdown: {body}");
     let md = body["markdown"]["content"].as_str().unwrap_or_default();
     assert!(md.contains("彻夜难眠"), "卡片要有中文任务名: {md}");
     assert!(md.contains("任务目标"), "卡片要有目标段: {md}");
@@ -2177,29 +2257,38 @@ async fn task_search_before_import_says_so() {
         .expect("应当回复提示");
     let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
     let text = body["content"].as_str().unwrap_or_default();
-    assert!(text.contains("更新任务"), "要告诉用户怎么解决: {text}");
+    assert!(text.contains("塔科夫更新数据"), "要告诉用户怎么解决: {text}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// B2：管理员导入物品 → 关键词搜 → 出卡片。
+/// B2：系统控制者刷新 → 关键词搜 → **Markdown 列表**（带可点「详情」）。
 #[tokio::test]
-async fn market_search_renders_a_card() {
+async fn market_search_renders_a_markdown_list() {
     let mock = MockServer::start().await;
     let (dispatcher, store, dir) = bili_stack(&mock).await;
 
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        r#"{"id":"MK_1","author":{"member_openid":"U1","member_role":"admin"},"content":"更新物品","group_openid":"GMK"}"#,
+        &as_controller(
+            r#"{"id":"MK_1","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GMK"}"#,
+        ),
     )
     .await;
 
     // 弹药条目也有 slug，所以一并入库；这里只断言目标物品在。
     assert!(store.item_count().await.unwrap() >= 4, "应当导入物品");
-    let m4 = store.search_items(vec!["m4a1".into()], 10).await.unwrap();
+    let m4 = store
+        .search_items(vec!["m4a1".into()], "m4a1".into(), 10)
+        .await
+        .unwrap();
     assert_eq!(m4.len(), 1);
     assert_eq!(m4[0].avg24h_price, Some(93642));
+    // 最高收购价按 RUB 取最大的那家（6622 那家是美元报价换算的）。
+    assert_eq!(m4[0].sell_trader_price, Some(7358));
+    assert_eq!(m4[0].sell_trader_name.as_deref(), Some("机械师"), "商人名来自语言包");
+    assert_eq!(m4[0].last_scan, Some(1_794_538_082), "价格扫描时刻要入库");
 
     feed(
         &dispatcher,
@@ -2208,21 +2297,94 @@ async fn market_search_renders_a_card() {
     )
     .await;
 
-    let card = mock
-        .all(|h| h.path == "/v2/groups/GMK/messages")
-        .into_iter()
-        .find(|h| {
-            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
-            body["msg_type"] == 7
-        })
-        .expect("应当回一张卡片");
-    let body: serde_json::Value = serde_json::from_str(&card.body).unwrap();
-    assert!(body["media"]["file_info"].is_string(), "应当走富媒体上传: {body}");
+    let body = last_message(&mock, "GMK");
+    assert_eq!(body["msg_type"], 2, "列表必须是 Markdown: {body}");
+    assert!(body["content"].is_null(), "Markdown 消息不该再带 content: {body}");
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.contains("柯尔特 M4A1"), "第一行是物品名: {md}");
+    assert!(md.contains("商人 7358"), "第二行要有商人收购价: {md}");
+    assert!(md.contains("跳蚤 9.36万"), "第二行要有跳蚤价: {md}");
+    assert!(md.contains("<qqbot-cmd-input "), "详情是可点文本: {md}");
+    // 点一下插入的是「跳蚤 <24位id>」，urlencode 之后是这个前缀。
+    assert!(
+        md.contains("text=\"%E8%B7%B3%E8%9A%A4%205447a9cd4bdc2dbd208b4567\""),
+        "可点文本要能触发按 id 查详情: {md}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// B3：参数是 24 位 id 时走详情视图，不是关键词搜。
+/// 路由用 Prefix：`跳蚤m4a1` 没有空格也要命中。
+#[tokio::test]
+async fn market_matches_without_a_space() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        &as_controller(
+            r#"{"id":"MK_6","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GMKN"}"#,
+        ),
+    )
+    .await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"MK_7","author":{"member_openid":"U1"},"content":"跳蚤m4a1","group_openid":"GMKN"}"#,
+    )
+    .await;
+
+    let body = last_message(&mock, "GMKN");
+    assert_eq!(body["msg_type"], 2, "无空格写法也要出列表: {body}");
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.contains("柯尔特 M4A1"), "应当命中同一件物品: {md}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 多个关键词（空格分隔）是 **AND**：全部命中才出现，范围只会更小。
+#[tokio::test]
+async fn market_multiple_keywords_narrow_the_result() {
+    let mock = MockServer::start().await;
+    let (dispatcher, _store, dir) = bili_stack(&mock).await;
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        &as_controller(
+            r#"{"id":"MK_8","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GMKM"}"#,
+        ),
+    )
+    .await;
+
+    // 两个词都能命中 M4；再加一个不存在的词，结果必须为空（AND，而不是 OR）。
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"MK_9","author":{"member_openid":"U1"},"content":"跳蚤 m4a1 colt","group_openid":"GMKM"}"#,
+    )
+    .await;
+    let body = last_message(&mock, "GMKM");
+    assert_eq!(body["msg_type"], 2, "两个词都命中时出列表: {body}");
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.contains("柯尔特 M4A1"), "{md}");
+
+    feed(
+        &dispatcher,
+        "GROUP_MESSAGE_CREATE",
+        r#"{"id":"MK_10","author":{"member_openid":"U1"},"content":"跳蚤 m4a1 不存在的词","group_openid":"GMKM"}"#,
+    )
+    .await;
+    let body = last_message(&mock, "GMKM");
+    let text = body["content"].as_str().unwrap_or_default();
+    assert!(text.contains("没有匹配"), "多一个不存在的词就该没有结果（AND）: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B3：参数是 24 位 id 时走**详情视图**（名称 / 图片 / 各价 / 涨跌 / 链接）。
 #[tokio::test]
 async fn market_item_id_gives_the_detail_view() {
     let mock = MockServer::start().await;
@@ -2231,7 +2393,9 @@ async fn market_item_id_gives_the_detail_view() {
     feed(
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
-        r#"{"id":"MK_3","author":{"member_openid":"U1","member_role":"admin"},"content":"更新物品","group_openid":"GMK2"}"#,
+        &as_controller(
+            r#"{"id":"MK_3","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GMK2"}"#,
+        ),
     )
     .await;
 
@@ -2242,15 +2406,17 @@ async fn market_item_id_gives_the_detail_view() {
     )
     .await;
 
-    let card = mock
-        .all(|h| h.path == "/v2/groups/GMK2/messages")
-        .into_iter()
-        .find(|h| {
-            let body: serde_json::Value = serde_json::from_str(&h.body).unwrap_or_default();
-            body["msg_type"] == 7
-        })
-        .expect("按 id 查也应当回卡片");
-    assert!(serde_json::from_str::<serde_json::Value>(&card.body).is_ok());
+    let body = last_message(&mock, "GMK2");
+    assert_eq!(body["msg_type"], 2, "详情也是 Markdown: {body}");
+    let md = body["markdown"]["content"].as_str().unwrap_or_default();
+    assert!(md.starts_with("# 柯尔特 M4A1"), "一级标题是物品名: {md}");
+    assert!(md.contains("![柯尔特 M4A1 #96px #96px](https://assets/"), "要有图片: {md}");
+    assert!(md.contains("**商人** 基准 1.84万｜最高收购 7358（机械师）"), "{md}");
+    assert!(md.contains("**跳蚤** 均价 9.36万｜最低挂牌 2.39万"), "{md}");
+    assert!(md.contains("**48h** +215（+0.40%）"), "涨跌带百分比: {md}");
+    assert!(md.contains("**规格** 1×2 格｜3.40 kg｜每格 4.68万"), "{md}");
+    assert!(md.contains("[wiki](https://wiki/m4)"), "{md}");
+    assert!(md.contains("> 价格数据：2026-11-13 10:48"), "页脚是上游扫描时刻: {md}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2268,12 +2434,9 @@ async fn market_search_before_import_says_so() {
     )
     .await;
 
-    let send = mock
-        .find(|h| h.path == "/v2/groups/GMK3/messages")
-        .expect("应当回复提示");
-    let body: serde_json::Value = serde_json::from_str(&send.body).unwrap();
+    let body = last_message(&mock, "GMK3");
     let text = body["content"].as_str().unwrap_or_default();
-    assert!(text.contains("更新物品"), "要告诉用户怎么解决: {text}");
+    assert!(text.contains("塔科夫更新数据"), "要告诉用户怎么解决: {text}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2618,7 +2781,7 @@ async fn chinese_query_that_misses_says_so() {
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
         &as_controller(
-            r#"{"id":"ZH_1","author":{"member_openid":"%CTRL%"},"content":"更新任务","group_openid":"GZH"}"#,
+            r#"{"id":"ZH_1","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GZH"}"#,
         ),
     )
     .await;
@@ -2656,7 +2819,7 @@ async fn task_chinese_names_come_from_the_language_pack() {
         &dispatcher,
         "GROUP_MESSAGE_CREATE",
         &as_controller(
-            r#"{"id":"ZH_1","author":{"member_openid":"%CTRL%"},"content":"更新任务","group_openid":"GZH"}"#,
+            r#"{"id":"ZH_1","author":{"member_openid":"%CTRL%"},"content":"塔科夫更新数据","group_openid":"GZH"}"#,
         ),
     )
     .await;

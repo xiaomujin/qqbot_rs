@@ -18,6 +18,13 @@ use serde::de::DeserializeOwned;
 /// 比纯 API 调用宽松：日报这类功能要把整张图片下载下来。
 pub const TIMEOUT: Duration = Duration::from_secs(20);
 
+/// 批量数据下载的超时。
+///
+/// 塔科夫那份 `regular/items` 实测 **17.3 MB / 18 秒**（gzip 后传输、解压 17 MB），
+/// 用 20 秒的交互超时等于每次刷新都在赌网络。它又是后台任务、不占用户的等待预算，
+/// 所以给它一个宽松到「只有真挂了才会超」的值。
+pub const BULK_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// 插件对外请求的统一 UA。
 ///
 /// 由 [`build_client`] 装在 client 上，所以所有请求都自动携带 ——
@@ -79,6 +86,14 @@ pub enum FetchError {
 /// 应当让进程直接起不来，而不是留一个「每次请求才报错」的机器人。
 pub fn build_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder().timeout(TIMEOUT).user_agent(USER_AGENT).build()
+}
+
+/// 建一个**批量下载**专用的客户端（超时 [`BULK_TIMEOUT`]，其余同上）。
+///
+/// 单独一个 client 而不是给共享的那个调大超时：交互命令（查任务、B 站解析）
+/// 必须继续用 20 秒快速失败 —— 一个卡住的上游不该让用户干等五分钟。
+pub fn build_bulk_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder().timeout(BULK_TIMEOUT).user_agent(USER_AGENT).build()
 }
 
 /// 发送请求，**只把传输失败**归一成 [`FetchError::Request`]，不看状态码。

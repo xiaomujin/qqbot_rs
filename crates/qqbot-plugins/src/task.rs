@@ -18,8 +18,14 @@
 //!
 //! 实测覆盖率：任务名 515/515、目标 1441/1441、奖励物品 901/901、
 //! 目标武器 730/730、商人 515/515、地图 263/263。
-//! 所以**中文是必需项**：覆盖率低于 MIN_COVERAGE 就整体拒绝写库、
-//! 保留旧数据 —— 宁可不更新，也不给用户看英文 slug。
+//!
+//! 早先这里有一道 98% 覆盖率闸门：不达标就整批放弃、保留旧数据。
+//! **已移除** —— 代价是上游语言包一抖动，任务查询就停更，而用户真正需要的是
+//! 「这个任务是什么」而不是「每个字都是中文」。现在中文只是增强：
+//! 名字依次退回「中文 → 英文名 → slug」，覆盖率只进日志与指标。
+//!
+//! 下载与写库都在 `tarkov_data`（一次刷新同时刷弹药 / 物品 / 任务）；
+//! 本模块只读本地表，`parse_tasks` 由刷新器调用。
 //!
 //! # 后续任务
 //!
@@ -68,39 +74,14 @@ use crate::timewin::{SHANGHAI_OFFSET, format_datetime};
 const LIST_LIMIT: usize = 20;
 /// 检索最多取多少条候选。
 const SEARCH_LIMIT: usize = 100;
-/// 中文覆盖率下限。低于它说明语言包没拉到、或上游改了路径。
-const MIN_COVERAGE: f64 = 0.98;
 
 /// 任务插件配置。
-#[derive(Clone)]
+///
+/// 没有 URL 字段：上游是七个静态 JSON，由 `tarkov_data` 的刷新器一次抓完并写库，
+/// 这个插件只读本地表。
+#[derive(Clone, Default)]
 pub struct TaskConfig {
-    /// 任务主数据。
-    pub tasks_url: String,
-    /// 商人的 slug 与头像。
-    pub traders_url: String,
-    /// 任务名 / 目标描述 / 技能名的语言包。
-    pub tasks_zh_url: String,
-    /// 物品名语言包（奖励物品、目标武器、钥匙）。
-    pub items_zh_url: String,
-    /// 商人名语言包。
-    pub traders_zh_url: String,
-    /// 地图名语言包。
-    pub maps_zh_url: String,
     pub store: Option<Arc<ResourceStore>>,
-}
-
-impl Default for TaskConfig {
-    fn default() -> Self {
-        Self {
-            tasks_url: "https://json.tarkov.dev/regular/tasks".into(),
-            traders_url: "https://json.tarkov.dev/regular/traders".into(),
-            tasks_zh_url: "https://json.tarkov.dev/regular/tasks_zh".into(),
-            items_zh_url: "https://json.tarkov.dev/regular/items_zh".into(),
-            traders_zh_url: "https://json.tarkov.dev/regular/traders_zh".into(),
-            maps_zh_url: "https://json.tarkov.dev/regular/maps_zh".into(),
-            store: None,
-        }
-    }
 }
 
 // ---- 上游 JSON 的形状 ----
@@ -404,10 +385,16 @@ pub fn parse_tasks(
         serde_json::from_str(tasks_body).map_err(|err| format!("解析任务数据失败：{err}"))?;
     let tasks = parsed.data.ok_or("任务响应缺少 data")?.tasks;
 
-    // 先建一份 id → 中文名 的表：失败条件、后续任务都要拿它把 id 变成名字。
+    // 先建一份 id → 名字的表：失败条件、后续任务都要拿它把 id 变成名字。
+    // 中文缺失时退回英文名（由 wiki 链接反推）—— 否则那几行会印出一串 24 位 hex。
     let names: HashMap<String, String> = tasks
         .iter()
-        .filter_map(|(id, t)| packs.task_name(&t.name).map(|n| (id.clone(), n)))
+        .map(|(id, t)| {
+            let name = packs.task_name(&t.name).unwrap_or_else(|| {
+                english_name(&t.wiki_link, t.normalized_name.trim())
+            });
+            (id.clone(), name)
+        })
         .collect();
 
     let mut coverage = Coverage::default();
@@ -420,10 +407,12 @@ pub fn parse_tasks(
             continue;
         }
         coverage.names_total += 1;
-        let Some(name_zh) = packs.task_name(&task.name) else {
-            continue;
-        };
-        coverage.names_hit += 1;
+        // 中文名缺失**不再丢这条任务**：闸门拿掉之后，宁可显示英文名或 slug，
+        // 也不让一条任务从库里消失（那才是用户真正的损失）。
+        let name_zh = packs.task_name(&task.name);
+        if name_zh.is_some() {
+            coverage.names_hit += 1;
+        }
 
         let (trader, trader_image) = trader_info.get(&task.trader).cloned().unwrap_or_default();
         let trader_name_zh = packs.trader(&task.trader);
@@ -522,7 +511,7 @@ pub fn parse_tasks(
             task: TarkovTask {
                 id,
                 normalized_name: normalized_name.clone(),
-                name_zh: Some(name_zh),
+                name_zh,
                 name_en: Some(english_name(&task.wiki_link, &normalized_name)),
                 trader,
                 trader_name_zh,
@@ -682,6 +671,18 @@ fn objective_view(o: &ObjectiveEntry, description_zh: Option<&str>) -> (String, 
 ///
 /// 优先用 wiki 链接的最后一段（The_Punisher_-_Part_1 → The Punisher - Part 1），
 /// 没有就按 - 切分首字母大写。
+/// 显示名：中文 → 英文名 → slug。
+///
+/// 三级而不是两级：中文语言包缺失时，英文名仍然是人能读的（`Gunsmith - Part 1`），
+/// 而 slug（`gunsmith-part-1`）只是最后一道保底。
+fn task_title(t: &TarkovTask) -> String {
+    t.name_zh
+        .as_deref()
+        .or(t.name_en.as_deref())
+        .unwrap_or(&t.normalized_name)
+        .to_string()
+}
+
 pub fn english_name(wiki_link: &str, normalized_name: &str) -> String {
     if let Some(rest) = wiki_link.split("/wiki/").nth(1) {
         let decoded = rest.replace('_', " ").replace("%20", " ");
@@ -820,7 +821,7 @@ fn render_objectives(out: &mut String, objectives: &[TarkovObjective]) {
 pub fn render_detail(detail: &TarkovTaskDetail, names: &HashMap<String, String>) -> String {
     let t = &detail.task;
     let mut out = String::new();
-    let title = t.name_zh.as_deref().unwrap_or(&t.normalized_name);
+    let title = task_title(t);
     // 一级标题 + 任务配图。官方支持 `![alt #宽px #高px](公网 url)`，
     // 开放平台会自己下载转存（实测任务图 314×177）。
     let _ = writeln!(out, "# {title}");
@@ -1029,7 +1030,7 @@ pub fn render_list(query: &str, items: &[TarkovTask], total: usize) -> String {
     }
     out.push('\n');
     for t in items {
-        let name = t.name_zh.as_deref().unwrap_or(&t.normalized_name);
+        let name = task_title(t);
         let mut parts: Vec<String> = Vec::new();
         let trader = t.trader_name_zh.as_deref().unwrap_or(&t.trader);
         if !trader.is_empty() {
@@ -1045,7 +1046,7 @@ pub fn render_list(query: &str, items: &[TarkovTask], total: usize) -> String {
         let _ = writeln!(
             out,
             "- {} {}",
-            cmd_input(&format!("查任务 {name}"), name),
+            cmd_input(&format!("查任务 {name}"), &name),
             parts.join(" · ")
         );
     }
@@ -1090,127 +1091,17 @@ fn url_encode(raw: &str) -> String {
 
 // ---- 插件 ----
 
-/// 是否是系统控制者。
+/// 塔科夫任务插件：只读本地表。
 ///
-/// 名单由 store 持有，与「系统控制者」命令是同一份数据 ——
-/// 全量导入是重操作（6 个端点、约 3.6 MB），只让系统控制者触发。
-async fn is_system_controller(ctx: &Ctx, store: &ResourceStore) -> bool {
-    let Some(openid) = ctx.sender_openid() else {
-        return false;
-    };
-    // 键名与 JSON 解码都在 store 里，这里只问「是不是」。
-    match store.is_system_controller(openid).await {
-        Ok(hit) => hit,
-        Err(err) => {
-            tracing::warn!(error = %err, "读取系统控制者失败");
-            false
-        }
-    }
-}
-
-/// 塔科夫任务插件。
+/// 数据由 `tarkov_data::TarkovData` 刷新 —— 这里没有任何 HTTP。
 #[derive(Clone)]
 pub struct TaskPlugin {
     config: TaskConfig,
-    http: reqwest::Client,
 }
 
 impl TaskPlugin {
-    pub fn new(config: TaskConfig, http: reqwest::Client) -> Self {
-        Self { config, http }
-    }
-
-    /// 「更新任务」：六个端点 → 语言包 → 反转后续 → 五表同事务替换。
-    async fn reload(&self, ctx: &Ctx) -> Handled {
-        let Some(store) = &self.config.store else {
-            let _ = ctx.reply.text("未启用持久化，任务功能不可用").await;
-            return Handled::Consumed;
-        };
-        if !is_system_controller(ctx, store).await {
-            let _ = ctx.reply.text("只有系统控制者能更新任务数据").await;
-            return Handled::Consumed;
-        }
-
-        let fetched = tokio::try_join!(
-            self.fetch(&self.config.tasks_url),
-            self.fetch(&self.config.traders_url),
-            self.fetch(&self.config.tasks_zh_url),
-            self.fetch(&self.config.items_zh_url),
-            self.fetch(&self.config.traders_zh_url),
-            self.fetch(&self.config.maps_zh_url),
-        );
-        let (tasks_body, traders_body, tasks_zh, items_zh, traders_zh, maps_zh) = match fetched {
-            Ok(v) => v,
-            Err(reason) => {
-                tracing::warn!(error = %reason, "下载任务数据失败");
-                let _ = ctx.reply.text(format!("下载失败：{reason}")).await;
-                return Handled::Consumed;
-            }
-        };
-
-        let packs = match (
-            parse_lang_pack(&tasks_zh),
-            parse_lang_pack(&items_zh),
-            parse_lang_pack(&traders_zh),
-            parse_lang_pack(&maps_zh),
-        ) {
-            (Ok(tasks), Ok(items), Ok(traders), Ok(maps)) => LangPacks { tasks, items, traders, maps },
-            (t, i, tr, m) => {
-                let reason = t.err().or(i.err()).or(tr.err()).or(m.err()).unwrap_or_default();
-                tracing::warn!(error = %reason, "语言包解析失败");
-                let _ = ctx.reply.text(format!("语言包解析失败：{reason}")).await;
-                return Handled::Consumed;
-            }
-        };
-
-        let (items, coverage) = match parse_tasks(&tasks_body, &traders_body, &packs) {
-            Ok(pair) => pair,
-            Err(reason) => {
-                tracing::warn!(error = %reason, "解析任务数据失败");
-                let _ = ctx.reply.text(format!("解析失败：{reason}")).await;
-                return Handled::Consumed;
-            }
-        };
-        if items.is_empty() {
-            let _ = ctx.reply.text("解析出 0 条任务，上游格式可能变了").await;
-            return Handled::Consumed;
-        }
-        // 覆盖率不达标就**不写库**：留着旧数据总比换成一半英文的强。
-        if coverage.ratio() < MIN_COVERAGE {
-            tracing::warn!(
-                ratio = coverage.ratio(),
-                names = format!("{}/{}", coverage.names_hit, coverage.names_total),
-                objectives = format!("{}/{}", coverage.objectives_hit, coverage.objectives_total),
-                "中文覆盖率不达标，已放弃本次导入"
-            );
-            let _ = ctx
-                .reply.text(format!(
-                    "中文覆盖率只有 {:.0}%，低于 {:.0}% 的底线，已放弃导入（旧数据保持不变）\n{}",
-                    coverage.ratio() * 100.0,
-                    MIN_COVERAGE * 100.0,
-                    coverage.summary()
-                ))
-                .await;
-            return Handled::Consumed;
-        }
-
-        let prereqs: usize = items.iter().map(|d| d.prereqs.len()).sum();
-        let successors: usize = items.iter().map(|d| d.successors.len()).sum();
-        match store.replace_tasks(items).await {
-            Ok(count) => {
-                let _ = ctx
-                    .reply.text(format!(
-                        "任务数据已更新，共 {count} 条（{}；前置 {prereqs} 条，后续 {successors} 条）",
-                        coverage.summary()
-                    ))
-                    .await;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "写入任务数据失败");
-                let _ = ctx.reply.text("写入失败，稍后再试").await;
-            }
-        }
-        Handled::Consumed
+    pub fn new(config: TaskConfig) -> Self {
+        Self { config }
     }
 
     /// 「查任务 <关键词>」/「任务 <关键词>」。
@@ -1247,7 +1138,7 @@ impl TaskPlugin {
 
         if items.is_empty() {
             let hint = match store.task_count().await {
-                Ok(0) => "任务数据还没导入，请系统控制者发「更新任务」",
+                Ok(0) => "任务数据还没导入，请系统控制者发「塔科夫更新数据」",
                 _ => "没有匹配的任务，换个关键词试试",
             };
             let _ = ctx.reply.text(hint).await;
@@ -1297,10 +1188,6 @@ impl TaskPlugin {
         }
         Handled::Consumed
     }
-
-    async fn fetch(&self, url: &str) -> Result<String, crate::http::FetchError> {
-        crate::http::fetch_text(&self.http, url).await
-    }
 }
 
 #[async_trait]
@@ -1312,7 +1199,6 @@ impl Handler for TaskPlugin {
             None => (content, ""),
         };
         match head {
-            "更新任务" => self.reload(ctx).await,
             "查任务" => self.search(ctx, rest).await,
             _ => Handled::Next,
         }
@@ -1701,83 +1587,47 @@ mod tests {
         assert!(parse_tasks(r#"{}"#, TRADERS, &packs()).is_err(), "缺 data 要报错");
     }
 
-    /// 实跑验证：打**真实**的静态端点与语言包。
-    ///
-    ///     cargo test -p qqbot-plugins --lib -- --ignored live_tasks
-    #[tokio::test]
-    #[ignore = "需要网络"]
-    async fn live_tasks_endpoint_parses() {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(90))
-            .build()
-            .unwrap();
-        let plugin = TaskPlugin::new(TaskConfig::default(), http);
-        let cfg = TaskConfig::default();
-        let (tasks, traders, tasks_zh, items_zh, traders_zh, maps_zh) = tokio::try_join!(
-            plugin.fetch(&cfg.tasks_url),
-            plugin.fetch(&cfg.traders_url),
-            plugin.fetch(&cfg.tasks_zh_url),
-            plugin.fetch(&cfg.items_zh_url),
-            plugin.fetch(&cfg.traders_zh_url),
-            plugin.fetch(&cfg.maps_zh_url),
-        )
-        .expect("静态端点与语言包都应当可用");
-
-        let packs = LangPacks {
-            tasks: parse_lang_pack(&tasks_zh).unwrap(),
-            items: parse_lang_pack(&items_zh).unwrap(),
-            traders: parse_lang_pack(&traders_zh).unwrap(),
-            maps: parse_lang_pack(&maps_zh).unwrap(),
-        };
-        let (items, coverage) = parse_tasks(&tasks, &traders, &packs).expect("真实数据应当能解析");
-        assert!(items.len() > 400, "实测 515 条，解析出 {} 条", items.len());
-        assert_eq!(coverage.names_hit, coverage.names_total, "任务名必须全中文");
-        assert!(
-            coverage.objectives_hit * 100 >= coverage.objectives_total * 98,
-            "目标中文覆盖 {}/{}",
-            coverage.objectives_hit,
-            coverage.objectives_total
-        );
-        let with_successors = items.iter().filter(|d| !d.successors.is_empty()).count();
-        assert!(with_successors > 150, "实测 200 条带后续，实际 {with_successors}");
-        assert!(items.iter().all(|d| d.task.name_zh.is_some()), "不该有任务缺中文名");
-        assert!(
-            items.iter().flat_map(|d| &d.objectives).all(|o| !o.display_text.is_empty()),
-            "每条目标都要有正文（语言包缺失时退回通用文案）"
-        );
-    }
-
     /// 实跑：把真实数据的「惩罚者 - 1」渲染成人眼可校验的卡片。
     ///
     ///     cargo test -p qqbot-plugins --lib -- --ignored --nocapture live_render_punisher
+    ///
+    /// 下载走 `http::build_bulk_client`（300s）—— 这条路径**不再经过插件**，
+    /// 插件早就没有 HTTP 了；刷新的实弹演习在 `tarkov_data` 的
+    /// `live_tarkov_refresh_parses_everything` 里。
     #[tokio::test]
     #[ignore = "需要网络"]
     async fn live_render_punisher() {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(90))
-            .build()
-            .unwrap();
-        let plugin = TaskPlugin::new(TaskConfig::default(), http);
-        let cfg = TaskConfig::default();
-        let (tasks, traders, tasks_zh, items_zh, traders_zh, maps_zh) = tokio::try_join!(
-            plugin.fetch(&cfg.tasks_url),
-            plugin.fetch(&cfg.traders_url),
-            plugin.fetch(&cfg.tasks_zh_url),
-            plugin.fetch(&cfg.items_zh_url),
-            plugin.fetch(&cfg.traders_zh_url),
-            plugin.fetch(&cfg.maps_zh_url),
-        )
-        .unwrap();
+        let http = crate::http::build_bulk_client().expect("建 client");
+        let get = |url: &str| {
+            let http = http.clone();
+            let url = url.to_string();
+            async move { crate::http::fetch_text(&http, &url).await.expect("下载失败") }
+        };
+        let (tasks, traders, tasks_zh, items_zh, traders_zh, maps_zh) = tokio::join!(
+            get("https://json.tarkov.dev/regular/tasks"),
+            get("https://json.tarkov.dev/regular/traders"),
+            get("https://json.tarkov.dev/regular/tasks_zh"),
+            get("https://json.tarkov.dev/regular/items_zh"),
+            get("https://json.tarkov.dev/regular/traders_zh"),
+            get("https://json.tarkov.dev/regular/maps_zh"),
+        );
         let packs = LangPacks {
             tasks: parse_lang_pack(&tasks_zh).unwrap(),
             items: parse_lang_pack(&items_zh).unwrap(),
             traders: parse_lang_pack(&traders_zh).unwrap(),
             maps: parse_lang_pack(&maps_zh).unwrap(),
         };
-        let (items, _) = parse_tasks(&tasks, &traders, &packs).unwrap();
+        let (items, coverage) = parse_tasks(&tasks, &traders, &packs).unwrap();
+        println!("{}", coverage.summary());
         let names: HashMap<String, String> = items
             .iter()
-            .filter_map(|d| d.task.name_zh.clone().map(|n| (d.task.id.clone(), n)))
+            .filter_map(|d| {
+                d.task
+                    .name_zh
+                    .clone()
+                    .or_else(|| d.task.name_en.clone())
+                    .map(|n| (d.task.id.clone(), n))
+            })
             .collect();
         let punisher = items
             .iter()

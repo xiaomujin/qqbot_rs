@@ -1,288 +1,173 @@
-//! 塔科夫跳蚤市场（B2 / B3）。
+//! 塔科夫跳蚤市场（B2 / B3 合并成一条命令）。
 //!
-//! 数据来自 `json.tarkov.dev/regular/items` —— 与 B4/B5/B6/B7 同一份静态 JSON。
+//! 源项目里 B2 走 `tarkov-market.com`（模糊搜索）、B3 走 `api.tarkov.dev` GraphQL
+//! （按 id 精确查），两者都只是「查跳蚤价格」。而 tarkov-market.com 已经死了
+//! （403 + 加密载荷），GraphQL 后端也挂着。所以这里用同一张本地表：
+//! 参数是 **24 位十六进制 id** 就给详情，否则当关键词搜。
 //!
-//! **B2 与 B3 合并成一条命令**：源项目里 B2 走 `tarkov-market.com`（模糊搜索），
-//! B3 走 `api.tarkov.dev` GraphQL（按 id 精确查），两者都只是「查跳蚤价格」。
-//! 而 tarkov-market.com 已经死了（403 + 加密载荷），GraphQL 后端也挂着。
-//! 所以这里用同一张表：参数是 **24 位十六进制 id** 就给详情，否则当关键词搜。
+//! # 为什么全是 Markdown
 //!
-//! 中文名来自 `regular/items_zh` 语言包（键 `<物品 id> Name`），原因同 `ammo.rs`。
+//! 列表里的「详情」必须是**可点文本**（`qqbot-cmd-input`，点击把指令插进输入框），
+//! 而富媒体卡片（`msg_type=7`）的 content 是纯文本、塞不进这种标签 ——
+//! 两者只能二选一。于是整个插件改走 `msg_type=2`：列表与详情都是 Markdown。
+//!
+//! 版式约定见 `docs/qq-bot-api-v2-protocol.md` 的「Markdown 消息」一节：
+//! 手机一行约 30 个显示单位（汉字算 2），**行末要放零宽空格**才强制换行。
+//!
+//! # 数据从哪来
+//!
+//! 只读本地 `tarkov_item` 表，由 `tarkov_data` 每小时从上游静态 JSON 刷新。
+//! 本模块没有任何 HTTP：查询失败只可能是数据库问题，不是网络问题。
 
-use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use qqbot_core::{Ctx, Handled, Handler};
-use qqbot_render::{Card, CardRow};
 use qqbot_store::{ResourceStore, TarkovItem};
-use serde::Deserialize;
 
-use crate::ammo::{ItemLangPack, item_name, parse_item_lang, query_tokens};
+use crate::ammo::query_tokens;
+use crate::md::{
+    BR, format_price, image_block, is_item_id, link_line, md_safe, price_lines, scan_footer,
+    trader_line,
+};
+use crate::task::cmd_input;
 
 /// 一次最多列几件。
-const MAX_ROWS: usize = 12;
+///
+/// 十条是**手机屏**的折中：两行一件、十条正好一屏多一点；再多用户也不会读完，
+/// 而消息长度与「补个关键词」的成本都在涨。
+const LIST_LIMIT: usize = 10;
 
 /// 跳蚤市场插件配置。
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MarketConfig {
-    pub items_url: String,
-    /// 物品名语言包（`<id> Name`）。
-    pub items_zh_url: String,
+    /// 物品表。`None` 表示未启用持久化。
     pub store: Option<Arc<ResourceStore>>,
 }
 
-impl Default for MarketConfig {
-    fn default() -> Self {
-        Self {
-            items_url: "https://json.tarkov.dev/regular/items".into(),
-            items_zh_url: "https://json.tarkov.dev/regular/items_zh".into(),
-            store: None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ItemsResponse {
-    #[serde(default)]
-    data: Option<ItemsData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ItemsData {
-    #[serde(default)]
-    items: HashMap<String, ItemEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ItemEntry {
-    #[serde(default, rename = "normalizedName")]
-    normalized_name: String,
-    #[serde(default, rename = "basePrice")]
-    base_price: i64,
-    // 下面四个都可能缺 —— 实测 5442 件里只有 3525 件有跳蚤价格。
-    #[serde(default, rename = "lastLowPrice")]
-    last_low_price: Option<i64>,
-    #[serde(default, rename = "avg24hPrice")]
-    avg24h_price: Option<i64>,
-    #[serde(default, rename = "low24hPrice")]
-    low24h_price: Option<i64>,
-    #[serde(default, rename = "high24hPrice")]
-    high24h_price: Option<i64>,
-    #[serde(default)]
-    weight: f64,
-}
-
-/// 解析物品。没有 slug 的条目会被丢掉 —— 它们没法被检索到。
-pub fn parse_items(body: &str, pack: &ItemLangPack) -> Result<Vec<TarkovItem>, String> {
-    let parsed: ItemsResponse =
-        serde_json::from_str(body).map_err(|err| format!("解析物品数据失败：{err}"))?;
-    let items = parsed.data.ok_or("物品响应缺少 data")?.items;
-
-    let mut out: Vec<TarkovItem> = items
-        .into_iter()
-        .filter_map(|(id, item)| {
-            let normalized_name = item.normalized_name.trim().to_string();
-            if normalized_name.is_empty() {
-                return None;
-            }
-            let name_zh = item_name(pack, &id);
-            Some(TarkovItem {
-                id,
-                normalized_name,
-                name_zh,
-                base_price: item.base_price,
-                last_low_price: item.last_low_price,
-                avg24h_price: item.avg24h_price,
-                low24h_price: item.low24h_price,
-                high24h_price: item.high24h_price,
-                weight: item.weight,
-            })
-        })
-        .collect();
-
-    out.sort_by(|a, b| a.normalized_name.cmp(&b.normalized_name));
-    Ok(out)
-}
-
-/// 是不是游戏内物品 id（24 位十六进制）。
+/// 一行价格摘要（列表第二行用）。
 ///
-/// 用它区分「查详情」与「搜关键词」，而不是让用户多记一条命令。
-pub fn is_item_id(raw: &str) -> bool {
-    raw.len() == 24 && raw.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// 价格写成「万」，否则六位数看不过来。
-pub fn format_price(value: i64) -> String {
-    // `unsigned_abs` 而不是 `abs`：`i64::MIN.abs()` 在 debug 下会 panic。
-    // 价格当然不可能是 i64::MIN，但一个会在越界输入上 panic 的格式化函数
-    // 没有理由留着 —— 它迟早会被用在别的地方。
-    if value.unsigned_abs() >= 10_000 {
-        format!("{:.2}万", value as f64 / 10_000.0)
-    } else {
-        value.to_string()
-    }
-}
-
-/// 一行价格摘要，搜索列表与详情共用。
+/// 分隔符两侧**不留空格**：手机一行只有 30 个单位，
+/// `商人 8,278｜跳蚤 9.36万｜详情` 正好 27，加上空格就是 31 —— 会折行。
 fn price_summary(item: &TarkovItem) -> String {
-    match item.avg24h_price.or(item.last_low_price) {
-        Some(flea) => {
-            if item.base_price > 0 {
-                format!("跳蚤 {} · 商人 {}", format_price(flea), format_price(item.base_price))
-            } else {
-                format!("跳蚤 {}", format_price(flea))
-            }
-        }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(price) = item.sell_trader_price {
+        parts.push(format!("商人 {}", format_price(price)));
+    }
+    match item.flea_price() {
+        Some(price) => parts.push(format!("跳蚤 {}", format_price(price))),
         // 说清楚「没有」而不是显示 0 —— 0 会被当成「不值钱」。
-        None => "无跳蚤数据".to_string(),
+        None => parts.push("无跳蚤数据".into()),
     }
+    // 可点文本：点一下只是把「跳蚤 <id>」插进输入框，用户还得按发送
+    // （群聊不支持 qqbot-cmd-enter，见协议文档 §12.1）。
+    parts.push(cmd_input(&format!("跳蚤 {}", item.id), "详情"));
+    parts.join("｜")
 }
 
-/// 搜索结果的行。
-pub fn format_rows(items: &[TarkovItem]) -> Vec<CardRow> {
-    items
-        .iter()
-        .map(|it| {
-            CardRow::Item {
-                label: it.name_zh.as_deref().unwrap_or(&it.normalized_name).to_string(),
-                value: price_summary(it),
-            }
-        })
-        .collect()
-}
-
-/// 详情视图的行。
-pub fn detail_rows(item: &TarkovItem) -> Vec<CardRow> {
-    let opt = |v: Option<i64>| v.map_or("-".to_string(), format_price);
-    let name = item.name_zh.as_deref().unwrap_or(&item.normalized_name);
-    let mut rows = vec![
-        CardRow::Item { label: "物品".to_string(), value: name.to_string() },
-        CardRow::Item {
-            label: "商人基础价".to_string(),
-            value: format_price(item.base_price),
-        },
-        CardRow::Item { label: "最低挂牌".to_string(), value: opt(item.last_low_price) },
-        CardRow::Item { label: "24 小时均价".to_string(), value: opt(item.avg24h_price) },
-        CardRow::Item {
-            label: "24 小时区间".to_string(),
-            value: match (item.low24h_price, item.high24h_price) {
-                (Some(lo), Some(hi)) => format!("{} ~ {}", format_price(lo), format_price(hi)),
-                _ => "-".to_string(),
-            },
-        },
-    ];
-    if item.weight > 0.0 {
-        rows.push(CardRow::Item {
-            label: "重量".to_string(),
-            value: format!("{:.2} kg", item.weight),
-        });
+/// 搜索结果（Markdown）。
+///
+/// 每件两行：`- **名称**` + 缩进的 `商人 … ｜ 跳蚤 … ｜ 详情`。
+/// 两行版式依赖「列表项内换行」，官方没有明确承诺 —— 所以这里做成**纯函数**，
+/// 真机实测若被压成一行，只改这一个函数就能切到单行版。
+pub fn render_list(items: &[TarkovItem], total: i64) -> String {
+    let mut out = String::new();
+    // 只有「被截断」时才提示条数：没截断还写一行，纯属噪音。
+    if total > items.len() as i64 {
+        let _ = writeln!(out, "匹配 {total} 件，显示前 {} 件。补个关键词能缩小范围。", items.len());
+        out.push('\n');
     }
-    rows
+    for item in items {
+        let name = md_safe(item.display_name());
+        let _ = writeln!(out, "- **{name}**{BR}");
+        let _ = writeln!(out, "  {}{BR}", price_summary(item));
+    }
+    out
 }
 
-/// `Clone` 是必需的：同一个实例要挂到两条命令路由上。
+/// 详情页（Markdown）。**空段不出现** —— 没有跳蚤价的物品不会印出一行「均价 -」。
+///
+/// 版式的公共部分（图片 / 商人段 / 价格段 / 链接 / 页脚）在 `crate::md`，
+/// 弹药详情用的是同一套 —— 两处必须长得一样，否则改一处漏一处只是时间问题。
+pub fn render_detail(item: &TarkovItem) -> String {
+    let name = md_safe(item.display_name());
+    let mut blocks: Vec<String> = vec![format!("# {name}")];
+
+    // 图片必须是**公网 URL**（平台自己下载转存），所以这里只认 http(s)。
+    blocks.extend(image_block(&name, item.image_url.as_deref()));
+    blocks.extend(trader_line(item));
+
+    let prices = price_lines(item);
+    if !prices.is_empty() {
+        // 分割线用 `***`（官方示例只有这个，`---` 不保证渲染）。
+        blocks.push("***".to_string());
+        blocks.push(prices.join("\n"));
+    }
+
+    blocks.extend(link_line(item));
+    // 页脚用**上游的价格扫描时刻**，比「我们什么时候刷的」更贴近这个价的真实年龄。
+    blocks.push(scan_footer(item));
+
+    blocks.join("\n\n")
+}
+
+
+/// 跳蚤市场插件：只读本地表。
+///
+/// 数据由 `tarkov_data` 每小时刷新 —— 这里没有任何 HTTP。
 #[derive(Clone)]
 pub struct MarketPlugin {
     config: MarketConfig,
-    http: reqwest::Client,
 }
 
 impl MarketPlugin {
-    pub fn new(config: MarketConfig, http: reqwest::Client) -> Self {
-        Self { config, http }
+    pub fn new(config: MarketConfig) -> Self {
+        Self { config }
     }
 
-    /// `更新物品`：整表重导。
-    async fn reload(&self, ctx: &Ctx) -> Handled {
-        if !ctx.is_group() || !ctx.is_admin() {
-            let _ = ctx.reply.text("只有群管理员能更新物品数据").await;
-            return Handled::Consumed;
-        }
+    /// `跳蚤<空格可有可无> <24位id | 关键词…>`。
+    async fn query(&self, ctx: &Ctx, raw: &str) -> Handled {
         let Some(store) = &self.config.store else {
             let _ = ctx.reply.text("未启用持久化，跳蚤功能不可用").await;
             return Handled::Consumed;
         };
-
-        let (body, lang) = match tokio::try_join!(
-            self.fetch(&self.config.items_url),
-            self.fetch(&self.config.items_zh_url)
-        ) {
-            Ok(pair) => pair,
-            Err(reason) => {
-                tracing::warn!(error = %reason, "下载物品数据失败");
-                let _ = ctx.reply.text(format!("下载失败：{reason}")).await;
-                return Handled::Consumed;
-            }
-        };
-        let pack = match parse_item_lang(&lang) {
-            Ok(pack) => pack,
-            Err(reason) => {
-                tracing::warn!(error = %reason, "物品语言包解析失败");
-                let _ = ctx.reply.text(format!("语言包解析失败：{reason}")).await;
-                return Handled::Consumed;
-            }
-        };
-        let items = match parse_items(&body, &pack) {
-            Ok(items) if !items.is_empty() => items,
-            Ok(_) => {
-                let _ = ctx.reply.text("解析出 0 件物品，上游格式可能变了").await;
-                return Handled::Consumed;
-            }
-            Err(reason) => {
-                tracing::warn!(error = %reason, "解析物品数据失败");
-                let _ = ctx.reply.text(format!("解析失败：{reason}")).await;
-                return Handled::Consumed;
-            }
-        };
-
-        match store.replace_items(items).await {
-            Ok(count) => {
-                let _ = ctx.reply.text(format!("物品数据已更新，共 {count} 条")).await;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "写入物品数据失败");
-                let _ = ctx.reply.text("写入失败，稍后再试").await;
-            }
-        }
-        Handled::Consumed
-    }
-
-    /// `跳蚤 <24位id|关键词>`。
-    async fn query(&self, ctx: &Ctx) -> Handled {
-        let raw = ctx.content().trim().strip_prefix("跳蚤").unwrap_or("").trim();
         if raw.is_empty() {
-            let _ = ctx.reply.text("用法：跳蚤 <名称片段>，或 跳蚤 <24位物品id>").await;
+            let _ = ctx
+                .reply
+                .markdown("用法：`跳蚤 <名称片段>`（可多关键词，空格分隔），或 `跳蚤 <24位物品id>`")
+                .await;
             return Handled::Consumed;
         }
-        let Some(store) = &self.config.store else {
-            let _ = ctx.reply.text("未启用持久化，跳蚤功能不可用").await;
-            return Handled::Consumed;
-        };
 
         // 24 位十六进制 → 详情视图；否则当关键词搜。
-        let (title, rows) = if is_item_id(raw) {
-            let found = match store.get_item(raw).await {
-                Ok(found) => found,
+        let markdown = if is_item_id(raw) {
+            match store.get_item(raw).await {
+                Ok(Some(item)) => render_detail(&item),
+                Ok(None) => {
+                    let _ = ctx
+                        .reply
+                        .text(self.empty_hint(store, "没有这个 id 对应的物品").await)
+                        .await;
+                    return Handled::Consumed;
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, "按 id 取物品失败");
                     let _ = ctx.reply.text("查询失败，稍后再试").await;
                     return Handled::Consumed;
                 }
-            };
-            match found {
-                Some(item) => {
-                    let name = item.name_zh.as_deref().unwrap_or(&item.normalized_name);
-                    (format!("跳蚤 · {name}"), detail_rows(&item))
-                }
-                None => {
-                    let _ = ctx.reply.text(self.empty_hint(store, "没有这个 id 对应的物品", raw).await).await;
-                    return Handled::Consumed;
-                }
             }
         } else {
             let tokens = query_tokens(raw);
-            let items = match store.search_items(tokens, MAX_ROWS).await {
+            if tokens.is_empty() {
+                let _ = ctx
+                    .reply
+                    .markdown("用法：`跳蚤 <名称片段>`（可多关键词，空格分隔），或 `跳蚤 <24位物品id>`")
+                    .await;
+                return Handled::Consumed;
+            }
+            let items = match store.search_items(tokens.clone(), search_hint(raw), LIST_LIMIT).await
+            {
                 Ok(items) => items,
                 Err(err) => {
                     tracing::warn!(error = %err, "检索物品失败");
@@ -291,48 +176,56 @@ impl MarketPlugin {
                 }
             };
             if items.is_empty() {
-                let _ = ctx.reply.text(self.empty_hint(store, "没有匹配的物品", raw).await).await;
+                let _ = ctx
+                    .reply
+                    .text(self.empty_hint(store, "没有匹配的物品").await)
+                    .await;
                 return Handled::Consumed;
             }
-            (format!("跳蚤 · {raw}"), format_rows(&items))
+            let total = store.count_items(tokens).await.unwrap_or(items.len() as i64);
+            render_list(&items, total)
         };
 
-        // 宽度与页脚都用 `Card` 的默认值（统一 1000 / 模板默认页脚）。
-        let mut card = Card::new(title);
-        for row in rows {
-            card = match row {
-                CardRow::Item { label, value } => card.row(label, value),
-                CardRow::Section { label } => card.section(label),
-            };
-        }
-        if let Err(err) = ctx.reply.card(&card).await {
-            tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "跳蚤卡片发送失败");
-            let _ = ctx.reply.text(format!("卡片生成失败：{err}")).await;
+        if let Err(err) = ctx.reply.markdown(markdown).await {
+            // 不降级成文本摘要：Markdown 发不出去时再发一条「两行一件」的纯文本
+            // 只会更难看，而且用户已经等了同样久。失败就明说失败。
+            tracing::warn!(error = %err, hint = err.hint().unwrap_or("-"), "跳蚤消息发送失败");
+            let _ = ctx.reply.text(format!("跳蚤消息发送失败：{err}")).await;
         }
         Handled::Consumed
     }
 
     /// 查不到时的话术。空表与「关键词不对」要给不同的话。
-    async fn empty_hint(&self, store: &ResourceStore, miss: &str, _query: &str) -> String {
+    async fn empty_hint(&self, store: &ResourceStore, miss: &str) -> String {
         match store.item_count().await {
-            Ok(0) => "物品数据还没导入，请管理员发「更新物品」".to_string(),
+            Ok(0) => "物品数据还没导入，请系统控制者发「塔科夫更新数据」".to_string(),
             _ => format!("{miss}，换个关键词试试"),
         }
     }
+}
 
-    async fn fetch(&self, url: &str) -> Result<String, crate::http::FetchError> {
-        crate::http::fetch_text(&self.http, url).await
-    }
+/// 排序用的「原样片段」：小写、去掉 LIKE 的通配符。
+///
+/// 参数里混进 `%` 或 `_` 会让排序条件变成「匹配一切」，
+/// 排序就从「相关性」退化成随机。
+fn search_hint(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| *c != '%' && *c != '_')
+        .collect::<String>()
+        .trim()
+        .to_lowercase()
 }
 
 #[async_trait]
 impl Handler for MarketPlugin {
     async fn handle(&self, ctx: &Ctx) -> Handled {
-        match ctx.content().split_whitespace().next().unwrap_or_default() {
-            "更新物品" => self.reload(ctx).await,
-            "跳蚤" => self.query(ctx).await,
-            _ => Handled::Next,
-        }
+        let content = ctx.content().trim();
+        // 路由用 `Matcher::Prefix("跳蚤")`，所以 `跳蚤 m4a1` 与 `跳蚤m4a1`
+        // 都会到这里 —— 差别只在 strip 之后有没有前导空格。
+        let Some(rest) = content.strip_prefix("跳蚤") else {
+            return Handled::Next;
+        };
+        self.query(ctx, rest.trim()).await
     }
 
     fn name(&self) -> &'static str {
@@ -344,123 +237,128 @@ impl Handler for MarketPlugin {
 mod tests {
     use super::*;
 
-    const FIXTURE: &str = concat!(
-        r#"{"data":{"items":{"#,
-        r#""i1":{"normalizedName":"colt-m4a1-556x45-assault-rifle","basePrice":18397,"lastLowPrice":23932,"avg24hPrice":93642,"low24hPrice":20000,"high24hPrice":185000,"weight":3.4},"#,
-        r#""i2":{"normalizedName":"slick-body-armor","basePrice":100000,"lastLowPrice":null,"avg24hPrice":null},"#,
-        r#""i3":{"normalizedName":"","basePrice":1}"#,
-        r#"}}}"#,
-    );
+    fn item(id: &str, slug: &str, name: Option<&str>) -> TarkovItem {
+        TarkovItem {
+            id: id.into(),
+            normalized_name: slug.into(),
+            name_zh: name.map(str::to_string),
+            base_price: 18_397,
+            last_low_price: Some(23_932),
+            avg24h_price: Some(53_707),
+            low24h_price: Some(20_000),
+            high24h_price: Some(185_000),
+            change_48h: Some(215),
+            change_48h_percent: Some(0.4),
+            offer_count: Some(20),
+            sell_trader_name: Some("Prapor".into()),
+            sell_trader_price: Some(8_278),
+            min_level_flea: 25,
+            grid_w: 1,
+            grid_h: 2,
+            weight: 3.4,
+            icon_url: Some(format!("https://assets/{id}-icon.webp")),
+            image_url: Some(format!("https://assets/{id}-grid.webp")),
+            wiki_link: Some("https://wiki/m4".into()),
+            dev_link: Some("https://tarkov.dev/item/m4".into()),
+            last_scan: Some(1_794_538_082),
+        }
+    }
 
+    fn bare(id: &str, slug: &str) -> TarkovItem {
+        TarkovItem {
+            name_zh: None,
+            base_price: 100_000,
+            last_low_price: None,
+            avg24h_price: None,
+            low24h_price: None,
+            high24h_price: None,
+            change_48h: None,
+            change_48h_percent: None,
+            offer_count: None,
+            sell_trader_name: None,
+            sell_trader_price: None,
+            min_level_flea: 0,
+            grid_w: 1,
+            grid_h: 1,
+            weight: 0.0,
+            icon_url: None,
+            image_url: None,
+            wiki_link: None,
+            dev_link: None,
+            last_scan: None,
+            id: id.into(),
+            normalized_name: slug.into(),
+        }
+    }
+
+    /// 列表：每件两行，第二行有商人价、跳蚤价与可点的「详情」。
     #[test]
-    fn keeps_items_with_a_slug_and_sorts() {
-        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
-        assert_eq!(items.len(), 2, "没有 slug 的条目没法被检索到: {items:?}");
-        assert_eq!(items[0].normalized_name, "colt-m4a1-556x45-assault-rifle");
-        assert_eq!(items[1].normalized_name, "slick-body-armor");
+    fn list_puts_name_prices_and_clickable_detail() {
+        let md = render_list(&[item("5447a9cd4bdc2dbd208b4567", "colt-m4a1", Some("柯尔特 M4A1"))], 1);
+        assert!(md.contains("- **柯尔特 M4A1**"), "第一行是名称: {md}");
+        assert!(md.contains("商人 8278"), "第二行要有商人收购价: {md}");
+        assert!(md.contains("跳蚤 5.37万"), "第二行要有跳蚤价: {md}");
+        assert!(md.contains("<qqbot-cmd-input "), "详情必须是可点文本: {md}");
+        assert!(md.contains("text=\"%E8%B7%B3%E8%9A%A4%20"), "点一下要插入「跳蚤 <id>」: {md}");
+        assert!(md.contains('\u{200B}'), "行末要有零宽空格，否则不换行: {md}");
+        assert!(!md.contains("匹配"), "没被截断就不该提条数: {md}");
     }
 
     #[test]
-    fn missing_flea_prices_stay_none() {
-        // 关键：缺价不能变成 0，否则会显示成「不值钱」。
-        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
-        let slick = &items[1];
-        assert_eq!(slick.last_low_price, None);
-        assert_eq!(slick.avg24h_price, None);
-        assert_eq!(slick.base_price, 100_000, "商人价仍在");
+    fn list_says_when_it_truncated() {
+        let items: Vec<TarkovItem> = (0..10).map(|i| bare(&format!("id{i}"), "s")).collect();
+        let md = render_list(&items, 137);
+        assert!(md.starts_with("匹配 137 件，显示前 10 件"), "要说明被截断: {md}");
+        assert!(md.contains("补个关键词"), "{md}");
     }
 
     #[test]
-    fn maps_the_price_fields() {
-        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
-        let m4 = &items[0];
-        assert_eq!(m4.base_price, 18397);
-        assert_eq!(m4.last_low_price, Some(23932));
-        assert_eq!(m4.avg24h_price, Some(93642));
-        assert_eq!(m4.low24h_price, Some(20000));
-        assert_eq!(m4.high24h_price, Some(185000));
+    fn list_says_when_there_is_no_flea_data() {
+        let md = render_list(&[bare("i1", "slick")], 1);
+        assert!(md.contains("无跳蚤数据"), "缺价要说清楚，不能显示 0: {md}");
     }
 
-    /// 实跑验证：打**真实**接口。
-    ///
-    /// ```text
-    /// cargo test -p qqbot-plugins --lib -- --ignored live_items
-    /// ```
-    #[tokio::test]
-    #[ignore = "需要网络"]
-    async fn live_items_endpoint_parses() {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .unwrap();
-        let body = http
-            .get("https://json.tarkov.dev/regular/items")
-            .header("User-Agent", "Mozilla/5.0 qqbot-rs")
-            .send()
-            .await
-            .expect("请求失败")
-            .text()
-            .await
-            .expect("读取失败");
-        let items = parse_items(&body, &ItemLangPack::new()).expect("解析失败");
-        assert!(items.len() > 5000, "应当解析出五千件以上物品，实际 {}", items.len());
-        let priced = items.iter().filter(|i| i.avg24h_price.is_some()).count();
-        assert!(priced > 3000, "应当有三千件以上带跳蚤价，实际 {priced}");
-        // 有价的那件必须能按 id 取回来 —— 这正是 B3 走的路。
-        let sample = items.iter().find(|i| i.avg24h_price.is_some()).unwrap();
-        assert!(is_item_id(&sample.id), "id 应当是 24 位十六进制: {}", sample.id);
+    /// 详情：图片、三个价、48h、规格、链接、页脚一个都不少。
+    #[test]
+    fn detail_shows_everything_it_has() {
+        let md = render_detail(&item("5447a9cd4bdc2dbd208b4567", "colt-m4a1", Some("柯尔特 M4A1")));
+        assert!(md.starts_with("# 柯尔特 M4A1\n"), "{md}");
+        assert!(md.contains("![柯尔特 M4A1 #96px #96px](https://assets/"), "图片是公网 URL: {md}");
+        assert!(md.contains("**商人** 基准 1.84万｜最高收购 8278（Prapor）"), "{md}");
+        assert!(md.contains("***"), "价格区前要有分割线: {md}");
+        assert!(md.contains("**跳蚤** 均价 5.37万｜最低挂牌 2.39万"), "{md}");
+        assert!(md.contains("**24h** 区间 2.00万 ~ 18.50万｜挂单 20 条"), "{md}");
+        assert!(md.contains("**48h** +215（+0.40%）"), "{md}");
+        assert!(md.contains("**规格** 1×2 格｜3.40 kg｜每格 2.69万"), "{md}");
+        assert!(md.contains("**门槛** 跳蚤准入 25 级"), "{md}");
+        assert!(md.contains("[wiki](https://wiki/m4)"), "{md}");
+        assert!(md.ends_with("> 价格数据：2026-11-13 10:48:02"), "页脚是扫描时刻: {md}");
+    }
+
+    /// 空段不出现：没有跳蚤价、没有图、没有链接的物品只留名称与商人价。
+    #[test]
+    fn detail_omits_empty_sections() {
+        let md = render_detail(&bare("5c0e53c886f7744a13f54933", "slick-body-armor"));
+        assert!(md.starts_with("# slick-body-armor"), "没有中文名就用 slug: {md}");
+        assert!(!md.contains("!["), "没有图就不该出现图片行: {md}");
+        assert!(!md.contains("**跳蚤**"), "没有跳蚤价就没有这一段: {md}");
+        assert!(!md.contains("**48h**"), "{md}");
+        assert!(!md.contains("**规格**") || !md.contains("kg"), "重量 0 不印: {md}");
+        assert!(md.contains("> 价格数据：未知"), "没有扫描时刻也要说清楚: {md}");
     }
 
     #[test]
-    fn broken_input_is_an_error_not_a_panic() {
-        assert!(parse_items("不是 JSON", &ItemLangPack::new()).is_err());
-        assert!(parse_items(r#"{"data":null}"#, &ItemLangPack::new()).is_err());
+    fn brackets_in_names_do_not_break_the_image_syntax() {
+        let mut it = item("i1", "x", Some("M4A1 [测试]"));
+        it.image_url = Some("https://assets/x.webp".into());
+        let md = render_detail(&it);
+        assert!(!md.contains("![M4A1 [测试]"), "半角方括号会提前闭合 ![](): {md}");
+        assert!(md.contains("M4A1 ［测试］"), "{md}");
     }
 
     #[test]
-    fn recognizes_item_ids() {
-        assert!(is_item_id("5447a9cd4bdc2dbd208b4567"));
-        assert!(!is_item_id("5447a9cd4bdc2dbd208b456"), "少一位不算");
-        assert!(!is_item_id("5447a9cd4bdc2dbd208b45678"), "多一位不算");
-        assert!(!is_item_id("slick-body-armor"), "slug 不算");
-        assert!(!is_item_id("5447a9cd4bdc2dbd208b456g"), "非十六进制不算");
-    }
-
-    #[test]
-    fn prices_switch_to_wan_at_five_digits() {
-        assert_eq!(format_price(9999), "9999");
-        assert_eq!(format_price(10_000), "1.00万");
-        assert_eq!(format_price(93_642), "9.36万");
-    }
-
-    #[test]
-    fn search_rows_say_when_there_is_no_flea_data() {
-        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
-        let rows = format_rows(&items);
-        assert_eq!(rows[0].value(), Some("跳蚤 9.36万 · 商人 1.84万"), "均价优先于最低挂牌");
-        assert_eq!(rows[1].value(), Some("无跳蚤数据"), "缺价要说清楚，不能显示 0");
-    }
-
-    #[test]
-    fn detail_rows_cover_every_field() {
-        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
-        let rows = detail_rows(&items[0]);
-        let labels: Vec<&str> = rows.iter().map(CardRow::label).collect();
-        assert_eq!(
-            labels,
-            vec!["物品", "商人基础价", "最低挂牌", "24 小时均价", "24 小时区间", "重量"]
-        );
-        assert_eq!(rows[4].value(), Some("2.00万 ~ 18.50万"));
-        assert_eq!(rows[5].value(), Some("3.40 kg"));
-    }
-
-    #[test]
-    fn detail_rows_use_a_dash_for_missing_values() {
-        let items = parse_items(FIXTURE, &ItemLangPack::new()).unwrap();
-        let rows = detail_rows(&items[1]);
-        assert_eq!(rows[2].value(), Some("-"));
-        assert_eq!(rows[4].value(), Some("-"), "只有一边有价也算缺");
-        // 重量为 0 时整行不出现，而不是显示 0.00 kg。
-        assert!(rows.iter().all(|r| r.label() != "重量"));
+    fn search_hint_strips_like_wildcards() {
+        assert_eq!(search_hint("  M4A1 "), "m4a1");
+        assert_eq!(search_hint("50%_x"), "50x");
     }
 }

@@ -66,8 +66,14 @@ basepath = "data/resources"
 #   3x4.png headset.png
 # **留空或注释掉则该插件不注册**（没放图时注册了也只会报「读取失败」）。
 # 环境变量：QQBOT_TARKOV_IMAGES_DIR
+#
+# refresh_hours：塔科夫数据（跳蚤价格 / 弹药 / 任务）的自动刷新周期，单位小时。
+#   一次刷新要下 7 个静态 JSON，约 21 MB（一天约 500 MB），所以按需调大。
+#   0 = **关闭自动刷新**，此时只有系统控制者发「塔科夫更新数据」才会更新。
+#   环境变量：QQBOT_TARKOV_REFRESH_HOURS
 # [tarkov]
 # images_dir = "/opt/bot_img/tarkov_map"
+# refresh_hours = 1
 
 # ---- 按需打开（默认值随机器规格而定，所以默认注释掉）----
 # 接口基址（调试 / 私有化部署用）

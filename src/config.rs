@@ -70,6 +70,14 @@ const MAX_DAILY_CACHE_SECS: u64 = 86_400;
 /// 从消息收录的素材默认落盘目录。
 const DEFAULT_RESOURCES_BASEPATH: &str = "data/resources";
 
+/// 塔科夫数据默认刷新周期（小时）。
+///
+/// 1 小时是「价格新鲜度」与「带宽」的折中：一次刷新约 21 MB，
+/// 一天约 500 MB。`0` 关闭自动刷新（手动命令仍在）。
+const DEFAULT_TARKOV_REFRESH_HOURS: u64 = 1;
+/// 刷新周期上界（一周）。没有上界的话 `* 3600` 在极端配置下会溢出。
+const MAX_TARKOV_REFRESH_HOURS: u64 = 168;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub app_id: String,
@@ -95,6 +103,8 @@ pub struct Config {
     pub resources_basepath: PathBuf,
     /// 塔科夫静态图目录（B9–B15）。`None` 表示不注册那个插件。
     pub tarkov_images_dir: Option<PathBuf>,
+    /// 塔科夫数据自动刷新周期（小时）。`0` 表示关闭（手动命令仍可用）。
+    pub tarkov_refresh_hours: u64,
     /// 系统控制者。`None` 表示沿用数据库里的值（首次建库会播种默认值）。
     pub system_controllers: Option<Vec<String>>,
     /// 日志级别（`RUST_LOG` > `config.toml` > 默认值，**已在这里解析完**）。
@@ -259,6 +269,13 @@ impl Config {
         let tarkov_images_dir = non_empty(env.get("QQBOT_TARKOV_IMAGES_DIR"))
             .or_else(|| file.and_then(|f| non_empty(f.tarkov.images_dir.as_deref())))
             .map(PathBuf::from);
+        // ---- 塔科夫数据刷新周期 ----
+        // 每一小时刷一次七个静态 JSON（约 21 MB）。`0` = 关闭自动刷新。
+        let tarkov_refresh_hours = env
+            .parsed::<u64>("QQBOT_TARKOV_REFRESH_HOURS")?
+            .or(file.and_then(|f| f.tarkov.refresh_hours))
+            .unwrap_or(DEFAULT_TARKOV_REFRESH_HOURS)
+            .min(MAX_TARKOV_REFRESH_HOURS);
 
         // 显式配置时**覆盖数据库**，这也是控制者列表被改坏后的恢复通道。
         let system_controllers = match non_empty(env.get("QQBOT_SYSTEM_CONTROLLERS")) {
@@ -289,6 +306,7 @@ impl Config {
             daily,
             resources_basepath,
             tarkov_images_dir,
+            tarkov_refresh_hours,
             system_controllers,
             log_level,
             log_level_source,
@@ -332,6 +350,7 @@ impl Default for Config {
             daily: None,
             resources_basepath: PathBuf::from(DEFAULT_RESOURCES_BASEPATH),
             tarkov_images_dir: None,
+            tarkov_refresh_hours: DEFAULT_TARKOV_REFRESH_HOURS,
             system_controllers: None,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             log_level_source: "默认值",
@@ -476,6 +495,8 @@ struct DailySection {
 struct TarkovSection {
     /// 静态图目录（B9–B15）。留空则该插件不注册。
     images_dir: Option<String>,
+    /// 数据刷新周期（小时）。`0` 关闭自动刷新。
+    refresh_hours: Option<u64>,
 }
 
 /// `[resources]` 段。
@@ -606,6 +627,32 @@ mod tests {
         let mut v = vec![("QQBOT_APP_ID", "id"), ("QQBOT_APP_SECRET", "sec")];
         v.extend_from_slice(pairs);
         v
+    }
+
+    /// 塔科夫刷新周期：默认 1 小时，环境变量优先，上界 168（一周）。
+    #[test]
+    fn tarkov_refresh_hours_defaults_to_one_hour_and_is_capped() {
+        let base = resolve(&creds(&[]), None).unwrap();
+        assert_eq!(base.tarkov_refresh_hours, 1, "默认每小时刷新");
+
+        let off = resolve(&creds(&[("QQBOT_TARKOV_REFRESH_HOURS", "0")]), None).unwrap();
+        assert_eq!(off.tarkov_refresh_hours, 0, "0 表示关闭自动刷新");
+
+        // 上界是功能性代码：没有它，极端值会把 `* 3600` 推到溢出边缘。
+        let huge = resolve(&creds(&[("QQBOT_TARKOV_REFRESH_HOURS", "100000")]), None).unwrap();
+        assert_eq!(huge.tarkov_refresh_hours, MAX_TARKOV_REFRESH_HOURS);
+
+        // 写了但解析不了必须报错，不能静默回退（与其它数值键一致）。
+        let bad = resolve(&creds(&[("QQBOT_TARKOV_REFRESH_HOURS", "abc")]), None);
+        assert!(bad.is_err(), "非法值要报错: {bad:?}");
+
+        // config.toml 的 [tarkov] refresh_hours 也认。
+        let from_file = resolve(
+            &creds(&[]),
+            Some("app_id = \"a\"\nclient_secret = \"s\"\n[tarkov]\nrefresh_hours = 6\n"),
+        )
+        .unwrap();
+        assert_eq!(from_file.tarkov_refresh_hours, 6);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// 当前 schema 版本，记录在 `meta` 表里。
 ///
@@ -46,9 +46,53 @@ use rusqlite::Connection;
 /// 「按 `(created_at, ordinal)` 取最新」那个排序 bug 的栖身之处。
 ///
 /// 从 v13 起**不再迁移旧库**：版本不等一律报错要求删库重建，理由见 `migrate`。
+///
+/// # 两级版本（v14 之后）
+///
+/// 库里有两类表，代价完全不同：
+///
+/// - **不可再生**（`messages` / `resources` / `settings` / `bili_subscriptions` …）：
+///   删掉就是丢用户数据。它们由上面的 `SCHEMA_VERSION` 严格把关，版本不等就报错。
+/// - **可再生**（`ammo` / `tarkov_item` / `tarkov_task*`）：全是上游静态 JSON 的副本，
+///   重建只要一次刷新（约 30 秒）。它们由 `TARKOV_SCHEMA_VERSION` 单独按**组**管理：
+///   组版本不符就 `DROP` 这十张表、按最新 DDL 重建，再把「上次刷新时间」清掉，
+///   让刷新器立刻回填。
+///
+/// 为什么分两级：这两类表在**同一个文件**里，而删库会连消息历史一起删。
+/// 加一个塔科夫字段就要用户丢掉全部聊天记录，是荒谬的代价；反过来把可再生表
+/// 也纳入「严格校验」则每次调字段都要删库。分级的成本只有一张常量表与十几行
+/// 重建逻辑。
 pub const SCHEMA_VERSION: i64 = 14;
 
-const DDL: &str = r#"
+/// 可再生表组的版本，存在 `meta.tarkov_schema` 里。
+///
+/// 形状变化时提它 —— 提完启动时自动重建，不需要人工删库。
+/// 判定与重建见 [`migrate`]。
+///
+/// v2：`image_url` 的**含义**变了（`image512pxLink` → `gridImageLink`，64×64 格子图）。
+/// 这不是 DDL 改动，但旧行里存的是 512px 地址，不重建就会在详情页里继续显示大照片 ——
+/// 「只改了取哪个字段」也照样是数据形状变了，所以照规矩提版本、让刷新器重灌。
+pub const TARKOV_SCHEMA_VERSION: i64 = 2;
+
+/// `meta` 里记录组版本的键。
+const TARKOV_VERSION_KEY: &str = "tarkov_schema";
+
+/// 可再生表（**先子表后主表**，虽然当前没开外键，顺序将来加约束时才不会炸）。
+const REGENERABLE_TABLES: [&str; 10] = [
+    "tarkov_task_fail",
+    "tarkov_task_requirement",
+    "tarkov_task_key",
+    "tarkov_task_successor",
+    "tarkov_task_prereq",
+    "tarkov_task_reward",
+    "tarkov_task_objective",
+    "tarkov_task",
+    "tarkov_item",
+    "ammo",
+];
+
+const CORE_DDL: &str = r#"
+-- 不可再生：删掉就是丢用户数据，由 `SCHEMA_VERSION` 严格把关。
 CREATE TABLE IF NOT EXISTS messages (
     id          TEXT PRIMARY KEY,
     scope       TEXT NOT NULL CHECK (scope IN ('group','c2c')),
@@ -138,7 +182,10 @@ CREATE TABLE IF NOT EXISTS pending_captions (
     created_at INTEGER NOT NULL,
     PRIMARY KEY (target_id, sender_id)
 );
+"#;
 
+// 以下是**可再生**的塔科夫表组，由 `TARKOV_SCHEMA_VERSION` 单独管理。
+const TARKOV_DDL: &str = r#"
 -- 塔科夫弹药。字段对齐 cq-bot 的 `bullet` 表（MIT），但只保留
 -- 静态 JSON 里真实存在、且玩家真正会看的那几项。
 CREATE TABLE IF NOT EXISTS ammo (
@@ -303,20 +350,52 @@ CREATE INDEX IF NOT EXISTS idx_tarkov_task_prereq_pre ON tarkov_task_prereq(prer
 CREATE INDEX IF NOT EXISTS idx_tarkov_task_successor_succ
     ON tarkov_task_successor(successor_id);
 
--- 塔科夫物品与跳蚤价格。价格字段可为 NULL —— 实测 5442 件里只有 3525 件有价。
+-- 塔科夫物品与跳蚤价格。价格字段可为 NULL —— 实测 5498 件里只有 3550 件有价。
+--
+-- 这是**可再生表**：整表由上游静态 JSON 重建，加列只提 `TARKOV_SCHEMA_VERSION`，
+-- 启动时自动 DROP + 重建（见上面的两级版本说明）。
 CREATE TABLE IF NOT EXISTS tarkov_item (
-    id              TEXT PRIMARY KEY,
+    id                  TEXT PRIMARY KEY,
     -- 可读 slug（`colt-m4a1-556x45-assault-rifle`）。理由同 ammo / tarkov_task。
-    normalized_name TEXT NOT NULL,
+    normalized_name     TEXT NOT NULL,
     -- 语言包里的中文名（`regular/items_zh` 的 `<id> Name`）。
-    name_zh         TEXT,
-    base_price      INTEGER NOT NULL DEFAULT 0,
+    name_zh             TEXT,
+    base_price          INTEGER NOT NULL DEFAULT 0,
     -- 跳蚤市场价：最低挂牌 / 24 小时均价 / 24 小时最低 / 24 小时最高。
-    last_low_price  INTEGER,
-    avg24h_price    INTEGER,
-    low24h_price    INTEGER,
-    high24h_price   INTEGER,
-    weight          REAL NOT NULL DEFAULT 0
+    last_low_price      INTEGER,
+    avg24h_price        INTEGER,
+    low24h_price        INTEGER,
+    high24h_price       INTEGER,
+    -- 48 小时变化：绝对 RUB 与百分比。百分比是上游算好的
+    -- （= change / (均价 - change) × 100，实测 3370/3550 复算一致），
+    -- 所以两个都存，渲染层不自己算 —— 自己算就等于把口径实现第二遍。
+    change_48h          INTEGER,
+    change_48h_percent  REAL,
+    -- 当前挂单数（上游 `lastOfferCount`）。
+    offer_count         INTEGER,
+    -- 卖给商人最赚的那一家：昵称 + RUB 报价。
+    -- 上游只给 trader id，昵称由 `regular/traders` + `traders_zh` 在**导入时**
+    -- 解析好 —— 查询路径不查第二张表，也不做 join。
+    sell_trader_name    TEXT,
+    sell_trader_price   INTEGER,
+    -- 跳蚤市场准入等级（0 = 未给/无限制）。
+    min_level_flea      INTEGER,
+    -- 占格（1×1、2×3）。每格价值 = 跳蚤均价 ÷ (w×h)，玩家真正关心的指标。
+    grid_w              INTEGER NOT NULL DEFAULT 0,
+    grid_h              INTEGER NOT NULL DEFAULT 0,
+    weight              REAL NOT NULL DEFAULT 0,
+    -- 图片与链接。markdown 卡片只能放**公网 URL**（平台自己下载转存），
+    -- 所以存 URL 而不是把图下载到本地。
+    -- icon_url  = `iconLink`（64×64 物品图标，暂无渲染方用）。
+    -- image_url = `gridImageLink`（64×64 格子图，透明底）—— 详情页用它，
+    --   不用 `image512pxLink`：那张是 512px「照片」，折行又多、放大也没意义。
+    icon_url            TEXT,
+    image_url           TEXT,
+    wiki_link           TEXT,
+    dev_link            TEXT,
+    -- 价格扫描时刻（上游 `lastScan`，unix 秒）。详情页脚的「价格数据」用它的
+    -- 时间，比我们自己刷新的时刻更贴近「这个价是什么时候的」。
+    last_scan           INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_tarkov_item_name ON tarkov_item(normalized_name);
@@ -367,81 +446,136 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(found > 0)
 }
 
-/// 建表并写入 schema 版本。三条规则：
+/// 建表并写入版本号。四条规则：
 ///
-/// 1. **新库**（连 `meta` 表都没有）→ 建表 + 写版本 + 播种默认资源，三件事一个事务；
-/// 2. 版本**恰好相等** → 直接用，什么都不做；
-/// 3. 版本**不等**（旧库或更新的库）→ 返回明确错误，**不建表、不迁移**；
+/// 1. **新库**（连 `meta` 表都没有）→ 建全部表 + 写两个版本号 + 播种默认资源，
+///    四件事一个事务；
+/// 2. 全局版本**恰好相等** → 检查可再生表的组版本（见下），必要时整组重建；
+/// 3. 全局版本**不等**（旧库或更新的库）→ 返回明确错误，**不建表、不迁移**；
 /// 4. `meta` 表在、版本行不在 → 也返回明确错误（见下），**不建表**。
 ///
-/// 第 3 条是 ADR 0001 第 11 条的授权结果：本次重构允许重建数据库，
-/// 所以加表加列只需要改 `DDL` 并提 `SCHEMA_VERSION`，不必再维护跨版本的
-/// `ALTER` / `DROP` 分支。宁可让用户删掉 `data/qqbot.db` 重启，
-/// 也不要留下「升了一半」的库 —— 那种半残状态既没有测试能覆盖，
-/// 报出来的错也指不到真正的原因。
+/// 第 3 条是 ADR 0001 第 11 条的授权结果：**不可再生**表只能靠删库重建，
+/// 因为「升了一半」的库既没有测试能覆盖，报出来的错也指不到真正的原因。
 ///
-/// ⚠️ 版本判定必须发生在执行 `DDL` **之前**：否则旧库会被顺手建上新表，
+/// 可再生表（`ammo` / `tarkov_item` / `tarkov_task*`）走**第 2 条**：
+/// 组版本不符时 DROP 这十张表、按最新 DDL 重建、清掉「上次刷新时间」，
+/// 刷新器随即回填。它们全是上游 JSON 的副本，删掉不心疼 —— 而消息历史删了
+/// 就回不来，所以不该为了加一个塔科夫字段让用户删整个库。
+///
+/// ⚠️ 全局版本判定必须发生在执行 DDL **之前**：否则旧库会被顺手建上新表，
 /// 之后即使报错，库里也已经多出一堆形状不一致的表。
 pub fn migrate(conn: &Connection) -> Result<()> {
-    // ⚠️ 不能用 `.ok()` 把三种语义压成同一个 None：
-    //   (a) 行不存在     → 正常首次初始化，走新库分支
-    //   (b) 查询失败     → 真实错误，必须上报
-    //   (c) 值不是整数   → 数据损坏，必须上报
-    // (b)/(c) 若混进 None 分支，会撞上 meta.key 主键约束，报出一条毫无指向性的
-    // "UNIQUE constraint failed"，进而让 main 静默把整个持久化降级掉。
-    //
-    // ⚠️ 「`meta` 表在、版本行不在」**不是**新库。它只可能来自手改数据库，或
-    // 「建表成功、写版本行之前进程退出」。当成新库的后果很隐蔽：`CREATE TABLE
-    // IF NOT EXISTS` 修不了已存在表的形状，版本却被写成当前值 —— 库看起来一切正常，
-    // 直到运行期报 `no such column`，而写线程对 SQL 失败只 warn 后丢批
-    // （消息一条不落库，日志里只有一行 warn）。所以这里明确报错。
-    let current: Option<i64> = if !table_exists(conn, "meta")? {
-        None
-    } else {
-        match conn.query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |r| r.get::<_, String>(0),
-        ) {
-            Ok(v) => Some(
-                v.parse()
-                    .with_context(|| format!("meta.schema_version 不是整数: {v:?}"))?,
-            ),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                anyhow::bail!(
-                    "数据库里有 meta 表却没有 schema_version 行，无法判断版本。\
-                     删掉 data/qqbot.db 后重启即可重建"
-                );
-            }
-            Err(err) => return Err(err).context("读取 schema_version 失败"),
+    match read_version(conn)? {
+        // 新库：建全部表、写两个版本、播种，一个事务。
+        None => {
+            let tx = conn.unchecked_transaction().context("开启建库事务失败")?;
+            tx.execute_batch(CORE_DDL).context("建表失败")?;
+            tx.execute_batch(TARKOV_DDL).context("建塔科夫表失败")?;
+            write_version(&tx, "schema_version", SCHEMA_VERSION)?;
+            write_version(&tx, TARKOV_VERSION_KEY, TARKOV_SCHEMA_VERSION)?;
+            // 只在**首次建库**时播种。之后控制者清空列表不会让默认值复活。
+            crate::resource::seed_defaults(&tx)?;
+            tx.commit().context("提交建库事务失败")?;
+            tracing::info!(version = SCHEMA_VERSION, "数据库 schema 已初始化");
+            Ok(())
         }
-    };
+        Some(v) if v == SCHEMA_VERSION => ensure_tarkov_tables(conn),
+        Some(v) => anyhow::bail!(
+            "数据库 schema 版本 {v} 与本程序要求的 {SCHEMA_VERSION} 不一致。\
+             本次重构（ADR 0001 第 11 条）不再迁移旧库：删掉 data/qqbot.db 后重启即可重建"
+        ),
+    }
+}
 
-    match current {
-        Some(v) if v == SCHEMA_VERSION => return Ok(()),
-        Some(v) => {
-            anyhow::bail!(
-                "数据库 schema 版本 {v} 与本程序要求的 {SCHEMA_VERSION} 不一致。\
-                 本次重构（ADR 0001 第 11 条）不再迁移旧库：删掉 data/qqbot.db 后重启即可重建"
-            );
-        }
-        None => {}
+/// 读全局版本号。
+///
+/// ⚠️ 不能用 `.ok()` 把三种语义压成同一个 None：
+///   (a) 行不存在     → 正常首次初始化，走新库分支
+///   (b) 查询失败     → 真实错误，必须上报
+///   (c) 值不是整数   → 数据损坏，必须上报
+/// (b)/(c) 若混进 None 分支，会撞上 meta.key 主键约束，报出一条毫无指向性的
+/// "UNIQUE constraint failed"，进而让 main 静默把整个持久化降级掉。
+///
+/// ⚠️ 「`meta` 表在、版本行不在」**不是**新库。它只可能来自手改数据库，或
+/// 「建表成功、写版本行之前进程退出」。当成新库的后果很隐蔽：`CREATE TABLE
+/// IF NOT EXISTS` 修不了已存在表的形状，版本却被写成当前值 —— 库看起来一切正常，
+/// 直到运行期报 `no such column`，而写线程对 SQL 失败只 warn 后丢批
+/// （消息一条不落库，日志里只有一行 warn）。所以这里明确报错。
+fn read_version(conn: &Connection) -> Result<Option<i64>> {
+    if !table_exists(conn, "meta")? {
+        return Ok(None);
+    }
+    match conn.query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| {
+        r.get::<_, String>(0)
+    }) {
+        Ok(v) => Ok(Some(
+            v.parse()
+                .with_context(|| format!("meta.schema_version 不是整数: {v:?}"))?,
+        )),
+        Err(rusqlite::Error::QueryReturnedNoRows) => anyhow::bail!(
+            "数据库里有 meta 表却没有 schema_version 行，无法判断版本。\
+             删掉 data/qqbot.db 后重启即可重建"
+        ),
+        Err(err) => Err(err).context("读取 schema_version 失败"),
+    }
+}
+
+/// 写一条 `meta` 版本（存在则覆盖）。
+fn write_version(conn: &Connection, key: &str, value: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value.to_string()],
+    )
+    .with_context(|| format!("写入 {key} 失败"))?;
+    Ok(())
+}
+
+/// 确保可再生表组的形状是当前版本；不是就整组 DROP 重建。
+///
+/// 重建后**清掉「上次刷新时间」**：那是刷新器判断「要不要立刻回填」的依据，
+/// 留着它会让空表看起来像刚更新过，用户查询只会得到「数据还没导入」。
+fn ensure_tarkov_tables(conn: &Connection) -> Result<()> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [TARKOV_VERSION_KEY],
+            |r| r.get(0),
+        )
+        .optional()
+        .context("读取塔科夫组版本失败")?;
+
+    // 组版本行缺失（v14 之前的库）也算不一致：那批表的形状本来就没有列记录。
+    let up_to_date = stored
+        .as_deref()
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(|v| v == TARKOV_SCHEMA_VERSION);
+    if up_to_date {
+        // 行在但与当前 DDL 一致 —— 什么都不用做，这是最常见的一条路径。
+        return Ok(());
     }
 
-    // 建表、写版本、播种必须在**同一个事务**里。否则「建了表却没写版本行」这个半残
-    // 状态就能由崩溃产生 —— 而它正是上面那条报错要挡住的东西。
-    // 用 `unchecked_transaction`：`migrate` 只拿得到 `&Connection`。
-    let tx = conn.unchecked_transaction().context("开启建库事务失败")?;
-    tx.execute_batch(DDL).context("建表失败")?;
+    let tx = conn.unchecked_transaction().context("开启重建事务失败")?;
+    for table in REGENERABLE_TABLES {
+        // 没有 IF EXISTS 之外的讲究：这些表可能整批都不存在（很旧的库）。
+        tx.execute(&format!("DROP TABLE IF EXISTS {table}"), [])
+            .with_context(|| format!("删除 {table} 失败"))?;
+    }
+    tx.execute_batch(TARKOV_DDL).context("重建塔科夫表失败")?;
+    write_version(&tx, TARKOV_VERSION_KEY, TARKOV_SCHEMA_VERSION)?;
+    // 数据没了，「上次刷新时间」也必须一起没 —— 否则刷新器等一个周期才回填。
     tx.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [SCHEMA_VERSION.to_string()],
-    )?;
-    // 只在**首次建库**时播种。之后控制者清空列表不会让默认值复活。
-    crate::resource::seed_defaults(&tx)?;
-    tx.commit().context("提交建库事务失败")?;
-    tracing::info!(version = SCHEMA_VERSION, "数据库 schema 已初始化");
+        "DELETE FROM settings WHERE key = ?1",
+        [crate::resource::REFRESH_SETTING_KEY],
+    )
+    .context("清除刷新时间失败")?;
+    tx.commit().context("提交重建事务失败")?;
+
+    tracing::warn!(
+        from = stored.as_deref().unwrap_or("缺失"),
+        to = TARKOV_SCHEMA_VERSION,
+        "塔科夫数据表的组版本不符，已删除并按最新结构重建（数据由刷新器重新导入）"
+    );
     Ok(())
 }
 
@@ -519,6 +653,71 @@ mod tests {
         let err = format!("{:#}", migrate(&conn).unwrap_err());
         assert!(err.contains("不是整数"), "应指出真实原因，实际: {err}");
         assert!(!err.contains("UNIQUE"), "不应退化成主键冲突: {err}");
+    }
+
+    /// 组版本不符时：**只**重建那十张可再生表，消息历史与设置原样保留。
+    ///
+    /// 这条测试钉住的是「加一个塔科夫字段不该让用户删掉整库」这个承诺 ——
+    /// 它是两级版本管理存在的唯一理由，所以必须真的删一次再重建一次。
+    #[test]
+    fn tarkov_group_rebuild_keeps_core_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // 不可再生的数据：一条消息 + 一条刷新时间设置。
+        conn.execute(
+            "INSERT INTO messages(id, scope, target_id, event_name, content, created_at) \
+             VALUES('M1','group','G1','GROUP_MESSAGE_CREATE','hi',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO settings(key, value, updated_at) VALUES(?1, '1700000000', 0)",
+            [crate::resource::REFRESH_SETTING_KEY],
+        )
+        .unwrap();
+        // 可再生的数据：一行物品（重建后消失，由刷新器回填）。
+        conn.execute(
+            "INSERT INTO tarkov_item(id, normalized_name, weight) VALUES('X','x',1.0)",
+            [],
+        )
+        .unwrap();
+
+        // 模拟「程序升级、塔科夫表加了列」：组版本落后。
+        conn.execute("UPDATE meta SET value = '0' WHERE key = 'tarkov_schema'", [])
+            .unwrap();
+        migrate(&conn).unwrap();
+
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(count("messages"), 1, "消息历史必须保住");
+        assert_eq!(count("tarkov_item"), 0, "可再生表要整组重建（清空待回填）");
+        let refresh_key: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [crate::resource::REFRESH_SETTING_KEY],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            refresh_key.is_none(),
+            "重建要顺手清掉刷新时间，否则刷新器会以为数据是新的"
+        );
+        assert!(count("settings") >= 1, "系统控制者这类设置不该被连带删掉");
+
+        // 组版本要写回当前值，否则每次启动都重建一遍。
+        let v: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'tarkov_schema'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, TARKOV_SCHEMA_VERSION.to_string());
+        // 新列必须真的存在（否则「重建」只是删了再建一张旧形状的表）。
+        conn.execute(
+            "INSERT INTO tarkov_item(id, normalized_name, sell_trader_price) VALUES('Y','y',1)",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

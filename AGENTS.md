@@ -18,7 +18,7 @@ Rust workspace 实现的 QQ 官方 API v2 机器人（群聊 / 单聊，不含�
 | MSRV | **1.88**（edition 2024 要 1.85，rusqlite 0.40.2 要 1.88，取高者） |
 | 结构 | 7 个 crate（`crates/*`）+ 根 package（**lib + bin**，`src/`）—— 装配在 lib 里，e2e 才引用得到 |
 | lint 策略 | `unsafe_code = "deny"`、clippy `correctness = "deny"`，**零警告** |
-| 测试基线 | 526 项，全绿 |
+| 测试基线 | 551 项，全绿 |
 | 运行时依赖 | 无。单静态二进制，不需要 Redis / 外部数据库 / Node / Chromium |
 
 ---
@@ -179,6 +179,8 @@ cargo check -p qqbot
 - 禁止 `Box<dyn Any>` 消息；actor 的消息必须是**具体 enum**。
 - 禁止在 actor 内部 `await` **无超时**的外部 IO。
 - `SessionShard` 是「按 key 分片」，**不是一群一 actor** —— 群数量会无界增长。
+- **定时任务不是 actor**：塔科夫数据每小时的刷新（`tarkov_data::spawn_hourly`）是一个普通
+  `tokio::spawn` 循环 + 一把 `Mutex` 串行化，没有跨消息独占状态，因此不进上表。
 - 扩大 actor 边界（新增第四类、或把无状态逻辑塞进 actor）属于架构变更：
   必须更新本节上面的边界表，并在提交说明里论证为什么现有三类不够用。
 - actor 内部的 IO 边缘可以用**单方法 trait** 替换（如 `SessionShard` 的 `SendApi`），
@@ -252,9 +254,10 @@ cargo check -p qqbot
 | 发送链路、`msg_seq`、被动窗口、配额 | `crates/qqbot-core/src/session.rs`。发送边缘是单方法 trait `SendApi`（`ApiClient` 是唯一生产实现），所以「被动过期 → 主动重试一次」这段策略有**进程内**测试（脚本化 adapter 直接驱动 `handle_send`），不必起 mock HTTP |
 | 事件分发、去重、并发 | `crates/qqbot-core/src/dispatch.rs` |
 | 路由表与插件 trait | `crates/qqbot-core/src/plugin.rs` |
-| 业务插件 | `crates/qqbot-plugins/src/{help,dice,wordcloud,daily,resource,tarkov,ba,bili,bangumi,caption,ammo,task,market,delta,tarkov_image,timewin}.rs`，注册在 `lib.rs::register` |
+| 业务插件 | `crates/qqbot-plugins/src/{help,dice,wordcloud,daily,resource,tarkov,ba,bili,bangumi,caption,ammo,task,market,delta,tarkov_image,timewin}.rs`，注册在 `lib.rs::register`。跳蚤与弹药的 Markdown 版式助手（零宽空格、价格段、图片/链接/页脚）在 `md.rs`，**别在插件里再抄一遍** |
 | 资源管理（关键词→素材） | `crates/qqbot-plugins/src/resource.rs` + `crates/qqbot-store/src/resource.rs` |
-| 数据库表结构 / schema 版本 | `crates/qqbot-store/src/schema.rs`（加表 / 加列 / 加索引**只改 `DDL` 并提 `SCHEMA_VERSION`**，不必再写跨版本的 `ALTER`）。**旧库不再迁移**：版本不等（旧库或更新的库）会**明确报错并要求删掉 `data/qqbot.db` 后重启**，且报错发生在建表之前 —— 这是 [ADR 0001](docs/adr/0001-plugin-outbound-refactor.md) 第 11 条的授权结果 |
+| 数据库表结构 / schema 版本 | `crates/qqbot-store/src/schema.rs`。**两级版本管理**：不可再生表（`messages` / `resources` / `settings` / `bili_subscriptions` …）由 `SCHEMA_VERSION` 严格把关，版本不等**明确报错并要求删掉 `data/qqbot.db`**（报错发生在建表之前）；可再生表（`ammo` / `tarkov_item` / `tarkov_task*`）由 `TARKOV_SCHEMA_VERSION` 按**组**管理，版本不等就 `DROP` 这十张表并按最新 DDL 重建 + 触发回填，**不动消息历史**。加表 / 加列只改 `DDL` 并提对应版本号，不必写跨版本 `ALTER`（[ADR 0001](docs/adr/0001-plugin-outbound-refactor.md) 第 11 条） |
+| 塔科夫数据刷新（7 个静态 JSON → 三张表） | `crates/qqbot-plugins/src/tarkov_data.rs`。**唯一写入者**：每小时自动（`[tarkov] refresh_hours`，0 = 关）+ 启动时按时间戳回填 + 系统控制者的 `塔科夫更新数据` / `tkf更新数据`。先全部下载再全部解析，最后写库；失败保留旧数据。批量下载用 `http::build_bulk_client`（300s），别和交互命令的 20s client 混用 |
 | 插件对外 HTTP | `crates/qqbot-plugins/src/http.rs`（**插件唯一的对外 HTTP 入口**：统一 20s 超时与 UA，客户端带 `Accept-Encoding: gzip`——**别关**，alapi 按这个头判爬虫直接回 `code=429`；非 2xx / 空体 / 大小上限 / 传输失败归一成 `FetchError`；调用点只用 `fetch_text` / `fetch_json` / `fetch_bytes` / `send` / `send_raw`（后者**不过**状态码闸门，只给「状态码不重要、只要响应头」的 delta 握手预热用），**不要在插件里自建 `reqwest::Client`，也不要再逐个手写 `User-Agent`**；唯一例外是 `delta` —— kkrb 按 UA 拦，它刻意逐请求覆盖成完整浏览器 UA） |
 | 插件配置 | 各插件自带 `XxxConfig`（如 `DailyConfig`），由 `PluginsConfig` 汇总传入 `register` |
 | 富媒体分片上传 / 秒传缓存 | `crates/qqbot-media/src/uploader.rs` |

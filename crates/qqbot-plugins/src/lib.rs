@@ -7,6 +7,7 @@ pub mod delta;
 pub mod dice;
 pub mod help;
 pub mod market;
+pub mod md;
 pub mod http;
 pub mod ammo;
 pub mod ba;
@@ -16,6 +17,7 @@ pub mod caption;
 pub mod resource;
 pub mod tarkov;
 pub mod tarkov_image;
+pub mod tarkov_data;
 pub mod task;
 pub mod timewin;
 pub mod wordcloud;
@@ -32,6 +34,7 @@ pub use ba::BaConfig;
 pub use bangumi::BangumiConfig;
 pub use bili::BiliConfig;
 pub use tarkov::TarkovConfig;
+pub use tarkov_data::{TarkovData, TarkovDataConfig, TarkovUpdatePlugin};
 pub use wordcloud::{tokenize, WordCloudPlugin};
 
 use std::sync::Arc;
@@ -69,6 +72,8 @@ pub struct PluginsConfig {
     pub market: MarketConfig,
     /// 三角洲行动的配置。
     pub delta: DeltaConfig,
+    /// 塔科夫数据刷新（七个静态 JSON → 三张表，每小时一次）。
+    pub tarkov_data: TarkovDataConfig,
 }
 
 /// 把所有内置插件注册到路由表。
@@ -147,27 +152,54 @@ pub async fn register(
     if ammo_cfg.store.is_none() {
         ammo_cfg.store = cfg.resources.as_ref().map(|res| Arc::clone(&res.store));
     }
-    let ammo = ammo::AmmoPlugin::new(ammo_cfg, http.clone());
-    router.on_any(Matcher::Command("查子弹".into()), ammo.clone());
-    router.on_any(Matcher::Command("更新子弹".into()), ammo.clone());
+    let ammo = ammo::AmmoPlugin::new(ammo_cfg);
+    // 同跳蚤：Prefix 让 `查子弹 m855` 与 `查子弹m855` 都命中，
+    // 详情靠列表里可点的「查子弹 <24位id>」。
+    router.on_any_displayed(
+        Matcher::Prefix("查子弹".into()),
+        "查子弹 <名称片段|24位物品id>",
+        ammo.clone(),
+    );
 
     // 塔科夫任务：与弹药同一套「静态 JSON + 本地表」管线。
     let mut task_cfg = cfg.task.clone();
     if task_cfg.store.is_none() {
         task_cfg.store = cfg.resources.as_ref().map(|res| Arc::clone(&res.store));
     }
-    let task = task::TaskPlugin::new(task_cfg, http.clone());
+    let task = task::TaskPlugin::new(task_cfg);
     router.on_any(Matcher::Command("查任务".into()), task.clone());
-    router.on_any(Matcher::Command("更新任务".into()), task.clone());
 
     // 塔科夫跳蚤市场：B2（关键词搜）与 B3（按 id 查详情）共用一条命令。
     let mut market_cfg = cfg.market.clone();
     if market_cfg.store.is_none() {
         market_cfg.store = cfg.resources.as_ref().map(|res| Arc::clone(&res.store));
     }
-    let market = market::MarketPlugin::new(market_cfg, http.clone());
-    router.on_any(Matcher::Command("跳蚤".into()), market.clone());
-    router.on_any(Matcher::Command("更新物品".into()), market.clone());
+    let market = market::MarketPlugin::new(market_cfg);
+    // 用 Prefix 而不是 Command：`跳蚤 m4a1` 与 `跳蚤m4a1` 都要命中
+    // （Command 只比对首个空格分隔的 token）。展示文案另给，
+    // 免得帮助表里出现一条 `跳蚤*`。
+    router.on_any_displayed(
+        Matcher::Prefix("跳蚤".into()),
+        "跳蚤 <名称片段|24位物品id>",
+        market.clone(),
+    );
+
+    // 塔科夫数据的**唯一**写入者：七个静态 JSON → 弹药 / 物品 / 任务三张表。
+    // 三条旧的更新命令（更新物品 / 更新子弹 / 更新任务）已删除 ——
+    // 它们各自承诺「只刷一张表」，而现在是一次全量刷新。
+    let mut tarkov_cfg = cfg.tarkov_data.clone();
+    if tarkov_cfg.store.is_none() {
+        tarkov_cfg.store = cfg.resources.as_ref().map(|res| Arc::clone(&res.store));
+    }
+    // 批量下载要 300s 超时（items 一个就 17 MB / 18s），不能和交互命令共用一个 client。
+    let tarkov_data = tarkov_data::TarkovData::new(tarkov_cfg, http::build_bulk_client()?);
+    let update = tarkov_data::TarkovUpdatePlugin::new(tarkov_data.clone());
+    router.on_any(Matcher::Command("塔科夫更新数据".into()), update.clone());
+    router.on_any(Matcher::Command("tkf更新数据".into()), update.clone());
+    // 每小时自动刷新。`refresh_hours = 0`（库默认 / 测试默认）时不起任务。
+    if tarkov_data.spawn_hourly().is_some() {
+        tracing::info!(hours = cfg.tarkov_data.refresh_hours, "塔科夫数据自动刷新已启用");
+    }
 
     // 塔科夫静态图（B9–B15）。只在配了目录时注册 ——
     // 没配就说明用户没放这批图，注册了也只会报「读取失败」。

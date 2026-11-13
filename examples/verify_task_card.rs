@@ -5,7 +5,7 @@
 //!     cargo run --example verify_task_card -- c2c:<openid> 「惩罚者 - 1」
 //!     cargo run --example verify_task_card -- group:<openid> 「惩罚者」 list
 //!
-//! 它做的事与「更新任务」完全一致（拉 6 个静态端点 → 套语言包 → 写库），
+//! 它做的事与「塔科夫更新数据」的任务部分一致（拉 6 个静态端点 → 套语言包 → 写库），
 //! 额外把渲染好的 Markdown 发到指定会话，用来验证真机上
 //! Markdown 与「可点击指令文本」的渲染效果。
 //!
@@ -16,8 +16,8 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use qqbot_api::{ApiClient, ApiClientConfig, OutMessage, Target};
-use qqbot_plugins::http::build_client;
-use qqbot_plugins::task::{LangPacks, TaskConfig, parse_lang_pack, parse_tasks, render_detail, render_list};
+use qqbot_plugins::http::build_bulk_client;
+use qqbot_plugins::task::{LangPacks, parse_lang_pack, parse_tasks, render_detail, render_list};
 use qqbot_store::TarkovTask;
 
 #[tokio::main]
@@ -64,20 +64,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 1) 拉真实数据（与「更新任务」同一批端点）。
-    let task_cfg = TaskConfig::default();
-    let http = build_client()?;
+    // 1) 拉真实数据（与「塔科夫更新数据」同一批端点）。
+    // URL 写在这里而不是插件配置里：插件早就没有 HTTP 了，刷新器的职责是写库，
+    // 这个工具要的是「同一份数据 + 渲染结果」，不必绕进程内的刷新链路。
+    let http = build_bulk_client()?;
     let get = |url: &str| {
-        let req = http.get(url).header("User-Agent", "Mozilla/5.0 qqbot-rs").send();
+        let req = http.get(url).send();
         async move { Ok::<String, anyhow::Error>(req.await?.text().await?) }
     };
     let (tasks, traders, tasks_zh, items_zh, traders_zh, maps_zh) = tokio::try_join!(
-        get(&task_cfg.tasks_url),
-        get(&task_cfg.traders_url),
-        get(&task_cfg.tasks_zh_url),
-        get(&task_cfg.items_zh_url),
-        get(&task_cfg.traders_zh_url),
-        get(&task_cfg.maps_zh_url),
+        get("https://json.tarkov.dev/regular/tasks"),
+        get("https://json.tarkov.dev/regular/traders"),
+        get("https://json.tarkov.dev/regular/tasks_zh"),
+        get("https://json.tarkov.dev/regular/items_zh"),
+        get("https://json.tarkov.dev/regular/traders_zh"),
+        get("https://json.tarkov.dev/regular/maps_zh"),
     )?;
 
     let packs = LangPacks {
@@ -92,12 +93,19 @@ async fn main() -> Result<()> {
     // 2) 渲染。
     let names: HashMap<String, String> = items
         .iter()
-        .filter_map(|d| d.task.name_zh.clone().map(|n| (d.task.id.clone(), n)))
+        .filter_map(|d| {
+            d.task
+                .name_zh
+                .clone()
+                .or_else(|| d.task.name_en.clone())
+                .map(|n| (d.task.id.clone(), n))
+        })
         .collect();
     let matched: Vec<_> = items
         .iter()
         .filter(|d| {
             d.task.name_zh.as_deref().is_some_and(|n| n.contains(&query))
+                || d.task.name_en.as_deref().is_some_and(|n| n.contains(&query))
                 || d.task.normalized_name.contains(&query)
         })
         .collect();
@@ -110,7 +118,7 @@ async fn main() -> Result<()> {
     };
     println!("---- 卡片（{mode}，命中 {} 条）----\n{markdown}", matched.len());
 
-    // 3) 入库（等价于管理员发「更新任务」）。
+    // 3) 入库（等价于系统控制者发「塔科夫更新数据」的任务部分）。
     let store = qqbot_store::open_resource_store(std::path::PathBuf::from(&db_path)).await?;
     let count = store.replace_tasks(items).await?;
     println!("已写入 {db_path}：{count} 条");

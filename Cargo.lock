@@ -1470,6 +1470,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "jieba-rs",
+ "metrics",
  "qqbot-core",
  "qqbot-media",
  "qqbot-render",

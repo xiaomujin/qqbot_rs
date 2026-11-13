@@ -18,7 +18,7 @@ use qqbot_core::{DispatchConfig, Dispatcher, Router, Services, SessionRegistry};
 use qqbot_media::MediaUploader;
 use qqbot_plugins::{
     AmmoConfig, BaConfig, BangumiConfig, BiliConfig, DeltaConfig, MarketConfig, PluginsConfig,
-    ResourcesConfig, TarkovConfig, TaskConfig,
+    ResourcesConfig, TarkovConfig, TarkovDataConfig, TaskConfig,
 };
 use qqbot_render::RenderService;
 use qqbot_store::MessageStore;
@@ -183,5 +183,11 @@ fn plugins_from_config(cfg: &Config) -> PluginsConfig {
         task: TaskConfig::default(),
         market: MarketConfig::default(),
         delta: DeltaConfig::default(),
+        // 塔科夫数据的刷新周期来自配置（`[tarkov] refresh_hours`，默认 1 小时）。
+        // URL 用库默认值（真实上游）；存储由 `register` 从资源库回填。
+        tarkov_data: TarkovDataConfig {
+            refresh_hours: cfg.tarkov_refresh_hours,
+            ..Default::default()
+        },
     }
 }

@@ -10,6 +10,7 @@ anyhow = { workspace = true }
 regex = { workspace = true }
 async-trait = { workspace = true }
 jieba-rs = { workspace = true }
+metrics = { workspace = true }
 qqbot-core = { workspace = true }
 qqbot-media = { workspace = true }
 qqbot-render = { workspace = true }
